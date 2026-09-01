@@ -1,0 +1,6 @@
+<IfModule mod_rewrite.c>
+RewriteEngine On
+RewriteBase /
+RewriteRule ^api/v1/classifications/?$ api.php [L,QSA]
+RewriteRule ^api/v1/classifications/([0-9]+)/?$ api.php?id=$1 [L,QSA]
+</IfModule>

@@ -1,0 +1,341 @@
+# -*- coding: utf-8 -*-
+"""Wizard de script no chat: perguntas, confirmar, corrigir, fechar sem join extra."""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from python import db  # noqa: E402
+from python.engine import Engine  # noqa: E402
+from tests.test_submenu import FakeSock, awaiting, insert_option, mem_conn, seed_queue_menu  # noqa: E402
+
+ENV_APOIO = {
+    "APOIO_API_URL": "http://example.test/api/v1/toa/criar_apoio?ambiente=PRODUCAO",
+    "APOIO_STATUS_URL": "http://example.test/api/v1/toa",
+    "APOIO_API_KEY": "sekret",
+}
+
+
+def seed_apoio_leaf(conn) -> int:
+    parent = insert_option(
+        conn,
+        menu_id=1,
+        sort_order=1,
+        label="Coord.",
+        classification="",
+        action="submenu",
+    )
+    insert_option(
+        conn,
+        menu_id=1,
+        parent_id=parent,
+        sort_order=1,
+        label="Apoio",
+        classification="apoio",
+        action="run_script",
+        script_slug="criar_apoio",
+    )
+    return parent
+
+
+def seed_infra_leaf(conn) -> int:
+    parent = insert_option(
+        conn,
+        menu_id=1,
+        sort_order=1,
+        label="Coord. Infra",
+        classification="",
+        action="submenu",
+    )
+    insert_option(
+        conn,
+        menu_id=1,
+        parent_id=parent,
+        sort_order=1,
+        label="Infra",
+        classification="infra",
+        action="run_script",
+        script_slug="criar_infra_rede",
+    )
+    return parent
+
+
+def row_of(conn, cid: int = 10) -> dict:
+    return conn.execute("SELECT * FROM chats WHERE chat_id = ?", (cid,)).fetchone()
+
+
+class ScriptWizardTest(unittest.IsolatedAsyncioTestCase):
+    def _eng(self, conn) -> tuple[Engine, FakeSock]:
+        sock = FakeSock()
+        return Engine(conn, sock), sock
+
+    async def _answer_form(self, eng: Engine, conn) -> None:
+        await eng.handle_reply(10, row_of(conn), "123")
+        await eng.handle_reply(10, row_of(conn), "tec.apoio")
+
+    async def test_perguntas_confirma_e_encerra_sem_join(self):
+        conn = mem_conn()
+        seed_queue_menu(conn)
+        parent = seed_apoio_leaf(conn)
+        eng, sock = self._eng(conn)
+        await eng.handle_reply(10, awaiting(conn), "1")
+        chat = row_of(conn)
+        self.assertEqual(int(chat["menu_node_id"]), parent)
+        await eng.handle_reply(10, chat, "1")
+        chat = row_of(conn)
+        self.assertEqual(chat["status"], "awaiting_script_answer")
+        self.assertEqual(chat["script_slug"], "criar_apoio")
+        self.assertIn("Qual ID da atividade?", sock.sent_texts()[-1])
+
+        await eng.handle_reply(10, chat, "abc")
+        self.assertEqual(row_of(conn)["status"], "awaiting_script_answer")
+        self.assertIn("Qual ID da atividade?", sock.sent_texts()[-1])
+
+        await self._answer_form(eng, conn)
+        chat = row_of(conn)
+        self.assertEqual(chat["status"], "awaiting_script_confirm")
+        answers = json.loads(chat["script_answers"])
+        self.assertEqual(answers["atividade"], "123")
+        self.assertEqual(answers["login_apoio"], "tec.apoio")
+        conf = sock.sent_texts()[-1]
+        self.assertIn("Confirme as informações:", conf)
+        self.assertIn("Qual ID da atividade: 123.", conf)
+        self.assertIn("Qual Login do tec. Apoio: tec.apoio.", conf)
+        self.assertIn("Digite:", conf)
+        self.assertIn("1) Confirmar", conf)
+        self.assertIn("2) Corrigir", conf)
+
+        with patch.dict(os.environ, ENV_APOIO, clear=False), patch(
+            "python.scripts.criar_apoio._post_json", return_value=(200, {"status": "SUCESSO"})
+        ):
+            await eng.handle_reply(10, chat, "1")
+        chat = row_of(conn)
+        self.assertEqual(chat["status"], "closed")
+        self.assertEqual(chat["classification"], "apoio")
+        self.assertTrue(chat["script_uuid"])
+        texts = sock.sent_texts()
+        self.assertTrue(any("Apoio criado com sucesso" in t for t in texts))
+        cmds = [n for n, _ in sock.cmds]
+        self.assertIn("leave_chat", cmds)
+        self.assertNotIn("join_chat", cmds)
+        reasons = [e["reason"] for e in conn.execute("SELECT reason FROM bot_events").fetchall()]
+        self.assertIn("script_ok", reasons)
+        self.assertIn("classified", reasons)
+        details = [
+            e["detail"]
+            for e in conn.execute("SELECT detail FROM bot_events WHERE reason = 'script_ok'").fetchall()
+        ]
+        self.assertTrue(any("http 200" in (d or "") for d in details))
+        blob = " ".join(
+            (e["detail"] or "") + (e["reason"] or "")
+            for e in conn.execute("SELECT reason, detail FROM bot_events").fetchall()
+        )
+        self.assertNotIn("sekret", blob)
+
+    async def test_corrigir_volta_a_pergunta_1(self):
+        conn = mem_conn()
+        seed_queue_menu(conn)
+        seed_apoio_leaf(conn)
+        eng, sock = self._eng(conn)
+        await eng.handle_reply(10, awaiting(conn), "1")
+        await eng.handle_reply(10, row_of(conn), "1")
+        await self._answer_form(eng, conn)
+        self.assertEqual(row_of(conn)["status"], "awaiting_script_confirm")
+        await eng.handle_reply(10, row_of(conn), "2")
+        chat = row_of(conn)
+        self.assertEqual(chat["status"], "awaiting_script_answer")
+        self.assertEqual(int(chat["script_field_index"] or 0), 0)
+        self.assertEqual(json.loads(chat["script_answers"] or "{}"), {})
+        self.assertIn("Qual ID da atividade?", sock.sent_texts()[-1])
+
+    async def test_digito_invalido_na_confirmacao(self):
+        conn = mem_conn()
+        seed_queue_menu(conn)
+        seed_apoio_leaf(conn)
+        eng, sock = self._eng(conn)
+        await eng.handle_reply(10, awaiting(conn), "1")
+        await eng.handle_reply(10, row_of(conn), "1")
+        await self._answer_form(eng, conn)
+        await eng.handle_reply(10, row_of(conn), "9")
+        chat = row_of(conn)
+        self.assertEqual(chat["status"], "awaiting_script_confirm")
+        self.assertEqual(int(chat["retries"]), 1)
+        self.assertIn("1) Confirmar", sock.sent_texts()[-1])
+        cmds = [n for n, _ in sock.cmds]
+        self.assertNotIn("leave_chat", cmds)
+
+    async def test_http_erro_transfere(self):
+        conn = mem_conn()
+        seed_queue_menu(conn, with_team=True)
+        seed_apoio_leaf(conn)
+        eng, sock = self._eng(conn)
+        await eng.handle_reply(10, awaiting(conn), "1")
+        await eng.handle_reply(10, row_of(conn), "1")
+        await self._answer_form(eng, conn)
+        with patch.dict(os.environ, ENV_APOIO, clear=False), patch(
+            "python.scripts.criar_apoio._post_json", return_value=(500, {})
+        ):
+            await eng.handle_reply(10, row_of(conn), "1")
+        chat = row_of(conn)
+        self.assertEqual(chat["status"], "closed")
+        texts = sock.sent_texts()
+        self.assertTrue(any("Erro ao criar apoio automático" in t for t in texts))
+        cmds = [n for n, _ in sock.cmds]
+        self.assertIn("move_chat", cmds)
+        self.assertIn("invite_to_chat", cmds)
+        reasons = [e["reason"] for e in conn.execute("SELECT reason FROM bot_events").fetchall()]
+        self.assertIn("script_error", reasons)
+
+    async def test_timeout_no_wizard_encerra(self):
+        conn = mem_conn()
+        seed_queue_menu(conn)
+        seed_apoio_leaf(conn)
+        eng, sock = self._eng(conn)
+        await eng.handle_reply(10, awaiting(conn), "1")
+        await eng.handle_reply(10, row_of(conn), "1")
+        conn.execute(
+            "UPDATE chats SET last_prompt_at = datetime('now', '-400 seconds') WHERE chat_id = 10"
+        )
+        await eng.tick_timeouts()
+        self.assertEqual(row_of(conn)["status"], "closed_timeout")
+        self.assertIn("leave_chat", [n for n, _ in sock.cmds])
+
+    async def test_on_message_nao_trata_wizard_como_menu(self):
+        conn = mem_conn()
+        seed_queue_menu(conn)
+        seed_apoio_leaf(conn)
+        eng, sock = self._eng(conn)
+        awaiting(conn)
+        await eng.handle_reply(10, row_of(conn), "1")
+        await eng.handle_reply(10, row_of(conn), "1")
+        await eng.on_message({"chat_id": 10, "author": "u:tec@claro.com", "text": "nao-e-numero"})
+        chat = row_of(conn)
+        self.assertEqual(chat["status"], "awaiting_script_answer")
+        self.assertEqual(int(chat["retries"]), 1)
+        self.assertIn("Qual ID da atividade?", sock.sent_texts()[-1])
+
+    async def test_resume_run_consulta_uuid_sem_post(self):
+        from datetime import datetime, timezone
+
+        from python.engine import MEM
+        from tests.test_resume import ResumeSock, active
+
+        conn = mem_conn()
+        seed_queue_menu(conn, with_team=True)
+        seed_apoio_leaf(conn)
+        child = conn.execute(
+            "SELECT id FROM menu_options WHERE action = 'run_script'"
+        ).fetchone()["id"]
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        db.upsert_chat(
+            conn,
+            10,
+            queue_address="h:q1",
+            status="awaiting_script_run",
+            option_id=child,
+            script_slug="criar_apoio",
+            script_uuid="uid-salvo",
+            script_started_at=now,
+            script_answers=json.dumps({"atividade": "1", "login_apoio": "tec"}),
+        )
+        sock = ResumeSock(chats=[active(present=True)])
+        eng = Engine(conn, sock)
+        posts = []
+
+        def boom_post(*a, **k):
+            posts.append(1)
+            raise AssertionError("POST no resume")
+
+        with patch.dict(os.environ, ENV_APOIO, clear=False), patch(
+            "python.scripts.criar_apoio._post_json", side_effect=boom_post
+        ), patch(
+            "python.scripts.criar_apoio._get_json",
+            return_value=(200, {"status": "SUCESSO"}),
+        ):
+            await eng.resume_open_chats()
+        self.assertEqual(posts, [])
+        self.assertEqual(row_of(conn)["status"], "closed")
+        self.assertTrue(any("Apoio criado com sucesso" in t for t in sock.sent_texts()))
+        MEM.clear()
+
+
+class InfraRedeWizardTest(unittest.IsolatedAsyncioTestCase):
+    def _eng(self, conn) -> tuple[Engine, FakeSock]:
+        sock = FakeSock()
+        return Engine(conn, sock), sock
+
+    async def test_rede_lista_opcoes_e_digito_vira_hfc(self):
+        conn = mem_conn()
+        seed_queue_menu(conn)
+        seed_infra_leaf(conn)
+        eng, sock = self._eng(conn)
+        await eng.handle_reply(10, awaiting(conn), "1")
+        await eng.handle_reply(10, row_of(conn), "1")
+        chat = row_of(conn)
+        self.assertEqual(chat["status"], "awaiting_script_answer")
+        self.assertEqual(chat["script_slug"], "criar_infra_rede")
+        self.assertIn("Qual o motivo?", sock.sent_texts()[-1])
+
+        for ans in ("Troca de Poste", "São Paulo", "Rua da Gloria, 54", "LIBAC"):
+            await eng.handle_reply(10, row_of(conn), ans)
+        rede_prompt = sock.sent_texts()[-1]
+        self.assertIn("Qual a rede?", rede_prompt)
+        self.assertIn("1) HFC", rede_prompt)
+        self.assertIn("2) GPON", rede_prompt)
+
+        await eng.handle_reply(10, row_of(conn), "1")
+        self.assertIn("Qual o Login do Técnico?", sock.sent_texts()[-1])
+        await eng.handle_reply(10, row_of(conn), "Z679436")
+        chat = row_of(conn)
+        self.assertEqual(chat["status"], "awaiting_script_confirm")
+        answers = json.loads(chat["script_answers"])
+        self.assertEqual(answers["rede"], "HFC")
+        conf = sock.sent_texts()[-1]
+        self.assertIn("Qual a rede: HFC.", conf)
+
+
+class ResumeScriptStatusTest(unittest.TestCase):
+    def test_timeouts_incluem_wizard(self):
+        conn = mem_conn()
+        seed_queue_menu(conn)
+        db.upsert_chat(
+            conn,
+            11,
+            queue_address="h:q1",
+            status="awaiting_script_answer",
+            last_prompt_at="2000-01-01 00:00:00",
+        )
+        rows = db.awaiting_timeouts(conn, 300)
+        self.assertTrue(any(int(r["chat_id"]) == 11 for r in rows))
+        statuses = {r["status"] for r in db.resume_chats(conn)}
+        self.assertIn("awaiting_script_answer", statuses)
+
+    def test_run_nao_entra_no_timeout_de_5min(self):
+        conn = mem_conn()
+        seed_queue_menu(conn)
+        db.upsert_chat(
+            conn,
+            12,
+            queue_address="h:q1",
+            status="awaiting_script_run",
+            script_uuid="abc",
+            script_started_at="2000-01-01 00:00:00",
+            last_prompt_at="2000-01-01 00:00:00",
+        )
+        ids = {int(r["chat_id"]) for r in db.awaiting_timeouts(conn, 300)}
+        self.assertNotIn(12, ids)
+        statuses = {r["status"] for r in db.resume_chats(conn)}
+        self.assertIn("awaiting_script_run", statuses)
+        timed = db.script_run_timeouts(conn, 60)
+        self.assertTrue(any(int(r["chat_id"]) == 12 for r in timed))
+
+
+if __name__ == "__main__":
+    unittest.main()

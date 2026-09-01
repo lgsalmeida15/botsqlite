@@ -1,0 +1,24 @@
+{
+  "scripts": [
+    {
+      "slug": "criar_apoio",
+      "label": "Criar apoio",
+      "fields": [
+        {"key": "atividade", "type": "int", "prompt": "Qual ID da atividade?"},
+        {"key": "login_apoio", "type": "text", "prompt": "Qual Login do tec. Apoio?"}
+      ]
+    },
+    {
+      "slug": "criar_infra_rede",
+      "label": "Criar infra de rede",
+      "fields": [
+        {"key": "motivo", "type": "text", "prompt": "Qual o motivo?"},
+        {"key": "cidade", "type": "text", "prompt": "Qual a cidade?"},
+        {"key": "endereco", "type": "text", "prompt": "Qual o endereço?"},
+        {"key": "equipamento", "type": "text", "prompt": "Qual o equipamento?"},
+        {"key": "rede", "type": "choice", "prompt": "Qual a rede?", "choices": ["HFC", "GPON"]},
+        {"key": "tecnico", "type": "text", "prompt": "Qual o Login do Técnico?"}
+      ]
+    }
+  ]
+}

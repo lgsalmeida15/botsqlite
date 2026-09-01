@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <title>HELPTOA Bot — Fluxogramas de atendimento</title>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+  <style>
+    @page { size: A4 landscape; margin: 10mm; }
+    body {
+      font-family: Segoe UI, Calibri, Arial, sans-serif;
+      color: #1a1a1a;
+      margin: 0;
+      padding: 8px 16px 16px;
+      background: #fff;
+    }
+    h1 { font-size: 22pt; margin: 0 0 6px; color: #0b3d2e; }
+    h2 { font-size: 13pt; margin: 0 0 8px; color: #0b3d2e; page-break-after: avoid; }
+    .lead { color: #444; margin: 0 0 10px; font-size: 10pt; }
+    .meta { font-size: 9pt; color: #666; margin-bottom: 16px; }
+    section {
+      page-break-before: always;
+      break-before: page;
+      page-break-inside: avoid;
+    }
+    section:first-of-type { page-break-before: auto; break-before: auto; }
+    .cover { page-break-after: always; }
+    .mermaid { display: flex; justify-content: center; }
+    .mermaid svg { max-width: 100%; max-height: 165mm; height: auto; }
+    table { border-collapse: collapse; width: 100%; font-size: 10pt; }
+    th, td { border: 1px solid #c5d4cc; padding: 6px 8px; text-align: left; vertical-align: top; }
+    th { background: #0b3d2e; color: #fff; }
+    tr:nth-child(even) td { background: #f4f6f8; }
+    .note { font-size: 9.5pt; color: #444; margin-top: 10px; }
+  </style>
+</head>
+<body>
+  <div class="cover">
+    <h1>HELPTOA Bot</h1>
+    <p class="lead">Fluxogramas completos do atendimento (botsqlite)</p>
+    <p class="meta">Documento gerado a partir do comportamento atual do daemon Python + painel PHP. O diretório <code>bot/</code> (Postgres) não está incluído.</p>
+    <ol>
+      <li>Visão geral</li>
+      <li>Filtros para assumir o chat</li>
+      <li>Menu, submenu, dígito e timeout</li>
+      <li>Classificação e formulário de validação aberto</li>
+      <li>Transferência: fila → time → rodízio</li>
+      <li>Restart / recycle (sem reenviar menu)</li>
+      <li>Amarrações do painel</li>
+    </ol>
+  </div>
+
+  <section>
+    <h2>1. Visão geral</h2>
+    <p class="lead">Caminho principal desde o chat na fila até encerrar ou ficar em monitoramento.</p>
+    <pre class="mermaid">
+flowchart TD
+  chatIn[Chat entra na fila TOA]
+  consider[consider: pode assumir?]
+  join[join_chat + presenca]
+  menu[Envia greeting e menu raiz]
+  wait[awaiting_reply]
+  digito[Tecnico envia digito]
+  classif[Classifica opcao]
+  fecha[leave_chat encerrado]
+  monitor[monitoring: bot fica no chat]
+
+  chatIn --> consider
+  consider -->|sim| join
+  join -->|presente e menu com opcoes| menu --> wait
+  wait --> digito
+  digito --> classif
+  classif -->|reply_and_close| fecha
+  classif -->|transferiu| fecha
+  classif -->|sem analista| monitor
+    </pre>
+  </section>
+
+  <section>
+    <h2>2. Filtros para assumir o chat</h2>
+    <p class="lead">Amarrações: fila habilitada no painel e menu ligado à fila. Formulário de validação do TOA não é chat de fila.</p>
+    <pre class="mermaid">
+flowchart TD
+  ev[helpdesk_chat_received ou get_helpdesk_chats]
+  botOff{Bot ligado?}
+  formVal{Formulario de encerramento TOA?}
+  temFila{Tem helpdesk_address?}
+  filaOn{Fila habilitada?}
+  jaAtendido{Ja tem analista ou o bot?}
+  jaLinha{Linha no SQLite nao e detected ou skipped?}
+  assume[Assumir: join e menu]
+  ignora[Nao assume]
+
+  ev --> botOff
+  botOff -->|nao: bot_off| ignora
+  botOff -->|sim| formVal
+  formVal -->|sim: indexa form e ignora| ignora
+  formVal -->|nao| temFila
+  temFila -->|nao: queue_unknown| ignora
+  temFila -->|sim| filaOn
+  filaOn -->|nao: queue_off| ignora
+  filaOn -->|sim| jaAtendido
+  jaAtendido -->|sim: not_new| ignora
+  jaAtendido -->|nao| jaLinha
+  jaLinha -->|ja em andamento| ignora
+  jaLinha -->|novo| assume
+    </pre>
+  </section>
+
+  <section>
+    <h2>3. Menu, submenu, dígito e timeout</h2>
+    <p class="lead">Raiz = opções sem parent_id. Filho = parent_id da opção submenu. Número 0 só vale no submenu (Voltar). Timeout usa reply_timeout_sec (padrão 300 s) também no submenu.</p>
+    <pre class="mermaid">
+flowchart TD
+  wait[awaiting_reply]
+  msg[Mensagem do tecnico originador]
+  timeout{Passou reply_timeout_sec?}
+  nivel{Esta em submenu?}
+  zero{Digitou 0?}
+  num{E numero da lista?}
+  sub{Acao da opcao e submenu?}
+  kids{Submenu tem filhos?}
+  aplica[apply_option]
+  invalido[Resposta invalida]
+  retry{retries menor que max_invalid_retries?}
+  fechaInv[Envia closing e sai: closed_invalid]
+  fechaTO[Envia closing e sai: closed_timeout]
+  raiz[Reenvia menu raiz]
+  listaSub[Envia lista do submenu mais 0 Voltar]
+
+  wait --> timeout
+  timeout -->|sim| fechaTO
+  timeout -->|nao| msg
+  msg --> nivel
+  nivel -->|sim| zero
+  zero -->|sim| raiz --> wait
+  zero -->|nao| num
+  nivel -->|nao: raiz| num
+  num -->|nao| invalido
+  num -->|sim| sub
+  sub -->|sim| kids
+  kids -->|nao| invalido
+  kids -->|sim| listaSub --> wait
+  sub -->|nao: folha| aplica
+  invalido --> retry
+  retry -->|sim: retry e reenvia lista do nivel| wait
+  retry -->|nao| fechaInv
+    </pre>
+    <p class="note">Só conta mensagem depois do menu (menu_sent_at), do técnico que abriu o chat (started_addr). Bot e outros participantes são ignorados.</p>
+  </section>
+
+  <section>
+    <h2>4. Classificação e formulário de validação aberto</h2>
+    <p class="lead">Cada folha tem ação/texto normais e, se preenchidos, action_if_form / reply_text_if_form. O form aberto segue o critério do TOA (cenário de validação pendente, casado pelo técnico).</p>
+    <pre class="mermaid">
+flowchart TD
+  folha[Opcao folha escolhida]
+  form{Tecnico tem form de validacao aberto?}
+  usaAlt[Usa action_if_form e reply_text_if_form se preenchidos]
+  usaNorm[Usa action e reply_text]
+  grava[SQLite: classified mais classificacao]
+  acao{Acao resolvida}
+  envia[Envia texto de resposta se houver]
+  closeNode[leave_chat]
+  transfere[Tenta transferir]
+  monitor[status monitoring: bot permanece]
+
+  folha --> form
+  form -->|sim| usaAlt --> grava
+  form -->|nao| usaNorm --> grava
+  grava --> acao
+  acao -->|reply_and_close| envia --> closeNode
+  acao -->|ask_and_transfer| envia --> transfere
+  acao -->|transfer_only| transfere
+  transfere -->|convidou analista| closeNode
+  transfere -->|sem analista: no_agent| monitor
+    </pre>
+  </section>
+
+  <section>
+    <h2>5. Transferência: fila → time → rodízio</h2>
+    <p class="lead">Uma fila só pode estar em um time. A opção não escolhe pessoa; só a ação “transferir”. O time da fila do chat decide quem recebe.</p>
+    <pre class="mermaid">
+flowchart TD
+  tenta[pick_assignee da fila]
+  time{Fila tem time ativo?}
+  membros{Time tem membros?}
+  janela{Alguem na janela de horario BRT?}
+  online[get_online_users: online no TOA]
+  cap{Abaixo do cap max_open_chats_per_agent?}
+  rr[Rodizio: proximo depois de last_assigned]
+  move[move_chat para a fila]
+  invite[invite_to_chat no escolhido]
+  ok[transferred e bot sai]
+  fail[no_agent e monitoring]
+
+  tenta --> time
+  time -->|nao| fail
+  time -->|sim| membros
+  membros -->|nao| fail
+  membros -->|sim| janela
+  janela -->|nao: fora_horario| fail
+  janela -->|sim| online
+  online --> cap
+  cap -->|ninguem elegivel| fail
+  cap -->|sim| rr --> move --> invite --> ok
+    </pre>
+    <p class="note">Ordem do filtro: ativo no time → dentro da janela (vazio = 24h) → online no TOA → carga de chats menor que o cap → round-robin.</p>
+  </section>
+
+  <section>
+    <h2>6. Restart / recycle (não reenvia menu)</h2>
+    <p class="lead">SQLite guarda status, menu_node_id, retries e last_prompt_at. RAM some. Depois do bootstrap o bot retoma em vez de tratar o chat como novo.</p>
+    <pre class="mermaid">
+flowchart TD
+  boot[bootstrap e get_active_chats]
+  resume[resume_open_chats]
+  acao{Banco vs presenca no TOA}
+  hydra[rehydrate: so memoria, sem join e sem menu]
+  silent[rejoin_silent: join sem greeting]
+  stale[status left: resume_stale]
+  wait[Volta a ouvir digito se awaiting_reply]
+
+  boot --> resume --> acao
+  acao -->|aberto e bot presente| hydra --> wait
+  acao -->|aberto e bot ausente| silent --> wait
+  acao -->|chat sumiu do TOA| stale
+    </pre>
+    <p class="note">Chromium: 3 timeouts de get_version ou WebSocket mudo por ws_stale_sec (padrão 180 s) fecha o browser, relança, faz bootstrap e resume de novo. SIGTERM fecha limpo (saída 0). O kill externo a cada 6 h permanece como rede de segurança.</p>
+  </section>
+
+  <section>
+    <h2>7. Amarrações do painel</h2>
+    <table>
+      <thead>
+        <tr><th>Painel</th><th>Liga</th><th>Efeito no chat</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Filas enabled</td><td>fila → bot liga/desliga</td><td>Fila off: não assume</td></tr>
+        <tr><td>Menu ↔ filas</td><td>1 fila = 1 menu</td><td>Opções 1, 2, 3… daquela fila</td></tr>
+        <tr><td>Opção submenu</td><td>raiz → filhos</td><td>Um nível; 0 = Voltar</td></tr>
+        <tr><td>Opção folha</td><td>classificação + ação</td><td>Encerrar ou transferir</td></tr>
+        <tr><td>Folha “se form aberto”</td><td>mesmo número, outra ação/texto</td><td>Só se o form de validação estiver aberto</td></tr>
+        <tr><td>Time ↔ filas</td><td>1 fila = 1 time</td><td>Quem pode receber transferência</td></tr>
+        <tr><td>Membro: ordem, janela, ativo</td><td>rodízio</td><td>Ausência = desativar membro</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <script>
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: "neutral",
+      flowchart: { htmlLabels: true, curve: "basis" },
+      securityLevel: "strict"
+    });
+  </script>
+</body>
+</html>

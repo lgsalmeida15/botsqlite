@@ -1,0 +1,13 @@
+.env
+.session.json
+.bot.lock
+.chrome-profile/
+__pycache__/
+*.pyc
+.venv/
+data/*.sqlite
+data/*.sqlite-*
+data/*.sqlite-wal
+data/*.sqlite-shm
+.DS_Store
+Thumbs.db
