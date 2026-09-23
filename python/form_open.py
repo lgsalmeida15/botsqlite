@@ -288,6 +288,22 @@ def last_message_time(msgs) -> float | None:
     return maior
 
 
+def form_started_epoch(form) -> float | None:
+    """Epoch (de verdade) em que o formulario foi criado, quando o payload traz.
+
+    O `started_time` do closure e o unico relogio confiavel quando as mensagens
+    nao trazem `time`: sem ele a janela de vida cairia no relogio do indice
+    (boot) e um formulario de horas atras pareceria recem-chegado.
+    """
+    if not isinstance(form, dict):
+        return None
+    for chave in ("started_time", "started_at", "created_time", "time"):
+        t = _ended_epoch(form.get(chave))
+        if t is not None:
+            return t
+    return None
+
+
 def chat_opener(chat: dict | None, own: str | None = None) -> dict:
     """Quem abriu o chat de fila (o técnico) — alias público de `_chat_opener`."""
     return _chat_opener(chat, own)

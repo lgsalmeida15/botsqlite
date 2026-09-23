@@ -28,6 +28,19 @@ def _ms_atras(minutos: float) -> int:
     return int((time.time() - float(minutos) * 60.0) * 1000)
 
 
+def _envelhece_caso(conn, cid: int = 99, horas: float = 5) -> None:
+    """Fixture: caso aberto há horas.
+
+    O relógio de vida considera também a abertura do caso (`assigned_at`): uma
+    entrega feita agora mantém o formulário vivo, então o cenário de "parado há
+    horas" precisa envelhecer a atribuição.
+    """
+    conn.execute(
+        "UPDATE route_assignments SET assigned_at = datetime('now', ?) WHERE chat_id = ?",
+        ("-%d hours" % int(horas), int(cid)),
+    )
+
+
 def form_agente(cid: int = 99, **over) -> dict:
     """Formulário como o TOA manda de verdade: SEM o address do técnico.
 
@@ -391,6 +404,7 @@ class FormAwareEngineTest(unittest.IsolatedAsyncioTestCase):
         eng, conn, sock = self._eng()
         await eng.consider(form_agente())
         eng.cfg["form_idle_offer_min"] = "30"
+        _envelhece_caso(conn)
         sock.msgs[99] = [
             {"author": "CREATEDBYMESSAGESCENARIO", "text": "cenario", "time": _ms_atras(120)},
             {"author": TEC, "text": "validando", "time": _ms_atras(120)},
@@ -421,6 +435,7 @@ class FormAwareEngineTest(unittest.IsolatedAsyncioTestCase):
         eng, conn, sock = self._eng()
         await eng.consider(form_agente())
         eng.cfg["form_idle_close_min"] = "60"
+        _envelhece_caso(conn)
         sock.msgs[99] = [
             {"author": "CREATEDBYMESSAGESCENARIO", "text": "cenario", "time": _ms_atras(240)},
         ]
@@ -438,6 +453,7 @@ class FormAwareEngineTest(unittest.IsolatedAsyncioTestCase):
         eng, conn, sock = self._eng()
         await eng.consider(form_agente())
         eng.cfg["form_idle_owner_close_min"] = "60"
+        _envelhece_caso(conn)
         sock.msgs[99] = [
             {"author": "CREATEDBYMESSAGESCENARIO", "text": "cenario", "time": _ms_atras(300)},
             {"author": ANA, "system_message": "user_joined", "time": _ms_atras(300)},
@@ -487,11 +503,44 @@ class FormAwareEngineTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(eng._prune_open_forms(), 0)
         self.assertIn(99, eng._open_forms)
 
+    async def test_ociosidade_usa_started_time_do_payload(self):
+        """Sem `time` nas mensagens, o relógio de vida vem do `started_time` do closure."""
+        eng, conn, sock = self._eng()
+        await eng.consider(form_agente(started_time=_ms_atras(300)))
+        eng.cfg["form_idle_close_min"] = "60"
+        _envelhece_caso(conn)
+        sock.msgs[99] = [{"author": "CREATEDBYMESSAGESCENARIO", "text": "cenario", "time": 1}]
+        eng._form_checked[99] = 0.0
+        await eng._sweep_form_states()
+        self.assertNotIn(99, eng._open_forms)
+        detalhe = conn.execute(
+            "SELECT detail FROM bot_events WHERE reason = 'form_closed' ORDER BY id DESC LIMIT 1"
+        ).fetchone()["detail"]
+        self.assertIn("form_ocioso", detalhe)
+
+    async def test_ociosidade_usa_assigned_at_apos_restart(self):
+        """Reidratado do ledger: o relógio de vida é a abertura do caso (`assigned_at`)."""
+        eng, conn, _sock = self._eng()
+        await eng.consider(form_agente())
+        conn.execute(
+            "UPDATE route_assignments SET assigned_at = datetime('now','-5 hours') WHERE chat_id = 99"
+        )
+        eng._open_forms.clear()
+        eng._form_seen.clear()
+        eng._form_last_msg.clear()
+        eng._form_started.clear()
+        eng._form_case_at.clear()
+        self.assertEqual(eng._hydrate_open_forms(), 1)
+        eng.cfg["form_idle_owner_close_min"] = "240"
+        eng._form_checked[99] = 0.0
+        await eng._sweep_form_states()
+        self.assertNotIn(99, eng._open_forms)
+
     async def test_ramo_1_sem_dono_espera_e_vai_junto_com_o_formulario(self):
         eng, conn, sock = self._eng(online=())
         await eng.consider(form_agente())
         self.assertEqual(assignment(conn, 99), {})
-        self.assertIn("form_no_agent", events(conn))
+        self.assertIn("queued", events(conn), "fila ligada: espera a vez (nao e falha)")
         await eng.consider(queue_chat())
         await eng.handle_reply(10, chat_row(conn), "1")
         self.assertIn("form_aware_wait", events(conn))
@@ -552,7 +601,7 @@ class FormAwareEngineTest(unittest.IsolatedAsyncioTestCase):
         """Peça irmã no outro sentido: a folha do menu entrega as duas juntas."""
         eng, conn, sock = self._eng(online=())
         await eng.consider(form_agente())  # formulario fica na fila (sem analista)
-        self.assertIn("form_no_agent", events(conn))
+        self.assertIn("queued", events(conn))
         await eng.consider(queue_chat())
         await eng.handle_reply(10, chat_row(conn), "2")  # abre o menu
         sock.online = ["ana"]

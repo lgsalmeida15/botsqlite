@@ -207,6 +207,22 @@ class FormRouteTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("move_chat", sock.names())
         self.assertIn("form_skip_past", events(conn))
 
+    async def test_form_sem_elegivel_entra_na_fila_com_evento_queued(self):
+        """Fila ligada: entrar na fila NAO e falha — o evento tem que dizer `queued`."""
+        eng, conn, _sock = self._eng(online=[])
+        await eng.consider(form_sem_identidade())
+        self.assertIn("queued", events(conn))
+        self.assertNotIn("form_no_agent", events(conn), "fila ligada: nao e falha")
+        espera = [r for r in routes(conn, "waiting") if r["kind"] == "form"]
+        self.assertEqual(len(espera), 1)
+        self.assertIsNotNone(espera[0]["expires_at"], "espera com vencimento")
+
+    async def test_form_sem_elegivel_com_fila_desligada_marca_falha(self):
+        eng, conn, _sock = self._eng(online=[])
+        eng.cfg["queue_wait_enabled"] = "false"
+        await eng.consider(form_sem_identidade())
+        self.assertIn("form_no_agent", events(conn))
+
     async def test_form_roteia_para_o_time_da_fila(self):
         eng, conn, sock = self._eng()
         await eng.consider(form_chat())
@@ -264,7 +280,8 @@ class FormRouteTest(unittest.IsolatedAsyncioTestCase):
         eng, conn, sock = self._eng(online=[])
         await eng.consider(form_chat())
         self.assertNotIn("move_chat", sock.names())
-        self.assertIn("form_no_agent", events(conn))
+        # Fila ligada: entrar na fila nao e falha — o evento e `queued`.
+        self.assertIn("queued", events(conn))
         wait = routes(conn, "waiting")
         self.assertEqual(len(wait), 1)
         self.assertEqual(int(wait[0]["attempts"]), 0)
@@ -283,7 +300,8 @@ class FormRouteTest(unittest.IsolatedAsyncioTestCase):
         eng, conn, sock = self._eng(online=[])
         conn.execute("INSERT INTO team_routing (team_id, fallback) VALUES (1, 'monitor')")
         await eng.consider(form_chat())
-        self.assertIn("form_no_agent", events(conn))
+        self.assertIn("queued", events(conn))
+        self.assertNotIn("form_no_agent", events(conn), "com fila ligada ele espera a vez")
         self.assertEqual(len(routes(conn, "waiting")), 1)
 
     async def test_tick_routes_entrega_quando_analista_aparece(self):
@@ -361,7 +379,7 @@ class FormRouteTest(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(routing, "_in_route_window", return_value=False):
             await eng.consider(form_chat())
         self.assertNotIn("move_chat", sock.names())
-        self.assertIn("form_no_agent", events(conn))
+        self.assertIn("queued", events(conn))
         self.assertIn("fora_horario", routes(conn, "waiting")[0]["detail"])
 
     async def test_chat_continua_com_o_rodizio_legado_do_time(self):

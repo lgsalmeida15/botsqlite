@@ -82,12 +82,12 @@ class RajadaTest(unittest.IsolatedAsyncioTestCase):
     async def test_rajada_de_tres_com_cap_form_um_entrega_um(self):
         conn, eng = await self._rajada(3, cap_form=1)
         self.assertEqual(eng.sock.names().count("move_chat"), 1)
-        self.assertEqual(eventos(conn).count("form_no_agent"), 2)
+        self.assertEqual(eventos(conn).count("queued"), 2)   # fila ligada: esperam a vez
 
     async def test_rajada_de_seis_com_cap_form_um_entrega_um(self):
         conn, eng = await self._rajada(6, cap_form=1)
         self.assertEqual(eng.sock.names().count("move_chat"), 1)
-        self.assertEqual(eventos(conn).count("form_no_agent"), 5)
+        self.assertEqual(eventos(conn).count("queued"), 5)   # fila ligada: esperam a vez
 
     async def test_rajada_de_quatro_com_cap_form_dois_entrega_dois(self):
         _conn, eng = await self._rajada(4, cap_form=2)
@@ -133,7 +133,7 @@ class AfinidadeTest(unittest.IsolatedAsyncioTestCase):
         await eng.consider(form_de(TEC, 99))
         await eng.consider(form_de(TEC2, 98))
         self.assertEqual(eng.sock.names().count("move_chat"), 1)
-        self.assertEqual(eventos(conn).count("form_no_agent"), 1)
+        self.assertEqual(eventos(conn).count("queued"), 1)   # o segundo espera a vez
 
 
 class CasoUnicoTest(unittest.IsolatedAsyncioTestCase):

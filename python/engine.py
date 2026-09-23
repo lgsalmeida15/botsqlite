@@ -243,6 +243,19 @@ def _confirm_text(spec: dict, answers: dict) -> str:
     return "\n".join(lines)
 
 
+def _sql_epoch(valor) -> float | None:
+    """Converte 'YYYY-MM-DD HH:MM:SS' (UTC, como o SQLite grava) em epoch."""
+    txt = str(valor or "").strip()
+    if not txt:
+        return None
+    try:
+        return datetime.strptime(txt[:19], "%Y-%m-%d %H:%M:%S").replace(
+            tzinfo=timezone.utc
+        ).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
 def _case_key_formulario(req: tuple, *fontes: str, autores=()) -> tuple[str, str]:
     """(chave, origem) do caso de um formulario, sem "balde" de identidade.
 
@@ -345,6 +358,12 @@ class Engine:
         # Relogio da vida do formulario: epoca da ultima mensagem lida (o indice
         # `_form_seen`, monotonico, e o fallback quando o TOA nao devolve `time`).
         self._form_last_msg: dict[int, float] = {}
+        # Outras referencias de vida: criacao do formulario (`started_time` do
+        # closure) e abertura do caso no ledger (`assigned_at`). A janela de vida
+        # usa a MAIS RECENTE — sem isso um formulario de horas atras cairia no
+        # relogio do boot e nunca fecharia.
+        self._form_started: dict[int, float] = {}
+        self._form_case_at: dict[int, float] = {}
         self._msg_ignored: set[int] = set()
         self._script_inflight: set[int] = set()
         self._route_lock = asyncio.Lock()
@@ -485,6 +504,11 @@ class Engine:
             self._open_forms[cid] = dict(chat)
             # O TTL conta INATIVIDADE: cada sinal novo renova o relogio.
             self._form_seen[cid] = time.monotonic()
+            # `started_time` do closure: relogio de criacao do formulario (a
+            # referencia que sobra quando as mensagens nao trazem `time`).
+            inicio = form_open.form_started_epoch(chat)
+            if inicio and not self._form_started.get(cid):
+                self._form_started[cid] = float(inicio)
             if novo:
                 self._emit(
                     "form_indexed", cid, queue_of(chat),
@@ -525,6 +549,8 @@ class Engine:
             self._form_authors.pop(cid, None)
             self._form_owner_msg.pop(cid, None)
             self._form_last_msg.pop(cid, None)
+            self._form_started.pop(cid, None)
+            self._form_case_at.pop(cid, None)
             self._emit("form_forget", cid, None, f"motivo={motivo or 'nao informado'}")
 
     def _prune_open_forms(self) -> int:
@@ -580,6 +606,9 @@ class Engine:
         ultima = form_open.last_message_time(msgs)
         if ultima:
             self._form_last_msg[fid] = max(float(ultima), float(self._form_last_msg.get(fid) or 0.0))
+        aberto = _sql_epoch(linha.get("assigned_at"))
+        if aberto:
+            self._form_case_at[fid] = max(float(aberto), float(self._form_case_at.get(fid) or 0.0))
         if estado is None:
             return None
         self._form_state[fid] = estado
@@ -600,6 +629,8 @@ class Engine:
         self._form_authors.pop(int(fid), None)
         self._form_owner_msg.pop(int(fid), None)
         self._form_last_msg.pop(int(fid), None)
+        self._form_started.pop(int(fid), None)
+        self._form_case_at.pop(int(fid), None)
         self._close_case(int(fid), "form_done")
         self._unblock_linked_chats(int(fid))
         # Formulario encerrado nao tem mais o que entregar: sem isso uma rota
@@ -641,10 +672,23 @@ class Engine:
             return
 
     def _form_idle_min(self, fid: int) -> float:
-        """Minutos sem sinal de vida do formulario (mensagem nova ou indexacao)."""
-        visto = self._form_last_msg.get(int(fid))
-        if visto:
-            return max(0.0, (time.time() - float(visto)) / 60.0)
+        """Minutos desde o sinal de vida MAIS RECENTE do formulario.
+
+        Ordem: ultima mensagem -> criacao (`started_time` do closure) -> abertura
+        do caso no ledger (`assigned_at`) -> relogio do indice (boot, ultimo
+        recurso). O mais recente vence: um formulario de horas atras nao pode
+        parecer novo so porque o bot reiniciou.
+        """
+        fid = int(fid)
+        vistos = [
+            float(t) for t in (
+                self._form_last_msg.get(fid),
+                self._form_started.get(fid),
+                self._form_case_at.get(fid),
+            ) if t
+        ]
+        if vistos:
+            return max(0.0, (time.time() - max(vistos)) / 60.0)
         mono = self._form_seen.get(int(fid))
         if mono:
             return max(0.0, (time.monotonic() - float(mono)) / 60.0)
@@ -1214,6 +1258,12 @@ class Engine:
                 },
                 "hydrate",
             )
+            # Sem o payload original, a referencia de vida e a abertura do caso no
+            # ledger (`assigned_at`): e o que impede o formulario de horas atras
+            # de parecer recem-chegado depois do restart.
+            aberto = _sql_epoch(row.get("assigned_at"))
+            if aberto:
+                self._form_case_at[fid] = aberto
             novos += 1
         if novos:
             log.info("formularios abertos reidratados do ledger: %s", novos)
@@ -2012,8 +2062,9 @@ class Engine:
         )
         self._emit("ask_collected", cid, q, detalhe[:800])
         # Rota aberta (restart/reconfirmacao) e reaproveitada; sem rota nova a entrada
-        # na fila acontece aqui. A espera do chat e sem limite: quem vence e o
-        # `expires_at` definido no painel (botao "Encerrar espera").
+        # na fila acontece aqui. A espera e limitada pelo `queue_max_wait_sec` do
+        # painel: no vencimento o bot aplica o fallback do time (o botao "Encerrar
+        # espera" continua valendo para antecipar).
         rota = db.waiting_route(self.conn, "chat", cid)
         rid = int(rota["id"]) if rota else None
         if rid is None and not db.route_seen(self.conn, "chat", cid):
@@ -2021,6 +2072,7 @@ class Engine:
             rid = db.enqueue_route(
                 self.conn, "chat", cid, q, int(team["id"]) if team else None,
                 detail=detalhe[:800] or "ask_collected", delay_sec=0,
+                expires_at=self._queue_expires_at(),
             )
         await self._finish_leaf_action(
             cid, row, opt, "transfer_only", reply="", route_id=rid, from_ask=True
@@ -2454,6 +2506,40 @@ class Engine:
         valor = str(self.cfg.get("queue_wait_enabled") or "true").strip().lower()
         return valor not in ("false", "0", "no")
 
+    def _queue_top_pos(self) -> int:
+        """A partir de qual posicao o chat ouve o NUMERO da fila (`0` = sempre)."""
+        try:
+            return max(0, int(self.cfg.get("queue_top_pos") or 5))
+        except (TypeError, ValueError):
+            return 5
+
+    async def _notify_queue_expired(self, cid: int, q: str | None, settings: dict) -> None:
+        """Avisa o tecnico que a espera na fila venceu.
+
+        Com fallback `close` o texto de encerramento ja informa (`closing`), entao
+        o aviso da fila sairia em dobro; com `monitor` e o unico aviso que ele tem.
+        """
+        if str(settings.get("fallback") or "") == "close":
+            return
+        texto = self._queue_text("queue_expired", 0)
+        if texto:
+            await self.send_guarded(cid, texto, q)
+
+    def _queue_expires_at(self) -> str | None:
+        """Vencimento da espera (UTC, formato do SQLite) quando a fila tem limite.
+
+        O `queue_max_wait_sec` do painel so valia pelo botao "Encerrar espera";
+        agora o proprio bot vence a espera e aplica o fallback do time.
+        """
+        try:
+            limite = int(self.cfg.get("queue_max_wait_sec") or 0)
+        except (TypeError, ValueError):
+            limite = 0
+        if not self._queue_on() or limite <= 0:
+            return None
+        quando = datetime.now(timezone.utc) + timedelta(seconds=limite)
+        return quando.strftime("%Y-%m-%d %H:%M:%S")
+
     def _queue_expired(self, row: dict) -> bool:
         expira = row.get("expires_at")
         if not expira:
@@ -2491,7 +2577,9 @@ class Engine:
         """
         if route_id < 1:
             return
-        pos = db.queue_position(self.conn, route_id)
+        # Numero anunciado conta SO chats: o tecnico nao sabe dos formularios que
+        # esperam na frente dele (a fila interna segue unica para a entrega).
+        pos = db.queue_position(self.conn, route_id, so_chat=True)
         if pos < 1:
             return
         row = self.conn.execute(
@@ -2513,7 +2601,13 @@ class Engine:
             self._emit("queue_position", cid, q, "posicao %d -> %d" % (anterior, pos))
         if routing.kind_of(row.get("kind")) == "form":
             return
-        texto = self._queue_text("queue_position", pos)
+        # Numero so no TOPO da fila (`queue_top_pos`, padrao 5). Acima disso o
+        # tecnico ouve que AVANCOU — contar posicao alta (inflada pelos
+        # formularios que ele nao ve) soa como fila que nunca anda.
+        if pos <= self._queue_top_pos():
+            texto = self._queue_text("queue_position", pos)
+        else:
+            texto = self._queue_text("queue_progress", 0)
         if texto:
             # `send_guarded`: falha de transporte no aviso de posicao nao pode
             # derrubar o tick nem o handler do handler que a chamou.
@@ -2965,8 +3059,15 @@ class Engine:
         db.enqueue_route(
             self.conn, "form", cid, queue_address, int(team["id"]),
             detail=detail, delay_sec=settings["retry_interval_sec"],
+            expires_at=self._queue_expires_at(),
         )
-        self._emit("form_no_agent", cid, queue_address, detail)
+        # A fila ligada ENFILEIRA (nao falha): o evento tem que dizer isso — antes
+        # saia `form_no_agent` e o painel mostrava "sem analista" para um item que
+        # estava esperando a vez (19 eventos em 3 h no banco real).
+        if self._queue_on():
+            self._emit("queued", cid, queue_address, f"sem analista elegivel; na fila; {detail}")
+        else:
+            self._emit("form_no_agent", cid, queue_address, detail)
 
     def _recover_classified(self) -> int:
         """Chats classificados sem nenhuma rota (crash entre classificar e entregar).
@@ -3038,9 +3139,20 @@ class Engine:
                     await self._apply_chat_fallback(cid, q)
                 continue
             if fila and self._queue_expired(row):
-                detail = "espera encerrada (vencimento definido no painel)"
+                detail = "espera encerrada (limite de %ss da fila)" % (
+                    self.cfg.get("queue_max_wait_sec") or 0
+                )
                 db.finish_route(self.conn, rid, "failed", detail)
                 self._emit("queue_expired", cid, q, detail)
+                if kind == "form":
+                    # Formulario nao tem chat para avisar: a rota para aqui (vai
+                    # para "rotas com falha" no painel) em vez de girar para sempre.
+                    self._emit(
+                        "form_no_agent", cid, q,
+                        f"{detail}; fallback={settings['fallback']}",
+                    )
+                    continue
+                await self._notify_queue_expired(cid, q, settings)
                 await self._apply_chat_fallback(cid, q)
                 continue
             # Abertura form-aware: rota presa ao dono do caso (analista do

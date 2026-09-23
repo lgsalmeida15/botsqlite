@@ -348,12 +348,12 @@ flowchart TD
   ok[assignment aberto no ledger + evento transferred + leave_chat closed]
   partial[transferred_partial: sem aviso de posicao aqui]
   retry[route_retry: retenta apenas o convite]
-  semNinguem[Evento no_agent]
+  semNinguem[Evento queued: sem analista elegivel, na fila]
   filaOn{Fila de espera ligada e chat nao foi movido?}
-  waiting[Rota waiting sem limite de tempo]
-  aviso[Aviso queue_position na entrada e so quando a posicao melhora]
+  waiting[Rota waiting ate queue_max_wait_sec]
+  aviso[Posicao: numero so ate queue_top_pos; acima disso "avancou na fila"]
   tick[Tick de 5 s tenta atribuir: evento queued_assigned]
-  vence{Encerrar espera no painel?}
+  vence{Espera venceu ou Encerrar espera no painel?}
   tent[Fila desligada: conta transfer_attempts com transfer_retry_interval_sec]
   fb{Fallback do time}
   fecha[close_out closed_no_agent]
@@ -375,7 +375,7 @@ flowchart TD
   fb -->|close| fecha
   fb -->|monitor| monitor
     </pre>
-    <p class="note">A fila de espera vive na <code>pending_routes</code> (<code>kind=chat</code> <strong>ou</strong> <code>kind=form</code>): posição FIFO <strong>por time, contando chat e formulário na mesma linha</strong>, aviso <code>queue_position</code> com <code>{pos}</code> só na entrada e quando a posição melhora (o <strong>formulário espera em silêncio</strong>), e <strong>nenhum</strong> <code>move_chat</code> antes de existir analista — por isso o técnico não vê "estou transferindo" seguido de "você é o Nº 1 da fila". Com a fila ligada o formulário também espera <strong>sem limite</strong> e não gasta tentativas (tentativas/fallback do formulário valem com a fila desligada). O <code>queue_max_wait_sec</code> ficou legado: a espera não vence sozinha, só pelo botão do painel. Com o chat <strong>já movido</strong> e o convite recusado, as tentativas contam normalmente (senão ele ficaria alternando para sempre). Nada disso se perde em restart: a rota está no banco. A <strong>identidade do caso</strong> nunca sai de nome genérico: formulário sem o address do técnico vira um caso por item (<code>chat:&lt;id&gt;</code>) e a afinidade entrega direto ao dono do caso (mesmo com o cap cheio); o cap vale para o rodízio, e quem está no limite espera a vaga.</p>
+    <p class="note">A fila de espera vive na <code>pending_routes</code> (<code>kind=chat</code> <strong>ou</strong> <code>kind=form</code>): a ordem de entrega é FIFO <strong>por time, contando chat e formulário na mesma linha</strong> — mas o <strong>número falado</strong> conta só chats (o técnico não vê os formulários à frente dele) e só aparece a partir de <code>queue_top_pos</code> (padrão 5); acima disso ele recebe o texto de progresso <code>queue_progress</code> ("Você avançou na fila"). Entrar na fila emite <code>queued</code> para os dois tipos (não é falha), e o <strong>formulário espera em silêncio</strong> (sem mensagem). <strong>Nenhum</strong> <code>move_chat</code> antes de existir analista — por isso o técnico não vê "estou transferindo" seguido de "você é o Nº 1 da fila". A espera <strong>vence</strong> em <code>queue_max_wait_sec</code> (<code>0</code> = sem limite): ao vencer, o bot registra <code>queue_expired</code>, avisa o técnico (texto <code>queue_expired</code> quando o fallback é monitorar) e aplica o fallback do time; para o formulário a rota é encerrada (<code>form_no_agent</code>) em vez de girar para sempre. O botão <em>Encerrar espera</em> antecipa o mesmo caminho. Com o chat <strong>já movido</strong> e o convite recusado, as tentativas contam normalmente (senão ele ficaria alternando para sempre). Nada disso se perde em restart: a rota está no banco.</p>
     <table>
       <thead>
         <tr><th>Desfecho</th><th>Status do chat</th><th>Evento</th></tr>
@@ -385,7 +385,7 @@ flowchart TD
         <tr><td>Convite recusado após o move</td><td>segue na rota</td><td><code>transferred_partial</code> + <code>route_retry</code></td></tr>
         <tr><td>Entrou na fila de espera</td><td><code>classified</code></td><td><code>queued</code> / <code>queue_position</code></td></tr>
         <tr><td>Atribuído depois de esperar</td><td><code>closed</code></td><td><code>queued_assigned</code> (com <code>espera=NNs</code>)</td></tr>
-        <tr><td>Espera encerrada no painel</td><td><code>closed_no_agent</code> ou <code>monitoring</code></td><td><code>queue_expired</code> + fallback do time</td></tr>
+        <tr><td>Espera encerrada (vencimento ou painel)</td><td><code>closed_no_agent</code> ou <code>monitoring</code></td><td><code>queue_expired</code> + fallback do time</td></tr>
         <tr><td>Sem analista e sem fila</td><td><code>closed_no_agent</code> ou <code>monitoring</code></td><td><code>no_agent</code></td></tr>
         <tr><td>Técnico saiu / chat removido</td><td><code>closed_originator_left</code> / <code>left</code></td><td><code>left</code> e rota fechada como <code>failed</code></td></tr>
       </tbody>

@@ -898,11 +898,13 @@ def pending_route_for_case(conn, case_key: str, kind: str) -> dict | None:
     ).fetchone()
 
 
-def queue_position(conn, route_id: int) -> int:
+def queue_position(conn, route_id: int, so_chat: bool = False) -> int:
     """Posicao FIFO da rota na fila do time (1 = primeiro).
 
-    Chat e formulario esperam na MESMA linha (a "fila normal"); o formulario so
-    nao anuncia a posicao para ninguem.
+    Chat e formulario esperam na MESMA linha (a "fila normal") — e isso que define
+    a ordem de entrega. Para o **numero falado ao tecnico** use `so_chat=True`:
+    ele nao sabe que existem formularios na frente dele, entao contar formulario
+    inflava o aviso (com 18 formularios o chat com 2 chats na frente ouvia "Nº 20").
     """
     if not route_id:
         return 0
@@ -911,9 +913,10 @@ def queue_position(conn, route_id: int) -> int:
     ).fetchone()
     if not row:
         return 0
+    filtro = " AND kind = 'chat'" if so_chat else ""
     total = conn.execute(
-        """SELECT COUNT(*) AS n FROM pending_routes
-            WHERE status = 'waiting' AND id < ? AND (team_id IS ?)""",
+        "SELECT COUNT(*) AS n FROM pending_routes"
+        " WHERE status = 'waiting' AND id < ? AND (team_id IS ?)" + filtro,
         (int(row["id"]), row["team_id"]),
     ).fetchone()
     return int(total["n"]) + 1

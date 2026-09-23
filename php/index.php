@@ -2007,7 +2007,8 @@ if ($page === 'routing') {
         'max_open_forms_per_agent' => ['Cap de formulários por analista', '8'],
         'transfer_attempts' => ['Tentativas de transferência (chat)', '5'],
         'transfer_retry_interval_sec' => ['Intervalo entre tentativas do chat (s)', '60'],
-        'queue_max_wait_sec' => ['Espera máxima do chat na fila (s) — só pelo botão Encerrar espera', '1800'],
+        'queue_max_wait_sec' => ['Espera máxima do chat na fila (s) — o bot aplica o fallback ao vencer; 0 = sem limite', '1800'],
+        'queue_top_pos' => ['Posição a partir da qual o chat ouve o número (0 = sempre)', '5'],
         'form_route_attempts' => ['Tentativas de rota do formulário', '5'],
         'form_route_retry_interval_sec' => ['Intervalo entre tentativas do formulário (s)', '60'],
     ];
@@ -2016,7 +2017,7 @@ if ($page === 'routing') {
         echo '<input class="form-control" name="' . h($gk) . '" value="' . h($map[$gk] ?? $gv[1]) . '"></div>';
     }
     echo '<button class="btn btn-primary mt-3">Salvar globais</button></form>';
-    echo '<p class="text-muted small mb-0 mt-3">O cap limita quantos chats/formulários simultâneos o analista recebe. O intervalo do chat é a espera entre as consultas de online; o do formulário é o intervalo do retry, que roda em background e não trava o atendimento. Com a <strong>fila de espera</strong> ligada, o chat fica aguardando (avisando a posição) <strong>sem limite de tempo</strong>: ele só sai da fila quando um analista elegível aparece, quando o técnico sai ou quando alguém usa <em>Encerrar espera</em> (o campo "espera máxima" não vence sozinho a espera do chat). Desligada, o bot apenas repete as tentativas e aplica o fallback do time.</p>';
+    echo '<p class="text-muted small mb-0 mt-3">O cap limita quantos chats/formulários simultâneos o analista recebe. O intervalo do chat é a espera entre as consultas de online; o do formulário é o intervalo do retry, que roda em background e não trava o atendimento. Com a <strong>fila de espera</strong> ligada, o chat fica aguardando <strong>até a espera máxima</strong>: ao vencer, o bot avisa o técnico (texto <em>queue_expired</em> quando o fallback é monitorar) e aplica o fallback do time; antecipar continua sendo o botão <em>Encerrar espera</em>. A posição falada conta <strong>só chats</strong> e o número só aparece a partir do campo <em>Posição a partir da qual o chat ouve o número</em> — acima disso o técnico recebe apenas "avançou na fila" (os formulários esperam na mesma fila, mas ele não os vê). Desligada, o bot apenas repete as tentativas e aplica o fallback do time.</p>';
     echo '</div></div>';
     $qParams = [];
     $qWhere = bot_scope_team_where($pdo, 'r.team_id', $qParams);

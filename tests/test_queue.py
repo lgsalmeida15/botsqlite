@@ -70,12 +70,45 @@ class QueueTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(wait), 1)
         self.assertEqual(wait[0]["kind"], "chat")
         self.assertEqual(int(wait[0]["last_position"]), 1)
-        # Espera sem limite: o chat so sai da fila atribuido, com o tecnico saindo
-        # ou pelo botao "Encerrar espera" do painel (que grava expires_at).
-        self.assertIsNone(wait[0]["expires_at"])
+        # A espera tem vencimento (`queue_max_wait_sec`): ao vencer o bot avisa e
+        # aplica o fallback. O botao "Encerrar espera" do painel antecipa.
+        self.assertIsNotNone(wait[0]["expires_at"])
         self.assertIn("queued", events(conn))
         self.assertTrue(any("N\u00ba 1" in t for t in sock.sent_texts()))
         self.assertNotIn("leave_chat", sock.names())
+
+    async def test_posicao_anunciada_conta_so_chats(self):
+        """Formulario na fila nao infla o numero que o tecnico ouve."""
+        eng, conn, _sock = self._eng(online=[])
+        db.enqueue_route(conn, "form", 99, "h:q1", 1, detail="formulario", delay_sec=0)
+        db.enqueue_route(conn, "form", 98, "h:q1", 1, detail="formulario", delay_sec=0)
+        rid = db.enqueue_route(conn, "chat", 10, "h:q1", 1, detail="chat", delay_sec=0)
+        # Fila interna: chat + formularios (ordem de entrega). Numero falado: so chats.
+        self.assertEqual(db.queue_position(conn, rid), 3)
+        self.assertEqual(db.queue_position(conn, rid, so_chat=True), 1)
+
+    async def test_acima_do_topo_avisa_progresso_sem_numero(self):
+        """Acima de `queue_top_pos` o tecnico ouve que AVANCOU, nunca o numero."""
+        eng, conn, sock = self._eng(online=[])
+        eng.cfg["queue_top_pos"] = "1"   # so o primeiro da fila ouve numero
+        db.enqueue_route(conn, "chat", 20, "h:q1", 1, detail="chat", delay_sec=0)
+        db.enqueue_route(conn, "chat", 21, "h:q1", 1, detail="chat", delay_sec=0)
+        await eng.tick_routes()
+        textos = sock.sent_texts()
+        self.assertTrue(any("N\u00ba 1" in t for t in textos), textos)
+        self.assertTrue(any("avan" in t.lower() for t in textos), textos)
+        self.assertFalse(any("N\u00ba 2" in t for t in textos), "acima do topo nao fala numero")
+
+    async def test_espera_do_formulario_vence_e_encerra_a_rota(self):
+        """Formulario sem elegivel nao gira para sempre: a espera vence e a rota para."""
+        eng, conn, _sock = self._eng(online=[])
+        db.enqueue_route(conn, "form", 99, "h:q1", 1, detail="formulario", delay_sec=0)
+        conn.execute("UPDATE pending_routes SET expires_at = datetime('now', '-1 seconds')")
+        await eng.tick_routes()
+        self.assertEqual(len(routes(conn, "failed")), 1)
+        self.assertIn("queue_expired", events(conn))
+        self.assertIn("form_no_agent", events(conn))
+        self.assertEqual(len(routes(conn, "waiting")), 0)
 
     async def test_posicao_melhora_quando_o_da_frente_e_atendido(self):
         eng, conn, sock = self._eng(online=[])
@@ -194,8 +227,11 @@ class QueueSchemaTest(unittest.TestCase):
         cfg = db.settings(conn)
         self.assertIn("queue_wait_enabled", cfg)
         self.assertIn("queue_max_wait_sec", cfg)
+        self.assertIn("queue_top_pos", cfg)
         tpl = db.templates(conn)
         self.assertIn("{pos}", tpl.get("queue_position", ""))
+        self.assertIn("avan", tpl.get("queue_progress", "").lower())
+        self.assertTrue(tpl.get("queue_expired"), "texto da espera vencida semeado")
 
     def test_posicao_fifo_por_time(self):
         conn = mem_conn()

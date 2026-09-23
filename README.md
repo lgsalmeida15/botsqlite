@@ -96,22 +96,32 @@ Os textos `ask_received` e `ask_transferring` sao editaveis na aba Templates.
 ### Fila de espera com posição (chat e formulário)
 
 Quando ninguém elegível está online, o item **não é descartado**: ele entra na fila (`pending_routes`) e
-o técnico recebe o texto `queue_position` (editável em Templates), com a posição atualizada **apenas
-quando ela melhora**. Isso vale para **qualquer** opção de transferência (com ou sem perguntas) **e para o
-formulário** — o formulário entra na mesma fila, só que **em silêncio** (não existe chat para avisar). A cada
-5 s o bot tenta atribuir, respeitando cap/janela/online; ao conseguir, entrega e registra `queued_assigned`
-com o tempo de espera.
+o técnico é avisado por mensagem (editáveis em Templates). Isso vale para **qualquer** opção de
+transferência (com ou sem perguntas) **e para o formulário** — o formulário entra na mesma fila, só que
+**em silêncio** (não existe chat para avisar). A cada 5 s o bot tenta atribuir, respeitando
+cap/janela/online; ao conseguir, entrega e registra `queued_assigned` com o tempo de espera.
 
-- A espera do chat e **sem limite de tempo**: ele so sai da fila quando um analista elegivel aparece,
-  quando o tecnico sai do chat ou quando alguem usa **Encerrar espera** (que aplica o fallback do time
-  na varredura seguinte, gravando `queue_expired`).
-- A posição é FIFO **por time**, contando **chat e formulário na mesma linha**; o formulário espera em silêncio, sem mensagem.
-- Com a fila **ligada** o formulário também espera **sem limite** (como o chat) e **não gasta** tentativas; `form_route_attempts`/fallback do formulário valem com a fila **desligada**.
-- O card **Fila de espera (agora)** na aba Roteamento mostra posicao, tempo, tentativas e o vencimento
-  ("sem limite" quando nao ha), com o botao **Encerrar espera**.
-- `queue_max_wait_sec` ficou como legado e **nao vence** mais a espera sozinho.
-- No **Dashboard**, o card "Fila de espera do chat" mostra quantos esperam agora, a espera media e a
-  maior espera do periodo (espera = do "queued" ate a atribuicao a um analista).
+- **Posição falada:** a fila interna é única (chat + formulário, ordem de entrega), mas o número que o
+  técnico ouve conta **só chats** — ele não vê os formulários na frente dele (antes disso, com 18
+  formulários na fila, um chat com 2 chats à frente ouvia "Nº 20").
+- **Número só no topo:** a partir de `queue_top_pos` (padrão **5**) o técnico ouve o número
+  (`queue_position`, com `{pos}`, atualizado **apenas quando melhora**); acima disso ele recebe o texto de
+  progresso `queue_progress` ("Você avançou na fila") — sem expor uma posição alta que soa como fila que
+  nunca anda.
+- **A espera tem vencimento:** `queue_max_wait_sec` (padrão 1800 s) — ao vencer, o bot registra
+  `queue_expired`, avisa o técnico (texto `queue_expired` quando o fallback é *monitorar*; com *encerrar* o
+  texto de encerramento já informa) e aplica o fallback do time. `0` = sem limite. Antecipar continua sendo
+  o botão **Encerrar espera** (que aplica o mesmo caminho).
+- **Formulário no vencimento:** a rota é encerrada com `form_no_agent` e vai para "rotas com falha" no
+  painel — antes ela girava para sempre (tentativas 58/66 no banco real).
+- **Entrar na fila não é falha:** com a fila ligada o evento é `queued` (com o motivo "sem analista
+  elegível") para chat **e** formulário; `form_no_agent` fica reservado para a fila desligada/fallback
+  *monitorar* — antes o painel mostrava "sem analista" para item que estava esperando a vez.
+- Com a fila **ligada** o formulário também espera e **não gasta** tentativas; `form_route_attempts`/fallback do formulário valem com a fila **desligada**.
+- O card **Fila de espera (agora)** na aba Roteamento mostra posição, tempo, tentativas e o vencimento
+  ("sem limite" quando não há), com o botão **Encerrar espera**.
+- No **Dashboard**, o card "Fila de espera do chat" mostra quantos esperam agora, a espera média e a
+  maior espera do período (espera = do "queued" até a atribuição a um analista).
 - Em Roteamento, **Fila de espera (chat) = Desligada** volta ao comportamento antigo: apenas
   `transfer_attempts` tentativas com `transfer_retry_interval_sec` entre elas e, ao esgotar, o fallback.
 - **Excecao da espera sem limite:** se o `move_chat` **ja foi feito** e o `invite_to_chat` esta falhando,

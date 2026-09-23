@@ -300,6 +300,9 @@ INSERT OR IGNORE INTO bot_settings (key, value) VALUES
   ('form_route_fallback', 'retry'),
   ('queue_wait_enabled', 'true'),
   ('queue_max_wait_sec', '1800'),
+  -- Posicao falada ao tecnico so a partir daqui (fila interna conta chat+form,
+  -- mas o numero anunciado conta so chats).
+  ('queue_top_pos', '5'),
   ('routing_strategy', 'round_robin');
 
 -- Ledger de atribuicoes: a carga real por CASO (solicitante distinto).
@@ -350,7 +353,14 @@ INSERT OR IGNORE INTO bot_settings (key, value) VALUES
 INSERT OR IGNORE INTO templates (slug, body) VALUES
   ('ask_received', 'Registrei as informações:'),
   ('ask_transferring', 'Já estou transferindo para o time responsável.'),
-  ('queue_position', 'Você é o Nº {pos} da fila. Assim que um analista liberar, eu te chamo.');
+  ('queue_position', 'Você é o Nº {pos} da fila. Assim que um analista liberar, eu te chamo.'),
+  -- Fila acima do topo (`queue_top_pos`, padrão 5): o técnico não ouve número —
+  -- a posição inclui formulários que ele não vê e um número alto soa como fila
+  -- que não anda. Aqui ele recebe só o progresso.
+  ('queue_progress', 'Você avançou na fila. Assim que um analista liberar, eu te chamo.'),
+  -- Espera vencida (`queue_max_wait_sec`) com fallback `monitor`: único aviso ao
+  -- técnico de que ele saiu da fila (com `close` o texto `closing` já informa).
+  ('queue_expired', 'Sua espera na fila foi encerrada. Assim que um analista ficar disponível eu volto a falar com você.');
 
 -- Abertura form-aware (aba Templates): o tecnico abre o chat e ja tem uma
 -- validacao de encerramento em andamento. `{analista}` = quem atende o formulario.

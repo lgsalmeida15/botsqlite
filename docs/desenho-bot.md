@@ -140,9 +140,10 @@ flowchart TD
     `form_ocioso_analista` — era exatamente o estado dos casos que travavam os
     caps: o analista entrou no formulario e o TOA nunca mostra a saida dele.
   - Fechar cancela as rotas presas (`form_route_cancelled`) e libera a vaga. O
-    relogio e o `time` da ultima mensagem (mesma regua de epoch do `ended_time`)
-    e, sem `time` confiavel, o relogio do indice (apos restart, no maximo a
-    janela depois do boot).
+    relogio de vida e o sinal **mais recente**: ultima mensagem -> `started_time`
+    do closure -> `assigned_at` do caso no ledger -> relogio do indice (boot,
+    ultimo recurso). Sem as duas referencias do meio, um formulario de horas
+    atras parecia novo a cada restart e a janela de vida nunca fechava nada.
 - **Indice enxuto:** a poda tira do indice o formulario cujo caso no ledger ja foi
   encerrado de verdade (`form_done`/`chat_removed` → `form_forget
   motivo=caso_encerrado`). Caso expirado por TTL/`stale_boot` **nao** descarta: o
@@ -416,7 +417,9 @@ flowchart TD
 | Chat | `close` - encerra e o bot sai - ou `monitor` - fica em `monitoring` | `close` |
 | Formulario | `retry` - insiste em segundo plano - ou `monitor` - nao insiste | `retry` |
 
-Com a **fila de espera** ligada (padrao), o chat fica aguardando **sem limite de tempo** (o campo `queue_max_wait_sec` do painel nao vence a espera sozinho) e nao gasta tentativas: a espera termina quando um analista elegivel aparece, quando o tecnico sai ou pelo botao **Encerrar espera** — que cai neste mesmo fallback (`close` encerra, `monitor` deixa em `monitoring`). **Excecao:** se o `move_chat` **ja foi feito** e o `invite_to_chat` esta falhando, as tentativas contam (`transferred_partial` + `route_retry`, sem repetir o move) e, ao esgotar, cai no fallback. O formulario continua por tentativas.
+Com a **fila de espera** ligada (padrao), o chat aguarda **ate `queue_max_wait_sec`** e nao gasta tentativas: a espera termina quando um analista elegivel aparece, quando o tecnico sai, pelo botao **Encerrar espera** ou **no vencimento** — nos tres ultimos casos cai neste mesmo fallback (`close` encerra, `monitor` deixa em `monitoring`). Com `queue_max_wait_sec = 0` a espera volta a ser sem limite. No vencimento o bot avisa o tecnico (texto `queue_expired`; com `close` o texto de encerramento ja informa) e, no caso do **formulario**, encerra a rota (`form_no_agent`) em vez de gira-la para sempre. **Excecao:** se o `move_chat` **ja foi feito** e o `invite_to_chat` esta falhando, as tentativas contam (`transferred_partial` + `route_retry`, sem repetir o move) e, ao esgotar, cai no fallback.
+
+**Posicao e mensagens da fila.** A fila interna e uma so (chat + formulario, ordem de entrega por `id`), mas o **numero falado** conta apenas **chats** (`db.queue_position(..., so_chat=True)`) — o tecnico nao sabe que existem formularios na frente dele. E o numero so aparece a partir de `queue_top_pos` (padrao 5): acima disso ele recebe o texto de progresso `queue_progress` ("Voce avancou na fila"), que nao expoe uma posicao alta (inflada) que soa como fila que nunca anda. Entrar na fila emite `queued` para os DOIS tipos; o formulario continua **sem receber mensagem** (so o evento).
 
 **`move_chat` recusado pelo TOA** (`e=10` = o formulario ja esta com alguem) e contado em `pending_routes.move_fails`: no teto (`form_move_max_fail`, padrao 3) a rota e **encerrada** com o evento `form_move_refused`, sem mexer no ponteiro do rodizio. Antes disso, a cada tentativa o bot le as mensagens do formulario: se um analista do time ja entrou, ele **adota** o dono (`form_adopted`) e a rota termina como entregue. Sem isso o retry girava para sempre (32 tentativas no banco real) batendo no mesmo analista a cada minuto.
 
@@ -523,6 +526,8 @@ flowchart TD
 | `form_idle_offer_min` | 30 | minutos sem mensagem nova (e sem analista do time dentro) para o formulario **deixar de ser oferecido** na abertura |
 | `form_idle_close_min` | 120 | minutos sem sinal de vida para o formulario **sair do indice** e o caso fechar (`form_closed motivo=form_ocioso`) |
 | `form_idle_owner_close_min` | 240 | mesma janela, mas para formulario parado **com analista do time dentro** (`motivo=form_ocioso_analista`) — o TOA nao avisa quando ele sai |
+| `queue_max_wait_sec` | 1800 | vencimento da espera do chat: ao vencer o bot avisa (`queue_expired`) e aplica o fallback do time (`0` = sem limite) |
+| `queue_top_pos` | 5 | posicao a partir da qual o chat ouve o NUMERO da fila; acima disso recebe o texto de progresso (`0` = sempre fala o numero) |
 
 ## 10. Restart, resume e reciclagem
 
