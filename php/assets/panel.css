@@ -1,0 +1,54 @@
+/* HELPTOA Bot - tema do painel (Bootstrap 5 local, sem CDN).
+   Secundaria vermelha: verde sai de cena; verde fica so para "ativo/habilitado". */
+:root{
+  --bs-secondary:#b02a37; --bs-secondary-rgb:176,42,55;
+  --bs-link-color:#8c1d24; --bs-link-hover-color:#6f1519;
+  --helptoa-red:#8c1d24; --helptoa-red-dark:#6f1519;
+}
+body{background:#f5f6f8}
+
+.navbar-helptoa{background:var(--helptoa-red)}
+.navbar-helptoa .navbar-brand{font-weight:600;letter-spacing:.2px}
+.navbar-helptoa .nav-link{font-size:.9rem;padding:.35rem .6rem;border-radius:.35rem}
+.navbar-helptoa .nav-link.active,.navbar-helptoa .nav-link:hover{background:rgba(255,255,255,.14)}
+.nav-user{font-size:.82rem;line-height:1.1;color:rgba(255,255,255,.85);text-align:right}
+.nav-user strong{display:block;font-size:.86rem;color:#fff}
+
+.page-head{display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;justify-content:space-between;margin-bottom:.85rem}
+.page-head h1{font-size:1.15rem;font-weight:600;margin:0}
+.page-head .sub{color:#6c757d;font-size:.82rem;margin:.2rem 0 0;max-width:70ch}
+
+.table-slim>:not(caption)>*>*{padding:.34rem .5rem;font-size:.9rem}
+.table-slim>thead>tr>th{font-size:.75rem;text-transform:uppercase;letter-spacing:.03em;color:#5c636a;background:#f8f9fa}
+.table-responsive.sticky-head{max-height:72vh}
+.table-responsive.sticky-head thead th{position:sticky;top:0;z-index:2}
+
+.card-header{font-size:.88rem;font-weight:600;padding:.55rem .8rem;background:#f8f9fa}
+.card-body{padding:.9rem}
+.card-slim .card-body{padding:.7rem .85rem}
+.card-hover{transition:box-shadow .12s ease}
+.card-hover:hover{box-shadow:0 .35rem .9rem rgba(0,0,0,.09)!important}
+
+.form-label{font-size:.8rem;font-weight:600;margin-bottom:.2rem}
+.form-control-sm,.form-select-sm{font-size:.85rem}
+.badge{font-weight:500}
+.badge-soft{background:#f1f3f5;border:1px solid #e3e6ea;color:#495057}
+
+/* multi-select local: <details> abre sem JS; o JS so melhora (busca/resumo) */
+details.ms-picker{position:relative}
+details.ms-picker>summary{list-style:none;cursor:pointer}
+details.ms-picker>summary::-webkit-details-marker{display:none}
+details.ms-picker>summary::after{content:"\25BE";float:right;opacity:.55}
+details.ms-picker[open]>.dropdown-menu{display:block;position:absolute;z-index:30;min-width:15rem}
+.ms-options{max-height:220px;overflow:auto}
+.ms-options .form-check{margin-bottom:.1rem}
+.ms-options .form-check-label{font-size:.85rem}
+
+/* legado do painel */
+.off-q{color:#6c757d}
+.queue-list{max-height:200px;overflow:auto}
+.login-card{width:100%;max-width:400px}
+.d-contents{display:contents}
+.opt-child td:first-child{padding-left:1.75rem;border-left:3px solid #e3d3d5}
+tr.opt-editor-row>td{padding:0;border:0}
+.list-scroll{max-height:22rem;overflow:auto}

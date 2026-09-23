@@ -12,11 +12,7 @@ sys.path.insert(0, str(ROOT))
 
 from python import db  # noqa: E402
 from python.engine import Engine, MEM, remember  # noqa: E402
-from python.form_open import (  # noqa: E402
-    has_open_validation_form,
-    is_open_validation_form,
-    resolve_option,
-)
+from python.form_open import is_open_validation_form  # noqa: E402
 from tests.test_submenu import FakeSock, awaiting, insert_option, mem_conn, seed_queue_menu  # noqa: E402
 
 OWN = "u:bot@claro.com"
@@ -73,58 +69,7 @@ class OpenFormDetectionTest(unittest.TestCase):
     def test_chat_de_fila_nao_e_formulario(self):
         self.assertFalse(is_open_validation_form(queue_chat()))
 
-    def test_match_por_address(self):
-        forms = [form_chat()]
-        self.assertTrue(has_open_validation_form(queue_chat(), forms, own=OWN))
-        self.assertFalse(has_open_validation_form(queue_chat(started_addr=OTHER), forms, own=OWN))
 
-    def test_nao_casa_so_staff(self):
-        form = form_chat(
-            started_addr=QUEUE,
-            participants={
-                QUEUE: {"address": QUEUE, "name": "Fila"},
-                OWN: {"address": OWN, "role_desc": "Moderator"},
-                "CREATEDBYMESSAGESCENARIO": {
-                    "address": "CREATEDBYMESSAGESCENARIO",
-                    "role_desc": "Moderator",
-                },
-            },
-        )
-        self.assertTrue(is_open_validation_form(form))
-        self.assertFalse(has_open_validation_form(queue_chat(), [form], own=OWN))
-
-    def test_fila_sem_form_no_indice(self):
-        self.assertFalse(has_open_validation_form(queue_chat(), [], own=OWN))
-        self.assertFalse(has_open_validation_form(queue_chat(), None, own=OWN))
-
-
-class ResolveOptionTest(unittest.TestCase):
-    def setUp(self):
-        self.opt = {
-            "action": "transfer_only",
-            "reply_text": "texto normal",
-            "action_if_form": "reply_and_close",
-            "reply_text_if_form": "texto form",
-        }
-
-    def test_sem_form_usa_campos_atuais(self):
-        self.assertEqual(resolve_option(self.opt, False), ("transfer_only", "texto normal"))
-
-    def test_com_form_usa_alternativos(self):
-        self.assertEqual(resolve_option(self.opt, True), ("reply_and_close", "texto form"))
-
-    def test_com_form_overrides_vazios_cai_no_atual(self):
-        opt = {"action": "ask_and_transfer", "reply_text": "peça o protocolo", "action_if_form": "", "reply_text_if_form": ""}
-        self.assertEqual(resolve_option(opt, True), ("ask_and_transfer", "peça o protocolo"))
-
-    def test_action_if_form_sozinho_mantem_reply_text(self):
-        opt = {
-            "action": "transfer_only",
-            "reply_text": "texto normal",
-            "action_if_form": "reply_and_close",
-            "reply_text_if_form": "",
-        }
-        self.assertEqual(resolve_option(opt, True), ("reply_and_close", "texto normal"))
 
 
 class SchemaFormFieldsTest(unittest.TestCase):
@@ -202,8 +147,6 @@ class EngineFormOpenTest(unittest.IsolatedAsyncioTestCase):
             classification="tec",
             action="transfer_only",
             reply_text="",
-            action_if_form="reply_and_close",
-            reply_text_if_form="Você já tem formulário de validação aberto.",
         )
 
     async def test_consider_indexa_form_aberto(self):
@@ -212,7 +155,8 @@ class EngineFormOpenTest(unittest.IsolatedAsyncioTestCase):
         await eng.consider(form_chat())
         self.assertIn(99, eng._open_forms)
 
-    async def test_com_form_nao_transfere(self):
+    async def test_com_form_aberto_vale_a_acao_normal(self):
+        """O override action_if_form foi removido: com formulario aberto vale a acao da folha."""
         conn = mem_conn()
         seed_queue_menu(conn, with_team=True)
         self._leaf(conn)
@@ -222,16 +166,15 @@ class EngineFormOpenTest(unittest.IsolatedAsyncioTestCase):
         row = awaiting(conn)
         await eng.handle_reply(10, row, "1")
         cmds = [n for n, _ in sock.cmds]
-        self.assertNotIn("move_chat", cmds)
-        self.assertIn("Você já tem formulário de validação aberto.", sock.sent_texts())
+        self.assertIn("move_chat", cmds)
+        self.assertNotIn("Você já tem formulário de validação aberto.", sock.sent_texts())
         chat = conn.execute("SELECT * FROM chats WHERE chat_id = 10").fetchone()
         self.assertEqual(chat["classification"], "tec")
-        self.assertEqual(chat["status"], "closed")
         details = [
             e["detail"]
             for e in conn.execute("SELECT detail FROM bot_events WHERE reason = 'classified'").fetchall()
         ]
-        self.assertTrue(any("form_aberto" in (d or "") for d in details))
+        self.assertFalse(any("form_aberto" in (d or "") for d in details))
 
     async def test_sem_form_transfere(self):
         conn = mem_conn()

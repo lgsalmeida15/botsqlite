@@ -186,11 +186,18 @@ class ToaSocket:
         except asyncio.TimeoutError:
             self.pending.pop(r, None)
             log.info("TOA command %s sem eco r=%s (timeout %.0fs)", a, r, timeout)
-            return {"ok": True, "timeout": True}
+            # O `r` fica no retorno para a instrumentacao (delivery_attempts) poder
+            # registrar qual solicitacao ficou sem eco.
+            return {"ok": True, "timeout": True, "r": r}
         if ack.get("e") not in (None, 0):
+            d = ack.get("d") if isinstance(ack.get("d"), dict) else {}
+            msg = d.get("message") or d.get("error")
             raise RuntimeError(
-                ack.get("d", {}).get("message") or ack.get("d", {}).get("error") or str(ack.get("e"))
+                f"{ack.get('e')}: {msg}" if msg else f"{ack.get('e')}: erro do TOA sem mensagem"
             )
+        if isinstance(ack, dict):
+            # Correlacao explicita: a instrumentacao de entrega grava o `r` da tentativa.
+            ack.setdefault("r", r)
         return ack
 
     async def close(self) -> None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 OPEN_STATUSES = frozenset({
     "joined", "menu_sent", "awaiting_reply", "classified", "monitoring",
     "awaiting_script_answer", "awaiting_script_confirm", "awaiting_script_run",
+    "awaiting_form_choice",
 })
 
 

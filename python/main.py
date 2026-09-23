@@ -97,6 +97,7 @@ async def run_once(conn, page, state: dict):
                         engine.conn = db.connect()
                         log.info("SQLite reconectado (timer)")
                     await engine.tick_timeouts()
+                    await engine.tick_routes()
                     await engine.process_pending_jobs()
                     poll = int(engine.cfg.get("config_poll_sec") or 15)
                     if n % max(poll, 5) == 0:

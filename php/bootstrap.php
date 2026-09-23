@@ -31,7 +31,13 @@ function bot_root(): string
 
 function bot_sqlite_path(): string
 {
-    $rel = bot_env('SQLITE_PATH', 'data/helptoa.sqlite');
+    // `.env` manda (é a fonte documentada); sem a chave lá, aceita o ambiente —
+    // é o que permite rodar as suítes de painel em banco temporário sem tocar
+    // em data/helptoa.sqlite.
+    $rel = bot_env('SQLITE_PATH');
+    if ($rel === null || $rel === '') {
+        $rel = getenv('SQLITE_PATH') ?: 'data/helptoa.sqlite';
+    }
     if ($rel === null || $rel === '') {
         $rel = 'data/helptoa.sqlite';
     }
@@ -90,6 +96,164 @@ function bot_ensure_schema(PDO $pdo): void
         $pdo->exec($stmt);
     }
     bot_migrate_submenu($pdo);
+    bot_migrate_rbac($pdo);
+    bot_migrate_ask($pdo);
+    bot_migrate_queue($pdo);
+    bot_migrate_delivery($pdo);
+    bot_migrate_form_aware($pdo);
+}
+
+/**
+ * Fluxo "Pedir info e transferir" com perguntas: a tabela menu_option_questions
+ * vem do schema.sql; aqui garantimos a coluna de estado em chats (bases antigas)
+ * e a marca de atividade do tecnico (timeout por silencio).
+ */
+function bot_migrate_ask(PDO $pdo): void
+{
+    if (!bot_table_exists($pdo, 'chats')) {
+        return;
+    }
+    $chatCols = bot_table_columns($pdo, 'chats');
+    if (!isset($chatCols['ask_option_id'])) {
+        $pdo->exec('ALTER TABLE chats ADD COLUMN ask_option_id INTEGER REFERENCES menu_options(id) ON DELETE SET NULL');
+    }
+    if (!isset($chatCols['last_reply_at'])) {
+        $pdo->exec('ALTER TABLE chats ADD COLUMN last_reply_at TEXT');
+    }
+    if (!isset($chatCols['moved_at'])) {
+        // Transferencia parcial: `move_chat` ja feito e `invite_to_chat` pendente.
+        $pdo->exec('ALTER TABLE chats ADD COLUMN moved_at TEXT');
+    }
+}
+
+/**
+ * Abertura form-aware: vinculo chat<->formulario, rota presa ao dono do caso e
+ * os textos novos da aba Templates. Espelho de python/db.py::_migrate_form_aware.
+ */
+function bot_migrate_form_aware(PDO $pdo): void
+{
+    if (!bot_table_exists($pdo, 'templates')) {
+        return;
+    }
+    if (bot_table_exists($pdo, 'chats') && !isset(bot_table_columns($pdo, 'chats')['linked_form_chat_id'])) {
+        $pdo->exec('ALTER TABLE chats ADD COLUMN linked_form_chat_id INTEGER');
+    }
+    if (bot_table_exists($pdo, 'pending_routes') && !isset(bot_table_columns($pdo, 'pending_routes')['expects_owner'])) {
+        $pdo->exec('ALTER TABLE pending_routes ADD COLUMN expects_owner INTEGER NOT NULL DEFAULT 0');
+    }
+    $opcoes = implode("\n", ['Digite o número da opção:', '1) Falar sobre o formulário', '2) Abrir o menu']);
+    $textos = [
+        'form_pending' => "Você tem um formulário de validação em andamento com {analista}.\n\n" . $opcoes,
+        'form_pending_wait' => "Você tem um formulário de validação aguardando atendimento.\n\n" . $opcoes,
+        'form_waiting' => 'Assim que um analista assumir a sua validação, eu encaminho este chat para ele.'
+            . ' Em breve você será atendido.',
+    ];
+    $st = $pdo->prepare('INSERT OR IGNORE INTO templates (slug, body) VALUES (?, ?)');
+    foreach ($textos as $slug => $body) {
+        $st->execute([$slug, $body]);
+    }
+    // Reparo: a primeira versao da semente gravou "\n" literal (SQLite nao
+    // interpreta escape) e o INSERT OR IGNORE nunca corrigia depois.
+    $pdo->prepare(
+        'UPDATE templates SET body = replace(body, ?, char(10))'
+        . " WHERE slug IN ('form_pending', 'form_pending_wait', 'form_waiting')"
+        . ' AND instr(body, ?) > 0'
+    )->execute(['\n', '\n']);
+
+    // Reparo do "balde" de identidade: chave generica do agente (ou vazia) vira
+    // caso POR FORMULARIO (`chat:<id>`) — assim a afinidade nao junta tecnicos
+    // diferentes no mesmo analista. Espelho de python/db.py::_migrate_case_keys.
+    $generica = "(case_key = '' OR lower(case_key) IN"
+        . " ('n:message scenario agent', 'n:mensagem de cenario', 'n:solicitacao de encerramento'))";
+    if (bot_table_exists($pdo, 'route_assignments') && isset(bot_table_columns($pdo, 'route_assignments')['case_key'])) {
+        $pdo->exec("UPDATE route_assignments SET case_key = 'chat:' || chat_id WHERE closed_at IS NULL AND {$generica}");
+        // Dialeto legado: chave de address SEM o prefixo `a:` (`u:...`). A
+        // afinidade compara string exata, entao essa chave nao casava com a do
+        // formulario/chat novo do mesmo tecnico. Idempotente. Espelho de
+        // python/db.py::_migrate_case_keys.
+        $pdo->exec("UPDATE route_assignments SET case_key = 'a:' || case_key WHERE closed_at IS NULL AND case_key LIKE 'u:%'");
+    }
+    if (bot_table_exists($pdo, 'pending_routes') && isset(bot_table_columns($pdo, 'pending_routes')['case_key'])) {
+        $pdo->exec("UPDATE pending_routes SET case_key = 'chat:' || chat_id WHERE status = 'waiting' AND {$generica}");
+        $pdo->exec("UPDATE pending_routes SET case_key = 'a:' || case_key WHERE status = 'waiting' AND case_key LIKE 'u:%'");
+    }
+}
+
+/**
+ * Fila de espera (Fase 2): expiracao da espera e ultima posicao avisada ao tecnico.
+ */
+function bot_migrate_queue(PDO $pdo): void
+{
+    if (!bot_table_exists($pdo, 'pending_routes')) {
+        return;
+    }
+    $cols = bot_table_columns($pdo, 'pending_routes');
+    if (!isset($cols['expires_at'])) {
+        $pdo->exec('ALTER TABLE pending_routes ADD COLUMN expires_at TEXT');
+    }
+    if (!isset($cols['last_position'])) {
+        $pdo->exec('ALTER TABLE pending_routes ADD COLUMN last_position INTEGER NOT NULL DEFAULT 0');
+    }
+}
+
+function bot_migrate_delivery(PDO $pdo): void
+{
+    // Espelho de python/db.py::_migrate_delivery: identidade do caso na entrega,
+    // marcas (alvo imutavel/move ja enviado), posse (claim) e o indice unico que
+    // impede duas entregas ativas para o mesmo chat/formulario.
+    if (!bot_table_exists($pdo, 'pending_routes')) {
+        return;
+    }
+    $cols = bot_table_columns($pdo, 'pending_routes');
+    $novas = [
+        'case_key' => "case_key TEXT NOT NULL DEFAULT ''",
+        'requester_addr' => "requester_addr TEXT NOT NULL DEFAULT ''",
+        'invite_target' => "invite_target TEXT NOT NULL DEFAULT ''",
+        'move_sent_at' => 'move_sent_at TEXT',
+        // `move_chat` recusado pelo TOA (e=10 = formulario ja com alguem):
+        // a rota para depois de N falhas em vez de girar para sempre.
+        'move_fails' => 'move_fails INTEGER NOT NULL DEFAULT 0',
+        'claimed_by' => "claimed_by TEXT NOT NULL DEFAULT ''",
+        'claimed_at' => 'claimed_at TEXT',
+        'claim_expires_at' => 'claim_expires_at TEXT',
+    ];
+    foreach ($novas as $nome => $ddl) {
+        if (!isset($cols[$nome])) {
+            $pdo->exec('ALTER TABLE pending_routes ADD COLUMN ' . $ddl);
+        }
+    }
+    if (bot_table_exists($pdo, 'route_assignments') && !isset(bot_table_columns($pdo, 'route_assignments')['close_reason'])) {
+        $pdo->exec("ALTER TABLE route_assignments ADD COLUMN close_reason TEXT NOT NULL DEFAULT ''");
+    }
+    if (!bot_table_exists($pdo, 'delivery_attempts')) {
+        $pdo->exec(
+            'CREATE TABLE delivery_attempts ('
+            . ' id INTEGER PRIMARY KEY AUTOINCREMENT,'
+            . " at TEXT NOT NULL DEFAULT (datetime('now')),"
+            . " kind TEXT NOT NULL DEFAULT '',"
+            . ' chat_id INTEGER, route_id INTEGER,'
+            . ' op TEXT NOT NULL,'
+            . " target TEXT NOT NULL DEFAULT '',"
+            . " request_id TEXT NOT NULL DEFAULT '',"
+            . " result TEXT NOT NULL DEFAULT '',"
+            . ' latency_ms INTEGER NOT NULL DEFAULT 0,'
+            . " error TEXT NOT NULL DEFAULT '')"
+        );
+        $pdo->exec('CREATE INDEX IF NOT EXISTS delivery_attempts_at_idx ON delivery_attempts (at DESC)');
+        $pdo->exec('CREATE INDEX IF NOT EXISTS delivery_attempts_chat_idx ON delivery_attempts (chat_id, id)');
+    }
+    // Saneia duplicatas antigas antes de criar o indice (bases em uso).
+    $pdo->exec(
+        "UPDATE pending_routes SET status = 'cancelled', detail = 'duplicata saneada na migracao'"
+        . " WHERE status NOT IN ('done', 'failed', 'cancelled')"
+        . ' AND EXISTS (SELECT 1 FROM pending_routes r2 WHERE r2.kind = pending_routes.kind'
+        . ' AND r2.chat_id = pending_routes.chat_id AND r2.status NOT IN (\'done\', \'failed\', \'cancelled\')'
+        . ' AND r2.id < pending_routes.id)'
+    );
+    $pdo->exec(
+        "CREATE UNIQUE INDEX IF NOT EXISTS pending_routes_active ON pending_routes (kind, chat_id)"
+        . " WHERE status NOT IN ('done', 'failed', 'cancelled')"
+    );
 }
 
 function bot_table_exists(PDO $pdo, string $table): bool
@@ -150,6 +314,18 @@ function bot_migrate_submenu(PDO $pdo): void
             $pdo->exec("ALTER TABLE queue_operators ADD COLUMN source TEXT NOT NULL DEFAULT 'toa'");
         }
     }
+    if (bot_table_exists($pdo, 'team_routing')) {
+        $trCols = bot_table_columns($pdo, 'team_routing');
+        if (!isset($trCols['cap_cases'])) {
+            $pdo->exec('ALTER TABLE team_routing ADD COLUMN cap_cases INTEGER');
+        }
+    }
+    if (bot_table_exists($pdo, 'team_member_routing')) {
+        $tmrCols = bot_table_columns($pdo, 'team_member_routing');
+        if (!isset($tmrCols['cap_cases'])) {
+            $pdo->exec('ALTER TABLE team_member_routing ADD COLUMN cap_cases INTEGER');
+        }
+    }
     $pdo->exec('DROP INDEX IF EXISTS menu_options_per_menu');
     $pdo->exec(
         'CREATE UNIQUE INDEX IF NOT EXISTS menu_options_per_menu_root
@@ -208,6 +384,107 @@ function bot_rebuild_menu_options_check(PDO $pdo): void
     );
     $pdo->exec('COMMIT');
     $pdo->exec('PRAGMA foreign_keys = ON');
+}
+
+function bot_migrate_rbac(PDO $pdo): void
+{
+    if (!bot_table_exists($pdo, 'bot_users')) {
+        return;
+    }
+    $userCols = bot_table_columns($pdo, 'bot_users');
+    if (!isset($userCols['group_id'])) {
+        $pdo->exec('ALTER TABLE bot_users ADD COLUMN group_id INTEGER REFERENCES permission_groups(id) ON DELETE SET NULL');
+    }
+    if (!isset($userCols['display_name'])) {
+        $pdo->exec("ALTER TABLE bot_users ADD COLUMN display_name TEXT NOT NULL DEFAULT ''");
+    }
+    if (!isset($userCols['operator_address'])) {
+        $pdo->exec("ALTER TABLE bot_users ADD COLUMN operator_address TEXT NOT NULL DEFAULT ''");
+    }
+    if (!isset($userCols['last_login_at'])) {
+        $pdo->exec('ALTER TABLE bot_users ADD COLUMN last_login_at TEXT');
+    }
+    bot_rbac_promote_legacy_users($pdo);
+    bot_rbac_copy_user_scope_to_groups($pdo);
+}
+
+/**
+ * Promove para Super Admin os usuarios que existiam antes do RBAC, uma unica
+ * vez (flag rbac_seeded em bot_settings), para o painel nunca ficar sem
+ * administrador. Usuarios criados depois ficam sem grupo ate serem associados.
+ */
+function bot_rbac_promote_legacy_users(PDO $pdo): void
+{
+    if (!bot_table_exists($pdo, 'permission_groups') || !bot_table_exists($pdo, 'bot_settings')) {
+        return;
+    }
+    $st = $pdo->prepare('SELECT value FROM bot_settings WHERE key = ?');
+    $st->execute(['rbac_seeded']);
+    $flag = $st->fetchColumn();
+    if ($flag === false || (string) $flag === '1') {
+        return;
+    }
+    $superId = bot_super_group_id($pdo);
+    if ($superId > 0) {
+        $pdo->prepare('UPDATE bot_users SET group_id = ? WHERE group_id IS NULL')->execute([$superId]);
+    }
+    $pdo->prepare('UPDATE bot_settings SET value = ? WHERE key = ?')->execute(['1', 'rbac_seeded']);
+}
+
+/**
+ * O escopo de dados passou a ser do GRUPO. Copia uma unica vez o que estava no
+ * nivel do usuario (user_teams/user_queues) para group_teams/group_queues.
+ * As tabelas de usuario ficam como legado, sem uso pelo painel.
+ */
+function bot_rbac_copy_user_scope_to_groups(PDO $pdo): void
+{
+    if (!bot_table_exists($pdo, 'group_teams') || !bot_table_exists($pdo, 'group_queues') || !bot_table_exists($pdo, 'bot_settings')) {
+        return;
+    }
+    $st = $pdo->prepare('SELECT value FROM bot_settings WHERE key = ?');
+    $st->execute(['rbac_scope_groups']);
+    $flag = $st->fetchColumn();
+    if ($flag === false || (string) $flag === '1') {
+        return;
+    }
+    if (bot_table_exists($pdo, 'user_teams')) {
+        $pdo->exec(
+            'INSERT OR IGNORE INTO group_teams (group_id, team_id)
+             SELECT u.group_id, ut.team_id FROM user_teams ut
+               JOIN bot_users u ON u.id = ut.user_id
+              WHERE u.group_id IS NOT NULL'
+        );
+    }
+    if (bot_table_exists($pdo, 'user_queues')) {
+        $pdo->exec(
+            'INSERT OR IGNORE INTO group_queues (group_id, queue_address)
+             SELECT u.group_id, uq.queue_address FROM user_queues uq
+               JOIN bot_users u ON u.id = uq.user_id
+              WHERE u.group_id IS NOT NULL'
+        );
+    }
+    $pdo->prepare('UPDATE bot_settings SET value = ? WHERE key = ?')->execute(['1', 'rbac_scope_groups']);
+}
+
+function bot_super_group_id(PDO $pdo): int
+{
+    if (!bot_table_exists($pdo, 'permission_groups')) {
+        return 0;
+    }
+    $st = $pdo->query('SELECT id FROM permission_groups WHERE is_super = 1 ORDER BY id LIMIT 1');
+    $id = $st === false ? false : $st->fetchColumn();
+    return ($id === false || $id === null) ? 0 : (int) $id;
+}
+
+function bot_has_active_super_admin(PDO $pdo): bool
+{
+    $superId = bot_super_group_id($pdo);
+    if ($superId < 1) {
+        return false;
+    }
+    $st = $pdo->prepare('SELECT 1 FROM bot_users WHERE group_id = ? AND active = 1 LIMIT 1');
+    $st->execute([$superId]);
+    return $st->fetchColumn() !== false;
 }
 
 function h(?string $v): string

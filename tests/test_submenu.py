@@ -145,6 +145,9 @@ class SchemaSubmenuTest(unittest.TestCase):
         db._migrate_submenu(conn)
         self.assertIn("parent_id", db._table_columns(conn, "menu_options"))
         self.assertIn("menu_node_id", db._table_columns(conn, "chats"))
+        db._migrate_ask(conn)
+        self.assertIn("ask_option_id", db._table_columns(conn, "chats"))
+        self.assertIn("last_reply_at", db._table_columns(conn, "chats"))
         conn.execute("UPDATE menu_options SET action = 'submenu', classification = '' WHERE id = 1")
         row = conn.execute("SELECT action, parent_id FROM menu_options WHERE id = 1").fetchone()
         self.assertEqual(row["action"], "submenu")
@@ -438,7 +441,7 @@ class EngineSubmenuTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sock.online_calls, 5)
         self.assertIn("tentativas=5", reason)
 
-    async def test_transfer_sem_analista_sai_do_chat(self):
+    async def test_transfer_sem_analista_fica_na_fila(self):
         conn = mem_conn()
         seed_queue_menu(conn, with_team=True)
         insert_option(
@@ -455,6 +458,41 @@ class EngineSubmenuTest(unittest.IsolatedAsyncioTestCase):
         eng.cfg["transfer_retry_interval_sec"] = "0"
         row = awaiting(conn)
         await eng.handle_reply(10, row, "1")
+        chat = conn.execute("SELECT * FROM chats WHERE chat_id = 10").fetchone()
+        self.assertEqual(chat["status"], "classified")
+        cmds = [n for n, _ in sock.cmds]
+        self.assertNotIn("leave_chat", cmds)
+        self.assertNotIn("move_chat", cmds)
+        wait = conn.execute("SELECT * FROM pending_routes WHERE status = 'waiting'").fetchall()
+        self.assertEqual(len(wait), 1)
+        self.assertIsNone(wait[0]["expires_at"])
+        reasons = [
+            e["reason"]
+            for e in conn.execute("SELECT reason FROM bot_events").fetchall()
+        ]
+        self.assertIn("no_agent", reasons)
+        self.assertIn("queued", reasons)
+
+    async def test_transfer_sem_analista_com_fila_desligada_sai_do_chat(self):
+        conn = mem_conn()
+        seed_queue_menu(conn, with_team=True)
+        insert_option(
+            conn,
+            menu_id=1,
+            sort_order=1,
+            label="Transferir",
+            classification="tec",
+            action="transfer_only",
+        )
+        sock = FakeSockNoOnline()
+        eng = Engine(conn, sock)
+        eng.cfg["transfer_attempts"] = "1"
+        eng.cfg["transfer_retry_interval_sec"] = "0"
+        eng.cfg["queue_wait_enabled"] = "false"
+        row = awaiting(conn)
+        await eng.handle_reply(10, row, "1")
+        conn.execute("UPDATE pending_routes SET next_try_at = datetime('now', '-1 seconds')")
+        await eng.tick_routes()
         chat = conn.execute("SELECT * FROM chats WHERE chat_id = 10").fetchone()
         self.assertEqual(chat["status"], "closed_no_agent")
         cmds = [n for n, _ in sock.cmds]

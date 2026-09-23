@@ -36,214 +36,637 @@
 <body>
   <div class="cover">
     <h1>HELPTOA Bot</h1>
-    <p class="lead">Fluxogramas completos do atendimento (botsqlite)</p>
-    <p class="meta">Documento gerado a partir do comportamento atual do daemon Python + painel PHP. O diretório <code>bot/</code> não está incluído.</p>
+    <p class="lead">Fluxogramas do atendimento do chatbot — como está hoje</p>
+    <p class="meta">Retrato do código em 21/09/2026, conferido em <code>python/engine.py</code>, <code>python/routing.py</code>, <code>python/main.py</code>, <code>python/resume.py</code>, <code>python/form_open.py</code> e <code>schema.sql</code>. Visão detalhada: <code>docs/desenho-bot.md</code>.</p>
     <ol>
-      <li>Visão geral</li>
+      <li>Visão geral do atendimento</li>
       <li>Filtros para assumir o chat</li>
-      <li>Menu, submenu, dígito e timeout</li>
-      <li>Classificação e formulário de validação aberto</li>
-      <li>Transferência: fila → time → rodízio</li>
-      <li>Restart / recycle (sem reenviar menu)</li>
+      <li>Menu, submenu, dígito, retry e timeout — inclui a <strong>abertura form-aware</strong> (3.1)</li>
+      <li>Folha escolhida: resposta, perguntas, script e transferência</li>
+      <li>Quem recebe: roteamento por caso</li>
+      <li>Entrega, fila de espera e fallback</li>
+      <li>Formulário de validação do TOA</li>
+      <li>Restart, resume e reciclagem do Chromium</li>
+      <li>Timers e saúde do processo</li>
+      <li>Status do chat e eventos registrados</li>
       <li>Amarrações do painel</li>
     </ol>
   </div>
 
   <section>
-    <h2>1. Visão geral</h2>
-    <p class="lead">Caminho principal desde o chat na fila até encerrar ou ficar em monitoramento.</p>
+    <h2>1. Visão geral do atendimento</h2>
+    <p class="lead">Caminho principal: o chat da fila habilitada é assumido, recebe o menu, é classificado e termina entregue a um analista, encerrado pelo bot ou em monitoramento.</p>
     <pre class="mermaid">
 flowchart TD
-  chatIn[Chat entra na fila TOA]
-  consider[consider: pode assumir?]
-  join[join_chat + presenca]
-  menu[Envia greeting e menu raiz]
-  wait[awaiting_reply]
-  digito[Tecnico envia digito]
-  classif[Classifica opcao]
-  fecha[leave_chat encerrado]
+  chatIn[Chat entra na fila do TOA]
+  consider{consider: pode assumir?}
+  ignora[Evento de recusa e fim]
+  menu[join_chat + greeting e menu raiz]
+  wait[awaiting_reply: espera o digito]
+  digito[Opcao escolhida pelo tecnico]
+  folha[Aplica a folha: classificacao gravada]
+  script[Script de apoio: perguntas e execucao]
+  perguntas[Perguntas antes de transferir]
+  entrega[Escolhe analista e entrega]
+  espera[Fila de espera com posicao]
+  fecha[leave_chat: encerrado]
   monitor[monitoring: bot fica no chat]
 
   chatIn --> consider
-  consider -->|sim| join
-  join -->|presente e menu com opcoes| menu --> wait
-  wait --> digito
-  digito --> classif
-  classif -->|reply_and_close| fecha
-  classif -->|transferiu| fecha
-  classif -->|sem analista| monitor
+  consider -->|nao| ignora
+  consider -->|sim| menu --> wait --> digito --> folha
+  folha -->|reply_and_close| fecha
+  folha -->|transfer_only| entrega
+  folha -->|ask_and_transfer com perguntas| perguntas --> entrega
+  folha -->|ask_and_transfer sem perguntas| entrega
+  folha -->|run_script| script
+  script -->|retorno do script| folha
+  entrega -->|analista convidado| fecha
+  entrega -->|ninguem elegivel| espera
+  espera -->|analista apareceu| fecha
+  espera -->|Encerrar espera com fallback monitor| monitor
+  espera -->|Encerrar espera com fallback close| fecha
+  folha -->|sem analista e fallback monitor| monitor
     </pre>
+    <p class="note">O bot é o único participante que fala pelo número da fila: entra com <code>join_chat</code>, grava o estado no SQLite <strong>antes</strong> de enviar cada mensagem e só sai com <code>leave_chat</code>. Nenhum texto de conversa vai para o banco — só status, classificação, respostas de coletas e timestamps.</p>
   </section>
 
   <section>
     <h2>2. Filtros para assumir o chat</h2>
-    <p class="lead">Amarrações: fila habilitada no painel e menu ligado à fila. Formulário de validação do TOA não é chat de fila.</p>
+    <p class="lead">Tudo isso vive em <code>Engine.consider</code>. Cada recusa gera evento próprio; nada é silencioso. Primeiro os filtros de entrada:</p>
     <pre class="mermaid">
-flowchart TD
+flowchart LR
   ev[helpdesk_chat_received ou get_helpdesk_chats]
-  botOff{Bot ligado?}
-  formVal{Formulario de encerramento TOA?}
-  temFila{Tem helpdesk_address?}
-  filaOn{Fila habilitada?}
-  jaAtendido{Ja tem analista ou o bot?}
-  jaLinha{Linha no SQLite nao e detected ou skipped?}
-  assume[Assumir: join e menu]
-  ignora[Nao assume]
+  botOff{Bot ligado no painel?}
+  formVal{Formulario de validacao do TOA?}
+  temFila{Tem helpdesk_address ou channel_addr?}
+  filaOn{Fila habilitada para o bot?}
+  ignoraF[Evento de recusa e fim]
+  formRoute[closure + route_form: secao 7]
+  assume[Segue para assumir o chat]
 
   ev --> botOff
-  botOff -->|nao: bot_off| ignora
+  botOff -->|nao: bot_off| ignoraF
   botOff -->|sim| formVal
-  formVal -->|sim: indexa form e ignora| ignora
+  formVal -->|sim: closure| formRoute
   formVal -->|nao| temFila
-  temFila -->|nao: queue_unknown| ignora
+  temFila -->|nao: queue_unknown| ignoraF
   temFila -->|sim| filaOn
-  filaOn -->|nao: queue_off| ignora
-  filaOn -->|sim| jaAtendido
+  filaOn -->|nao: queue_off| ignoraF
+  filaOn -->|sim| assume
+    </pre>
+    <p class="lead">Depois a assunção: o bot só entra quando o chat ainda é novo e a presença é confirmada.</p>
+    <pre class="mermaid">
+flowchart LR
+  assume2[Chat passou nos filtros]
+  jaAtendido{Ja tem Moderator ou o bot presente?}
+  jaLinha{Linha no SQLite fora de detected e skipped?}
+  sqlite[status detected]
+  join[join_chat + espera presenca]
+  presente{Presenca confirmada?}
+  temMenu{A fila tem opcao de menu?}
+  saudacao[status joined e evento assumed]
+  ar[status awaiting_reply antes do envio]
+  menu[greeting + menu raiz e evento menu_sent]
+  ignora[Evento not_new ou duplicidade e fim]
+  falha[join_failed e fim]
+
+  assume2 --> jaAtendido
   jaAtendido -->|sim: not_new| ignora
   jaAtendido -->|nao| jaLinha
-  jaLinha -->|ja em andamento| ignora
-  jaLinha -->|novo| assume
+  jaLinha -->|em andamento| ignora
+  jaLinha -->|novo| sqlite --> join --> presente
+  presente -->|nao| falha
+  presente -->|sim| temMenu
+  temMenu -->|nao: menu vazio| falha
+  temMenu -->|sim| saudacao --> ar --> menu
     </pre>
+    <p class="note">A espera de presença leva até 10 s (40 tentativas de 0,25 s) e, se o ACK do <code>join_chat</code> não confirmar, o bot confere em <code>get_active_chats</code>. O mesmo chat nunca reinicia a conversa: com linha em <code>detected</code> ou <code>skipped</code> o bot ignora a duplicidade; em um ciclo novo o <code>moved_at</code> é zerado.</p>
   </section>
 
   <section>
-    <h2>3. Menu, submenu, dígito e timeout</h2>
-    <p class="lead">Raiz = opções sem parent_id. Filho = parent_id da opção submenu. Número 0 só vale no submenu (Voltar). Timeout usa reply_timeout_sec (padrão 300 s) também no submenu.</p>
+    <h2>3. Menu, submenu, dígito, retry e timeout</h2>
+    <p class="lead">O estado é gravado antes do envio (<code>awaiting_reply</code> + <code>last_prompt_at</code>), a opção é escolhida pelo <code>sort_order</code> igual ao dígito e o relógio mede o <strong>silêncio do solicitante</strong>, não o tempo desde a pergunta.</p>
     <pre class="mermaid">
-flowchart TD
-  wait[awaiting_reply]
-  msg[Mensagem do tecnico originador]
-  timeout{Passou reply_timeout_sec?}
+flowchart LR
+  wait[Estado awaiting_reply]
+  timeout{Silencio maior que reply_timeout_sec?}
+  fechaTO[closing + leave_chat: closed_timeout]
+  msg{Mensagem do solicitante depois do menu?}
+  ignora[Ignora: bot, terceiros e mensagem anterior ao menu]
+  marca[last_reply_at = agora: zera o relogio]
   nivel{Esta em submenu?}
   zero{Digitou 0?}
-  num{E numero da lista?}
+  raiz[Reenvia greeting + menu raiz]
+  num{O digito existe na lista do nivel?}
   sub{Acao da opcao e submenu?}
-  kids{Submenu tem filhos?}
-  aplica[apply_option]
+  kids{O submenu tem filhos?}
   invalido[Resposta invalida]
   retry{retries menor que max_invalid_retries?}
-  fechaInv[Envia closing e sai: closed_invalid]
-  fechaTO[Envia closing e sai: closed_timeout]
-  raiz[Reenvia menu raiz]
-  listaSub[Envia lista do submenu mais 0 Voltar]
+  reenvia[Template retry + lista do nivel atual]
+  fechaInv[closing + leave_chat: closed_invalid]
+  listaSub[Titulo + filhos + 0 Voltar]
+  aplica[apply_option: secao 4]
 
   wait --> timeout
   timeout -->|sim| fechaTO
   timeout -->|nao| msg
-  msg --> nivel
+  msg -->|nao| ignora
+  msg -->|sim| marca --> nivel
   nivel -->|sim| zero
   zero -->|sim| raiz --> wait
   zero -->|nao| num
-  nivel -->|nao: raiz| num
+  nivel -->|nao| num
   num -->|nao| invalido
   num -->|sim| sub
   sub -->|sim| kids
   kids -->|nao| invalido
   kids -->|sim| listaSub --> wait
-  sub -->|nao: folha| aplica
+  sub -->|nao: e folha| aplica
   invalido --> retry
-  retry -->|sim: retry e reenvia lista do nivel| wait
+  retry -->|sim| reenvia --> wait
   retry -->|nao| fechaInv
     </pre>
-    <p class="note">Só conta mensagem depois do menu (menu_sent_at), do técnico que abriu o chat (started_addr). Bot e outros participantes são ignorados.</p>
-  </section>
-
-  <section>
-    <h2>4. Classificação e formulário de validação aberto</h2>
-    <p class="lead">Cada folha tem ação/texto normais e, se preenchidos, action_if_form / reply_text_if_form. O form aberto segue o critério do TOA (cenário de validação pendente, casado pelo técnico).</p>
+    <p class="note">São consideradas só mensagens do técnico que abriu o chat (<code>started_addr</code>), depois do <code>menu_sent_at</code> e com texto. Resposta inválida <strong>também</strong> reinicia o relógio: <code>closed_timeout</code> só acontece com silêncio real. O menu nunca volta sozinho para a raiz — <code>0</code> só funciona dentro de um submenu. Ao voltar de restart, <code>replay_pending_reply</code> processa a resposta que chegou com o bot fora (evento <code>reply_replayed</code>) antes de qualquer timeout.</p>
+    <h2>3.1 Abertura form-aware: técnico com formulário em andamento</h2>
+    <p class="lead">Quando o chat assumido é de um técnico que <strong>já tem formulário de validação aberto</strong>, o bot não manda o menu: ele oferece <strong>1) Falar sobre o formulário</strong> / <strong>2) Abrir o menu</strong>. Chat e formulário passam a ser <strong>um caso só</strong> (mesmo <code>case_key</code> no ledger): encaminhado um, o outro vai junto.</p>
     <pre class="mermaid">
 flowchart TD
-  folha[Opcao folha escolhida]
-  form{Tecnico tem form de validacao aberto?}
-  usaAlt[Usa action_if_form e reply_text_if_form se preenchidos]
-  usaNorm[Usa action e reply_text]
-  grava[SQLite: classified mais classificacao]
-  acao{Acao resolvida}
-  envia[Envia texto de resposta se houver]
-  closeNode[leave_chat]
-  transfere[Tenta transferir]
-  monitor[status monitoring: bot permanece]
-
-  folha --> form
-  form -->|sim| usaAlt --> grava
-  form -->|nao| usaNorm --> grava
-  grava --> acao
-  acao -->|reply_and_close| envia --> closeNode
-  acao -->|ask_and_transfer| envia --> transfere
-  acao -->|transfer_only| transfere
-  transfere -->|convidou analista| closeNode
-  transfere -->|sem analista: no_agent| monitor
+  A[assumed] --> B{Tem formulario aberto do mesmo tecnico?}
+  B -->|nao| M[menu normal - secao 3]
+  B -->|sim| L[case_linked: chat + formulario no MESMO caso]
+  L --> G[1 falar sobre o formulario / 2 abrir o menu]
+  G -->|2| M
+  G -->|1| D{Ja tem analista no formulario?}
+  D -->|sim e na janela| T[move_chat + invite_to_chat para ele - o chat vai com o historico]
+  D -->|nao, ou fora da janela| W[form_waiting: o chat espera preso ao caso] --> T
+  T --> I[transferred + mesmo caso no ledger]
     </pre>
+    <p class="note">Correlação (qual formulário é do técnico): por <code>address</code>; por nome quando <code>affinity_match_name</code> = true; e, como o formulário do TOA normalmente <strong>não traz o address do técnico</strong> (o ledger chega a gravar <code>case_key='n:message scenario agent'</code>), o fallback é o <strong>formulário aberto mais recente da mesma fila</strong> que ainda não está vinculado a outro chat — o evento <code>case_linked</code> registra a regra usada. <strong>Estados do formulário</strong> (como na extensão do TOA): <em>pendente</em>, <em>em atendimento</em> (o analista entrou) e <em>passado</em> (o analista saiu / atendimento concluído) — o bot lê isso das <strong>mensagens do formulário</strong> (<code>get_chat_messages</code>, só leitura), no boot, na abertura e numa varredura de 1 por tick; passado sai de cena (<code>form_closed</code>) e nada é decidido se o TOA não responder. O vínculo é <strong>definitivo</strong>: formulário já oferecido a um chat não é oferecido de novo. <strong>Índice do formulário:</strong> fica acompanhado até um fim explícito, <code>chat_removed</code>, TTL de 12 h ou caso já encerrado no ledger; aviso de <em>fila</em> (<code>helpdesk_chat_removed</code>, que o <code>move_chat</code> para o analista gera) <strong>não</strong> tira o formulário, e o boot reconstrói o índice do ledger antes do resume (a varredura de boot não fecha caso de formulário). Eventos de diagnóstico: <code>form_indexed</code>, <code>form_not_open</code>, <code>form_dropped</code>, <code>form_ignored_payload</code>, <code>form_queue_left</code>, <code>form_forget</code>, <code>form_state</code>, <code>form_closed</code>, <code>form_aware_skip</code>. O chat do ramo 1 entra na fila com <code>expects_owner=1</code>: espera o analista do formulário <strong>sem gastar tentativa nem cair no fallback</strong>, e a entrega das duas peças juntas acontece quando uma delas é atribuída (<code>case_sibling_delivered</code>). Textos: <code>form_pending</code>, <code>form_pending_wait</code> e <code>form_waiting</code> (aba Templates).</p>
   </section>
 
   <section>
-    <h2>5. Transferência: fila → time → rodízio</h2>
-    <p class="lead">Uma fila só pode estar em um time. A opção não escolhe pessoa; só a ação “transferir”. O time da fila do chat decide quem recebe.</p>
+    <h2>4. Folha escolhida: resposta, perguntas, script e transferência</h2>
+    <p class="lead">A folha grava a classificação e resolve a ação. <code>ask_and_transfer</code> com perguntas cadastradas coleta no chat antes de tentar entregar; <code>run_script</code> chama o script de apoio com a sessão do navegador.</p>
     <pre class="mermaid">
 flowchart TD
-  tenta[pick_assignee da fila]
-  time{Fila tem time ativo?}
-  membros{Time tem membros?}
-  janela{Alguem na janela de horario BRT?}
-  online[get_online_users: online no TOA]
-  cap{Abaixo do cap max_open_chats_per_agent?}
-  rr[Rodizio: proximo depois de last_assigned]
-  move[move_chat para a fila]
-  invite[invite_to_chat no escolhido]
-  ok[transferred e bot sai]
-  fail[no_agent e monitoring]
+  folha[Folha escolhida]
+  act{Acao da opcao}
+  submenuNao[Acao submenu nao e folha: vale resposta invalida]
+  script[run_script: ver diagrama abaixo]
+  temPerg{ask_and_transfer tem perguntas?}
+  wizard[Coleta a pergunta 1 ate a N]
+  conf{Confirmacao: 1 confirma 2 corrige}
+  corrige[Volta a primeira pergunta]
+  resumo[Resumo ask_received no chat e evento ask_collected]
+  enfileira[Enfileira a rota kind=chat]
+  grava[status classified + classificacao + option_id + classified_at]
+  txt[Envia reply_text]
+  fecha[leave_chat: closed]
+  entrega[Entrega e fila de espera: secao 6]
 
-  tenta --> time
-  time -->|nao| fail
-  time -->|sim| membros
-  membros -->|nao| fail
-  membros -->|sim| janela
-  janela -->|nao: fora_horario| fail
+  folha --> act
+  act -->|submenu| submenuNao
+  act -->|run_script| script
+  act -->|ask_and_transfer| temPerg
+  act -->|transfer_only| entrega
+  act -->|reply_and_close| grava
+  temPerg -->|sim| wizard --> conf
+  conf -->|2| corrige --> wizard
+  conf -->|1| resumo --> enfileira --> grava
+  temPerg -->|nao| grava
+  grava -->|reply_and_close| txt --> fecha
+  grava -->|ask_and_transfer ou transfer_only| entrega
+    </pre>
+    <p class="note">Ordem das mensagens do wizard: o resumo (<code>ask_received</code>) sai <strong>sem</strong> o <code>ask_transferring</code>; com analista elegível o bot manda <code>ask_transferring</code> e entrega, sem analista quem fala é o aviso de posição na fila. O progresso fica no banco (<code>ask_option_id</code>, <code>script_field_index</code>, <code>script_answers</code> em JSON <code>q1..qN</code>), então sobrevive ao restart.</p>
+    <pre class="mermaid">
+flowchart TD
+  s0[Opcao run_script]
+  perfil{Script exige perfil de gestor no TOA?}
+  negado[script_denied + mensagem padrao + sai]
+  campos[Pergunta campo a campo: text, int ou choice]
+  conf[Confirmacao: 1 confirma 2 corrige]
+  corrige[Volta ao primeiro campo]
+  run[status awaiting_script_run + chamada com a sessao do navegador]
+  res{Resultado}
+  ok[script_ok]
+  err[script_error]
+  ret{Retorno configurado na opcao}
+  rClose[reply_and_close: encerra]
+  rTransf[transfer_only ou ask_and_transfer: secao 6]
+  rRetry[retry_form: volta as perguntas]
+  rStay[stay: status monitoring]
+  resume[Restart ou timer: retoma pelo script_uuid dentro do BUDGET_SEC]
+
+  s0 --> perfil
+  perfil -->|negado| negado
+  perfil -->|ok| campos --> conf
+  conf -->|2| corrige --> campos
+  conf -->|1| run --> res
+  res -->|sucesso| ok
+  res -->|erro| err
+  ok --> ret
+  err --> ret
+  ret -->|reply_and_close| rClose
+  ret -->|transfer_only ou ask_and_transfer| rTransf
+  ret -->|retry_form| rRetry --> campos
+  ret -->|stay| rStay
+  resume --> res
+    </pre>
+    <p class="note">Status do script: <code>awaiting_script_answer</code> → <code>awaiting_script_confirm</code> → <code>awaiting_script_run</code>. Campo inválido reusa a mesma validação do wizard de perguntas e conta em <code>retries</code>; esgotou, <code>closed_invalid</code>. O <code>tick_timeouts</code> retoma script preso em <code>awaiting_script_run</code>.</p>
+  </section>
+
+  <section>
+    <h2>5. Quem recebe: roteamento por caso</h2>
+    <p class="lead">Um único motor para chat e formulário, com a mesma fonte de carga. A unidade é o <strong>caso</strong>: um solicitante distinto. Formulário + chat do mesmo técnico contam como um caso só.</p>
+    <pre class="mermaid">
+flowchart LR
+  pick[pick_assignee: fila + tipo + case_key]
+  caseKey[Identifica o solicitante: started_addr ou participante que nao e staff]
+  af{Esse caso ja tem dono no ledger?}
+  dir[Entrega DIRETA ao mesmo analista: afinidade]
+  cap[Le a carga do time]
+  c1[TOA: get_active_chats com o operador presente]
+  c2[TOA: get_helpdesk_chats in_process na fila]
+  c3[Ledger: route_assignments abertos]
+  c4[Reservas: entregas em voo ainda nao refletidas]
+  soma[Casos = solicitantes distintos deduplicados]
+  janela{Janela de plantao do membro?}
+  online{Online no TOA se exigido?}
+  limite{Cap de casos do membro, time ou global?}
+  tipo{Cap_chat e cap_form do membro?}
+  est[Estrategia: rodizio, prioridade ou menor carga]
+  achou[Analista escolhido: entrega na secao 6]
+  semNinguem[Ninguem elegivel: motivo no detalhe do evento]
+
+  pick --> caseKey --> af
+  af -->|sim e dono ativo na janela| dir
+  af -->|nao ou dono indisponivel| cap
+  cap --> c1 --> soma
+  cap --> c2 --> soma
+  cap --> c3 --> soma
+  cap --> c4 --> soma
+  soma --> janela
+  janela -->|fora_horario| semNinguem
   janela -->|sim| online
-  online --> cap
-  cap -->|ninguem elegivel| fail
-  cap -->|sim| rr --> move --> invite --> ok
+  online -->|sem_online| semNinguem
+  online -->|sim| limite
+  limite -->|no_cap| semNinguem
+  limite -->|sim| tipo
+  tipo -->|no_cap| semNinguem
+  tipo -->|sim| est
+  est -->|achou| achou
+  est -->|ninguem| semNinguem
     </pre>
-    <p class="note">Ordem do filtro: ativo no time → dentro da janela (vazio = 24h) → online no TOA → carga de chats menor que o cap → round-robin.</p>
-  </section>
-
-  <section>
-    <h2>6. Restart / recycle (não reenvia menu)</h2>
-    <p class="lead">SQLite guarda status, menu_node_id, retries e last_prompt_at. RAM some. Depois do bootstrap o bot retoma em vez de tratar o chat como novo.</p>
-    <pre class="mermaid">
-flowchart TD
-  boot[bootstrap e get_active_chats]
-  resume[resume_open_chats]
-  acao{Banco vs presenca no TOA}
-  hydra[rehydrate: so memoria, sem join e sem menu]
-  silent[rejoin_silent: join sem greeting]
-  stale[status left: resume_stale]
-  wait[Volta a ouvir digito se awaiting_reply]
-
-  boot --> resume --> acao
-  acao -->|aberto e bot presente| hydra --> wait
-  acao -->|aberto e bot ausente| silent --> wait
-  acao -->|chat sumiu do TOA| stale
-    </pre>
-    <p class="note">Chromium: 3 timeouts de get_version ou WebSocket mudo por ws_stale_sec (padrão 180 s) fecha o browser, relança, faz bootstrap e resume de novo. SIGTERM fecha limpo (saída 0). O kill externo a cada 6 h permanece como rede de segurança.</p>
-  </section>
-
-  <section>
-    <h2>7. Amarrações do painel</h2>
     <table>
       <thead>
-        <tr><th>Painel</th><th>Liga</th><th>Efeito no chat</th></tr>
+        <tr><th>Ponto da decisão</th><th>Regra hoje</th></tr>
       </thead>
       <tbody>
-        <tr><td>Filas enabled</td><td>fila → bot liga/desliga</td><td>Fila off: não assume</td></tr>
-        <tr><td>Menu ↔ filas</td><td>1 fila = 1 menu</td><td>Opções 1, 2, 3… daquela fila</td></tr>
-        <tr><td>Opção submenu</td><td>raiz → filhos</td><td>Um nível; 0 = Voltar</td></tr>
-        <tr><td>Opção folha</td><td>classificação + ação</td><td>Encerrar ou transferir</td></tr>
-        <tr><td>Folha “se form aberto”</td><td>mesmo número, outra ação/texto</td><td>Só se o form de validação estiver aberto</td></tr>
-        <tr><td>Time ↔ filas</td><td>1 fila = 1 time</td><td>Quem pode receber transferência</td></tr>
-        <tr><td>Membro: ordem, janela, ativo</td><td>rodízio</td><td>Ausência = desativar membro</td></tr>
+        <tr><td>Afinidade</td><td>Caso com dono no ledger e dono ativo + na janela recebe direto, mesmo com o cap cheio. Online só barra se <code>affinity_require_online</code> estiver ligado. É por isso que o chat de quem já tem formulário vai para o mesmo analista.</td></tr>
+        <tr><td>Carga por caso</td><td>Soma as fontes deduplicando por <code>chat_id</code> e por solicitante. Sem resposta do TOA a carga <strong>não zera</strong>: valem ledger e reservas, e o evento registra <code>carga_toa=indisponivel</code>.</td></tr>
+        <tr><td>Janela de plantão</td><td><code>route_start</code>/<code>route_end</code> do membro; vazio ou início igual ao fim = 24 h; madrugada 22:00-06:00 atravessa a meia-noite. Lida no fuso America/Sao_Paulo.</td></tr>
+        <tr><td>Limites</td><td><code>cap_cases</code> (membro → time → <code>max_cases_per_agent</code>, padrão 4) e os sub-limites <code>cap_chat</code> / <code>cap_form</code>, que contam só o próprio tipo.</td></tr>
+        <tr><td>Estratégia</td><td><code>round_robin</code> = próximo depois do último escolhido; <code>priority</code> = maior peso, empate no rodízio; <code>least_load</code> = menor número de casos, empate por peso e rodízio. O rodízio é independente por tipo.</td></tr>
+        <tr><td>Auditoria</td><td>O detalhe do evento mostra <code>time</code>, <code>estrategia</code>, <code>cap</code>, <code>membros</code>, <code>janela</code>, <code>fora_horario</code>, <code>sem_online</code>, <code>so_chat</code>, <code>no_cap</code>, <code>casos</code>, <code>carga</code> e <code>tentativas</code> — dá para saber por que cada um foi descartado.</td></tr>
       </tbody>
     </table>
+  </section>
+
+  <section>
+    <h2>6. Entrega, fila de espera e fallback</h2>
+    <p class="lead">Com analista escolhido, a entrega é <code>move_chat</code> (uma única vez por chat) + <code>invite_to_chat</code>. Sem ninguém elegível, o chat entra na fila de espera com posição e fica lá até alguém aparecer, o técnico sair ou alguém usar <em>Encerrar espera</em>.</p>
+    <pre class="mermaid">
+flowchart TD
+  pedido[Folha pediu transferencia]
+  pick{Tem analista elegivel agora?}
+  esc[Analista escolhido]
+  reserva[Reserva a carga dele na hora]
+  movido{O move_chat ja foi feito neste chat?}
+  move[move_chat com reason Transferido para X]
+  invite[invite_to_chat no escolhido]
+  ok[assignment aberto no ledger + evento transferred + leave_chat closed]
+  partial[transferred_partial: sem aviso de posicao aqui]
+  retry[route_retry: retenta apenas o convite]
+  semNinguem[Evento no_agent]
+  filaOn{Fila de espera ligada e chat nao foi movido?}
+  waiting[Rota waiting sem limite de tempo]
+  aviso[Aviso queue_position na entrada e so quando a posicao melhora]
+  tick[Tick de 5 s tenta atribuir: evento queued_assigned]
+  vence{Encerrar espera no painel?}
+  tent[Fila desligada: conta transfer_attempts com transfer_retry_interval_sec]
+  fb{Fallback do time}
+  fecha[close_out closed_no_agent]
+  monitor[status monitoring: bot fica no chat]
+
+  pedido --> pick
+  pick -->|sim| esc --> reserva --> movido
+  movido -->|nao| move --> invite
+  movido -->|sim: apenas convida| invite
+  invite -->|ok| ok
+  invite -->|falhou| partial --> retry --> tent
+  pick -->|nao| semNinguem --> filaOn
+  filaOn -->|sim| waiting --> aviso --> tick
+  tick -->|achou analista| pick
+  tick -->|segue sem ninguem| vence
+  filaOn -->|nao| tent
+  vence -->|sim| fb
+  tent -->|tentativas esgotadas| fb
+  fb -->|close| fecha
+  fb -->|monitor| monitor
+    </pre>
+    <p class="note">A fila de espera vive na <code>pending_routes</code> (<code>kind=chat</code> <strong>ou</strong> <code>kind=form</code>): posição FIFO <strong>por time, contando chat e formulário na mesma linha</strong>, aviso <code>queue_position</code> com <code>{pos}</code> só na entrada e quando a posição melhora (o <strong>formulário espera em silêncio</strong>), e <strong>nenhum</strong> <code>move_chat</code> antes de existir analista — por isso o técnico não vê "estou transferindo" seguido de "você é o Nº 1 da fila". Com a fila ligada o formulário também espera <strong>sem limite</strong> e não gasta tentativas (tentativas/fallback do formulário valem com a fila desligada). O <code>queue_max_wait_sec</code> ficou legado: a espera não vence sozinha, só pelo botão do painel. Com o chat <strong>já movido</strong> e o convite recusado, as tentativas contam normalmente (senão ele ficaria alternando para sempre). Nada disso se perde em restart: a rota está no banco. A <strong>identidade do caso</strong> nunca sai de nome genérico: formulário sem o address do técnico vira um caso por item (<code>chat:&lt;id&gt;</code>) e a afinidade entrega direto ao dono do caso (mesmo com o cap cheio); o cap vale para o rodízio, e quem está no limite espera a vaga.</p>
+    <table>
+      <thead>
+        <tr><th>Desfecho</th><th>Status do chat</th><th>Evento</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Analista convidado</td><td><code>closed</code></td><td><code>transferred</code></td></tr>
+        <tr><td>Convite recusado após o move</td><td>segue na rota</td><td><code>transferred_partial</code> + <code>route_retry</code></td></tr>
+        <tr><td>Entrou na fila de espera</td><td><code>classified</code></td><td><code>queued</code> / <code>queue_position</code></td></tr>
+        <tr><td>Atribuído depois de esperar</td><td><code>closed</code></td><td><code>queued_assigned</code> (com <code>espera=NNs</code>)</td></tr>
+        <tr><td>Espera encerrada no painel</td><td><code>closed_no_agent</code> ou <code>monitoring</code></td><td><code>queue_expired</code> + fallback do time</td></tr>
+        <tr><td>Sem analista e sem fila</td><td><code>closed_no_agent</code> ou <code>monitoring</code></td><td><code>no_agent</code></td></tr>
+        <tr><td>Técnico saiu / chat removido</td><td><code>closed_originator_left</code> / <code>left</code></td><td><code>left</code> e rota fechada como <code>failed</code></td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>7. Formulário de validação do TOA</h2>
+    <p class="lead">O formulário não é chat de menu: o bot <strong>não entra</strong>, não envia mensagem e não encerra. Ele só roteia, com a mesma dinâmica do chat e por tentativas agendadas em segundo plano.</p>
+    <pre class="mermaid">
+flowchart LR
+  form[Formulario chega: mode message_scenario]
+  ev[Evento closure e indexa como form aberto]
+  flag{form_routing_enabled?}
+  soRegistra[So registra o evento]
+  fila{Tem helpdesk_address?}
+  noqueue[form_no_queue]
+  repetido{Ja foi roteado antes: linha em pending_routes?}
+  ignora[Ignora a repeticao]
+  time{Fila tem time ativo que recebe formulario?}
+  noteam[form_no_team]
+  af{O solicitante ja tem caso com dono ativo na janela?}
+  direto[Entrega direta ao mesmo analista: afinidade]
+  pick[Roteamento: janela, online, cap, estrategia]
+  deliv[move_chat + invite_to_chat]
+  routed[form_routed + caso aberto no ledger]
+  noagent[form_no_agent]
+  fb{Fallback do formulario}
+  retry[retry: linha em pending_routes e evento form_route_retry]
+  mon[monitor: nao insiste]
+
+  form --> ev --> flag
+  flag -->|nao| soRegistra
+  flag -->|sim| fila
+  fila -->|nao| noqueue
+  fila -->|sim| repetido
+  repetido -->|sim| ignora
+  repetido -->|nao| time
+  time -->|nao| noteam
+  time -->|sim| af
+  af -->|sim| direto --> deliv
+  af -->|nao| pick
+  pick -->|achou| deliv
+  pick -->|ninguem| noagent --> fb
+  fb -->|retry| retry --> pick
+  fb -->|monitor| mon
+  deliv --> routed
+    </pre>
+    <p class="note">Uma fila desabilitada para chat <strong>continua</strong> roteando formulário: o que manda é o <code>form_routing_enabled</code> (global) e o campo "recebe formulário" do time. O mesmo formulário nunca é roteado duas vezes — a marca fica na <code>pending_routes</code>, inclusive após restart — e o formulário <strong>espera em silêncio</strong>: o aviso de posição só existe no chat. Quando o formulário do técnico já tem um caso aberto, o chat dele vai para o mesmo analista (afinidade), contando como um caso só.</p>
+  </section>
+
+  <section>
+    <h2>7.1 Identidade do caso: chat e formulário do mesmo técnico</h2>
+    <p class="lead">Um caso é o <strong>solicitante</strong>. O chat e o formulário do mesmo técnico precisam cair no mesmo caso — e nunca no caso de outra pessoa. A identidade sai, nesta ordem, do <code>address</code> do payload, do <strong>autor das mensagens do formulário</strong> (o técnico escreve lá), do nome (quando ligado) e, só com <strong>um único candidato livre</strong>, da fila.</p>
+    <pre class="mermaid">
+flowchart TD
+  abre[Tecnico abre chat na fila]
+  indice{Tem formulario aberto no indice?}
+  menu[Menu normal]
+  cand[Candidatos: mesma fila, nao passados, nao ociosos]
+  quantos{Quantos candidatos}
+  zero[Nenhum: menu normal e evento form_aware_skip]
+  addr{O address do payload e de quem abriu?}
+  autor{O AUTOR das mensagens do formulario e de quem abriu?}
+  nome{Nome bate e affinity_match_name ligado?}
+  fila{Tem um unico candidato SEM responsavel?}
+  unico{Esse e o unico candidato da fila?}
+  atend[Em atendimento com terceiro: nao vincula e evento em_atendimento]
+  amb[Ambiguo: nao vincula e evento ambiguo]
+  conflito{A identidade do formulario e de OUTRO tecnico?}
+  recusa[Recusa o vinculo: menu normal e form_aware_skip]
+  passado{Estado do formulario e passado?}
+  ociosoA{Sem mensagem nova ha form_idle_offer_min?}
+  deixa[Deixa de ser oferecido: ociosos no diagnostico]
+  fecha[form_closed: sai do indice e encerra as rotas presas]
+  vincula[case_linked: vinculo gravado e caso unificado]
+  texto[Texto personalizado com o analista e opcoes 1 e 2]
+
+  abre --> indice
+  indice -->|nao| menu
+  indice -->|sim| cand --> quantos
+  quantos -->|0| zero
+  quantos -->|1 ou mais| addr
+  addr -->|sim, regra address| passado
+  addr -->|nao| autor
+  autor -->|sim, regra autor| passado
+  autor -->|nao| nome
+  nome -->|sim, regra name| passado
+  nome -->|nao| fila
+  fila -->|sim, regra fila| conflito
+  fila -->|nao| unico
+  unico -->|sim| conflito
+  unico -->|nao| atend
+  conflito -->|sim| recusa
+  conflito -->|nao| passado
+  passado -->|sim| fecha --> menu
+  passado -->|nao| ociosoA
+  ociosoA -->|sim| deixa --> menu
+  ociosoA -->|nao| vincula --> texto
+    </pre>
+    <p class="note">O palpite por fila só vale com <strong>um</strong> candidato <strong>sem responsável</strong> e sem conflito de identidade: era o vínculo cego por recência que movia o formulário de outro técnico para este caso (o caso "trocava de analista" no painel). Formulário que <strong>já está com um analista do time</strong> só entra por identidade — e, quando é o único da fila, continua sendo oferecido (é o técnico falando do próprio formulário). Leitura <strong>forçada</strong> do estado antes de responder: a mensagem ao técnico nunca sai de cache, formulário encerrado não é oferecido de novo e formulário <strong>ocioso</strong> (sem mensagem nova por `form_idle_offer_min`, sem analista dentro) deixa de ser oferecido.</p>
+    <pre class="mermaid">
+flowchart TD
+  form[Formulario aberto e indexado]
+  leitura[Leitura viva das mensagens: estado, autores e quem entrou]
+  passado{Analista saiu ou encerrou?}
+  cancela[form_skip_past e form_closed: entrega cancelada]
+  ocioso{Sem sinal de vida ha form_idle_close_min (240 com analista dentro)?}
+  fechaOcioso[form_closed motivo=form_ocioso ou form_ocioso_analista e rotas canceladas]
+  dentro{Tem analista do time dentro do formulario?}
+  adota[form_adopted: adota o dono sem repetir o move_chat]
+  chave[Chave do caso: address do payload ou AUTOR das mensagens]
+  owner{Afinidade: o caso ja tem dono aberto?}
+  direto[Entrega direta ao dono do caso]
+  rodizio[Sem dono: janela, online, cap e rodizio]
+  novo[Caso novo no ledger apenas sem responsavel]
+  move[move_chat e invite_to_chat]
+  ok[form_routed e caso aberto]
+  recusa{move_chat recusado pelo TOA}
+  teto[No teto de recusas encerra a rota: form_move_refused]
+
+  form --> leitura --> passado
+  passado -->|sim| cancela
+  passado -->|nao| ocioso
+  ocioso -->|sim| fechaOcioso
+  ocioso -->|nao| dentro
+  dentro -->|sim| adota
+  dentro -->|nao| chave --> owner
+  owner -->|sim| direto --> move
+  owner -->|nao| rodizio --> novo --> move
+  move -->|ok| ok
+  move -->|falhou| recusa
+  recusa -->|abaixo do teto| move
+  recusa -->|no teto| teto
+    </pre>
+    <p class="note">O formulário que <strong>já está com um analista</strong> não é movido de novo: o TOA recusa com <code>e=10</code> e o bot adotava o retry infinito (mesmo analista atrás de <code>move_chat</code> a cada minuto). Agora ele adota o dono que as mensagens mostram, conta a carga do analista e encerra a rota; se a recusa persistir sem dono identificado, a rota para no teto (<code>form_move_refused</code>) em vez de girar para sempre. E o formulário <strong>sem sinal de vida</strong> (o TOA não avisa a saída do analista) sai de cena pela janela de vida: deixa de ser oferecido e o caso fecha — <code>form_ocioso</code> (120 min sem analista dentro) ou <code>form_ocioso_analista</code> (240 min <strong>com</strong> analista dentro, o estado real dos casos que travavam os caps). O índice também é podado quando o caso no ledger já encerrou de verdade (<code>form_forget motivo=caso_encerrado</code>).</p>
+  </section>
+
+  <section>
+    <h2>8. Restart, resume e reciclagem do Chromium</h2>
+    <p class="lead">O SQLite guarda status, <code>menu_node_id</code>, <code>retries</code>, <code>last_prompt_at</code>, a coleta e as rotas. A memória RAM some; depois do bootstrap o bot retoma em vez de tratar o chat como novo.</p>
+    <pre class="mermaid">
+flowchart TD
+  boot[bootstrap: catalogo, chats pendentes e get_active_chats]
+  resume[resume_open_chats compara banco x presenca no TOA]
+  dec{Decisao por chat com status aberto}
+  reh[rehydrate: so memoria, sem join e sem menu]
+  silent[rejoin_silent: entra sem reenviar menu]
+  stale[status left + evento resume_stale]
+  replay[replay_pending_reply: processa a resposta que chegou com o bot fora]
+  ask[resume_ask: reenvia a pergunta ou a confirmacao atual]
+  scr[resume_script_run: retoma pelo script_uuid dentro do BUDGET_SEC]
+  volta[Volta a ouvir: menu, coleta, script ou rota da fila]
+  recycle[Recicla o Chromium: 3 falhas de get_version ou WS mudo por ws_stale_sec]
+
+  boot --> resume --> dec
+  dec -->|aberto e o bot presente| reh --> replay
+  dec -->|aberto e o bot ausente| silent --> replay
+  dec -->|chat sumiu do TOA| stale
+  replay -->|havia resposta nova| volta
+  replay -->|nada novo| ask
+  ask -->|coleta em andamento| volta
+  ask -->|nada pendente| scr --> volta
+  recycle --> boot
+    </pre>
+    <p class="note">Status retomados: <code>joined</code>, <code>menu_sent</code>, <code>awaiting_reply</code>, <code>classified</code>, <code>monitoring</code>, <code>awaiting_script_answer</code>, <code>awaiting_script_confirm</code> e <code>awaiting_script_run</code>. O menu nunca é reenviado no resume e <code>reply_replayed</code> acontece antes de qualquer timeout — sem isso a resposta perdida viraria <code>closed_timeout</code> cinco minutos depois. A fila de retry do formulário, a fila de espera do chat e o ledger também sobrevivem. <code>SIGTERM</code> fecha o Chromium e sai com código 0.</p>
+  </section>
+
+  <section>
+    <h2>9. Timers e saúde do processo</h2>
+    <p class="lead">Um único laço de 5 s empurra o atendimento; o WebSocket só recebe e entrega eventos. Se o TOA ou o navegador travam, o bot recicla o Chromium e refaz o bootstrap — sem perder o que está no banco.</p>
+    <pre class="mermaid">
+flowchart LR
+  t[Timer do daemon a cada 5 s]
+  a[tick_timeouts: silencio do tecnico, scripts presos e TTL do ledger]
+  b[tick_routes: atribui a fila de espera e retenta o formulario]
+  c[process_pending_jobs: catalog_sync pedido pelo painel]
+  d[Cada config_poll_sec: reload de filas, menus, times e ajustes]
+  e[Cada 60 s: get_version no WebSocket do TOA]
+  f{3 timeouts seguidos ou WS mudo por ws_stale_sec?}
+  g[BrowserStale: fecha o Chromium, relanca e refaz o bootstrap]
+  h[SQLite fechado: reconecta em vez de derrubar o bot]
+
+  t --> a
+  t --> b
+  t --> c
+  t --> d
+  t --> e
+  t --> h
+  e --> f
+  f -->|sim| g
+  f -->|nao| t
+    </pre>
+    <table>
+      <thead>
+        <tr><th>Ajuste (aba Ajustes / Roteamento)</th><th>Padrão</th><th>Para que serve</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>reply_timeout_sec</code></td><td>300 s</td><td>Silêncio do solicitante antes de encerrar; qualquer resposta (mesmo inválida) reinicia o relógio.</td></tr>
+        <tr><td><code>max_invalid_retries</code></td><td>3</td><td>Respostas inválidas no menu, no wizard e nas perguntas do script antes de <code>closed_invalid</code>.</td></tr>
+        <tr><td><code>config_poll_sec</code></td><td>15 s</td><td>Intervalo de recarga das configurações do painel.</td></tr>
+        <tr><td><code>ws_stale_sec</code></td><td>180 s</td><td>WebSocket mudo que dispara a reciclagem do Chromium.</td></tr>
+        <tr><td><code>route_assign_ttl_sec</code></td><td>43200 s</td><td>Caso órfão no ledger sem evento de saída é fechado e a vaga volta.</td></tr>
+        <tr><td><code>route_reserve_ttl_sec</code></td><td>300 s</td><td>Validade da reserva de carga feita na hora da entrega.</td></tr>
+        <tr><td><code>queue_wait_enabled</code></td><td>ligado</td><td>Fila de espera do chat com posição e sem limite de tempo; desligado volta a <code>transfer_attempts</code>.</td></tr>
+        <tr><td><code>form_route_attempts</code> / <code>form_route_retry_interval_sec</code></td><td>—</td><td>Tentativas e intervalo do formulário em segundo plano.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>10. Status do chat e eventos registrados</h2>
+    <p class="lead">Uma linha por <code>chat_id</code> em <code>chats</code>; cada passo vira evento em <code>bot_events</code> (sem texto de conversa).</p>
+    <table>
+      <thead>
+        <tr><th>Status</th><th>Significado</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>detected</code></td><td>Chat identificado, ainda sem presença confirmada.</td></tr>
+        <tr><td><code>joined</code></td><td>Bot entrou no chat.</td></tr>
+        <tr><td><code>menu_sent</code></td><td>Menu enviado (o estado já é <code>awaiting_reply</code>).</td></tr>
+        <tr><td><code>awaiting_reply</code></td><td>Esperando o dígito, com timeout por silêncio.</td></tr>
+        <tr><td><code>awaiting_form_choice</code></td><td>Abertura form-aware: esperando <strong>1</strong> (falar sobre o formulário) ou <strong>2</strong> (abrir o menu); o timeout por silêncio continua valendo como salvaguarda.</td></tr>
+        <tr><td><code>awaiting_script_answer</code></td><td>Wizard de perguntas ou script: preenchendo um campo.</td></tr>
+        <tr><td><code>awaiting_script_confirm</code></td><td>Wizard/script: confirmando os dados (1 confirma, 2 corrige).</td></tr>
+        <tr><td><code>awaiting_script_run</code></td><td>Script em execução com a sessão do navegador.</td></tr>
+        <tr><td><code>classified</code></td><td>Folha aplicada, com classificação gravada — inclui quem está na fila de espera.</td></tr>
+        <tr><td><code>monitoring</code></td><td>Bot fica no chat sem menu, aguardando o desfecho.</td></tr>
+        <tr><td><code>closed</code></td><td>Encerrado pelo bot depois de transferir ou responder.</td></tr>
+        <tr><td><code>closed_invalid</code></td><td>Encerrado por respostas inválidas.</td></tr>
+        <tr><td><code>closed_timeout</code></td><td>Encerrado por silêncio real do técnico (resposta perdida no restart é recuperada em <code>reply_replayed</code>).</td></tr>
+        <tr><td><code>closed_no_agent</code></td><td>Sem analista elegível e fallback do time = encerrar.</td></tr>
+        <tr><td><code>closed_originator_left</code> / <code>left</code></td><td>O técnico saiu / o chat foi removido ou o bot saiu.</td></tr>
+      </tbody>
+    </table>
+    <table>
+      <thead>
+        <tr><th>Grupo</th><th>Eventos</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Entrada e assunção</td><td><code>assumed</code>, <code>menu_sent</code>, <code>not_new</code>, <code>queue_off</code>, <code>queue_unknown</code>, <code>bot_off</code>, <code>join_failed</code></td></tr>
+        <tr><td>Conversa e desfecho</td><td><code>ignored_reply</code>, <code>reply_replayed</code>, <code>send_failed</code>, <code>classified</code>, <code>transferred</code>, <code>no_agent</code>, <code>closed_invalid</code>, <code>closed_timeout</code>, <code>closed_no_agent</code>, <code>left</code>, <code>resume_stale</code></td></tr>
+        <tr><td>Perguntas antes de transferir</td><td><code>ask_collected</code>, <code>route_retry</code>, <code>transferred_partial</code></td></tr>
+        <tr><td>Fila de espera</td><td><code>queued</code>, <code>queue_position</code>, <code>queued_assigned</code>, <code>queue_expired</code></td></tr>
+        <tr><td>Scripts</td><td><code>script_ok</code>, <code>script_error</code>, <code>script_denied</code></td></tr>
+        <tr><td>Formulário de validação</td><td><code>closure</code>, <code>form_routed</code>, <code>form_no_agent</code>, <code>form_route_retry</code>, <code>form_no_team</code>, <code>form_no_queue</code></td></tr>
+        <tr><td>Abertura form-aware</td><td><code>case_linked</code> (chat + formulário no mesmo caso), <code>form_aware_greeting</code>, <code>form_aware_choice</code>, <code>form_aware_wait</code>, <code>form_aware_skip</code>, <code>case_sibling_delivered</code></td></tr>
+        <tr><td>Índice do formulário</td><td><code>form_indexed</code>, <code>form_not_open</code>, <code>form_dropped</code>, <code>form_ignored_payload</code>, <code>form_queue_left</code> (aviso de fila; o formulário segue aberto), <code>form_forget</code>, <code>form_state</code> (pendente/em atendimento/passado), <code>form_closed</code> (virou passado), <code>case_key_divergente</code> (identidade do payload venceu a chave da rota)</td></tr>
+        <tr><td>Resposta ignorada</td><td><code>message_ignored</code> — mensagem do técnico em status que o bot não trata (antes era silencioso)</td></tr>
+        <tr><td>Catálogo</td><td><code>catalog_synced</code>, <code>sync_error</code></td></tr>
+      </tbody>
+    </table>
+    <p class="note">O que <strong>ainda não existe</strong>: uso de <code>transfer_targets</code> / <code>menu_option_targets</code> (código morto — decidir entre implementar ou tirar da UI), o <code>CHAT_TYPE_ROUTING</code> nativo do TOA, a validação em produção do escopo do <code>get_active_chats</code> e os campos <code>action_if_form</code>/<code>reply_text_if_form</code> do menu (legado sem uso: o painel grava vazio e o motor ignora — a abertura form-aware vive no vínculo do caso, seção 3.1).</p>
+  </section>
+
+  <section>
+    <h2>11. Amarrações do painel</h2>
+    <p class="lead">O que o painel liga e o efeito imediato no atendimento. O motor lê só as tabelas de catálogo, menu, times e roteamento — RBAC é assunto do painel.</p>
+    <table>
+      <thead>
+        <tr><th>Aba / campo</th><th>Liga</th><th>Efeito no atendimento</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Filas</td><td><code>enabled</code> e sincronização do catálogo</td><td>Fila desligada: o bot não assume o chat (<code>queue_off</code>), mas ainda roteia o formulário dela.</td></tr>
+        <tr><td>Menus ↔ filas</td><td>1 fila = 1 menu</td><td>Sem opção cadastrada o chat cai em <code>join_failed</code> (menu vazio).</td></tr>
+        <tr><td>Opção submenu</td><td>raiz → filhos</td><td>Um nível por vez; <code>0</code> volta para a raiz.</td></tr>
+        <tr><td>Opção folha</td><td>classificação + ação + texto</td><td>Encerrar, transferir, perguntar antes de transferir ou rodar script.</td></tr>
+        <tr><td>Perguntas da opção</td><td>1 a 20 perguntas (<code>text</code>, <code>int</code>, <code>choice</code>)</td><td>Coleta no chat antes de tentar entregar; sem perguntas o comportamento é o antigo.</td></tr>
+        <tr><td>Templates</td><td><code>greeting</code>, <code>menu</code>, <code>retry</code>, <code>closing</code>, <code>ask_received</code>, <code>ask_transferring</code>, <code>queue_position</code></td><td>Textos das mensagens, inclusive <code>{pos}</code> da fila de espera.</td></tr>
+        <tr><td>Times</td><td>membros, Ordem, janela de plantão e filas do time</td><td>Define quem pode receber e em que ordem; membro inativo não recebe.</td></tr>
+        <tr><td>Roteamento: globais</td><td>bot ligado, formulário roteado, estratégia, caps, tentativas, fallback, fila de espera</td><td>Formulário desligado: só registra <code>closure</code>. Bot desligado: nenhum chat é assumido.</td></tr>
+        <tr><td>Roteamento: por time</td><td>estratégia, caps, online, plantão, tentativas, fallback, recebe formulário</td><td>Campo vazio herda o global (membro → time → global).</td></tr>
+        <tr><td>Roteamento: por membro</td><td>peso, cap chat, cap form, casos, recebe formulário</td><td>Peso só vale na estratégia por prioridade.</td></tr>
+        <tr><td>Roteamento: fila de espera</td><td>posição, tempo de espera, tentativas e <em>Encerrar espera</em></td><td>O botão vence a espera na hora e deixa o motor aplicar o fallback do time.</td></tr>
+        <tr><td>Dashboard</td><td>classificações por categoria, resumo do formulário e fila de espera do chat</td><td>Leitura do que está acontecendo agora.</td></tr>
+        <tr><td>Atividade</td><td><code>bot_events</code> com filtro por tipo</td><td>É onde se audita cada decisão de roteamento, com o detalhe dos descartes.</td></tr>
+        <tr><td>Chats</td><td>status, classificação, retries e respostas das coletas</td><td>Sem conteúdo de conversa.</td></tr>
+        <tr><td>Usuários / Grupos (super-only)</td><td>contas, grupos, permissões e escopo de dados</td><td>Vale só para o painel: negar por padrão, sem marcação e sem <code>scope.all_*</code> o grupo não vê dado nenhum.</td></tr>
+      </tbody>
+    </table>
+    <p class="note">Resumo em uma frase: o bot assume o chat da fila habilitada, oferece o menu, classifica a folha escolhida (com perguntas ou script quando configurado) e então decide quem recebe — contando <strong>casos por solicitante</strong> no TOA, no ledger e nas entregas em voo, com <strong>afinidade</strong> para o formulário do mesmo técnico, <strong>fila de espera com posição e sem limite de tempo</strong> no chat, timeout medido por <strong>silêncio real do solicitante</strong> com recuperação da resposta que chegou com o bot fora, e retry assíncrono para o formulário, que nunca entra na conversa nem é encerrado pelo bot.</p>
   </section>
 
   <script>

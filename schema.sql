@@ -3,11 +3,17 @@
 
 PRAGMA foreign_keys = ON;
 
+-- Colunas de RBAC (php/bootstrap.php -> bot_migrate_rbac adiciona em bases antigas).
+-- group_id NULL = usuario sem grupo (sem acesso ao painel).
 CREATE TABLE IF NOT EXISTS bot_users (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   login TEXT NOT NULL UNIQUE,
   password_hash TEXT NOT NULL,
   active INTEGER NOT NULL DEFAULT 1,
+  display_name TEXT NOT NULL DEFAULT '',
+  operator_address TEXT NOT NULL DEFAULT '',
+  group_id INTEGER REFERENCES permission_groups(id) ON DELETE SET NULL,
+  last_login_at TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -99,6 +105,18 @@ CREATE UNIQUE INDEX IF NOT EXISTS menu_options_per_menu_root
 CREATE UNIQUE INDEX IF NOT EXISTS menu_options_per_menu_child
   ON menu_options (menu_id, parent_id, sort_order) WHERE menu_id IS NOT NULL AND parent_id IS NOT NULL;
 
+-- Perguntas da opcao "Pedir info e transferir": o bot coleta no chat, o tecnico
+-- confirma e so entao a transferencia acontece (mesmo wizard dos scripts).
+CREATE TABLE IF NOT EXISTS menu_option_questions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  option_id INTEGER NOT NULL REFERENCES menu_options(id) ON DELETE CASCADE,
+  sort_order INTEGER NOT NULL,
+  prompt TEXT NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'text' CHECK (kind IN ('text', 'int', 'choice')),
+  choices TEXT NOT NULL DEFAULT '',
+  UNIQUE (option_id, sort_order)
+);
+
 CREATE TABLE IF NOT EXISTS queue_operators (
   queue_address TEXT NOT NULL REFERENCES queues(address) ON DELETE CASCADE,
   address TEXT NOT NULL,
@@ -126,12 +144,18 @@ CREATE TABLE IF NOT EXISTS chats (
   classification TEXT,
   option_id INTEGER REFERENCES menu_options(id) ON DELETE SET NULL,
   menu_node_id INTEGER REFERENCES menu_options(id) ON DELETE SET NULL,
+  ask_option_id INTEGER REFERENCES menu_options(id) ON DELETE SET NULL,
   retries INTEGER NOT NULL DEFAULT 0,
   auto_close INTEGER NOT NULL DEFAULT 0,
   menu_sent_at TEXT,
   last_prompt_at TEXT,
+  last_reply_at TEXT,
   classified_at TEXT,
   left_at TEXT,
+  moved_at TEXT,
+  -- Abertura form-aware: chat do tecnico vinculado ao formulario de validacao
+  -- aberto dele (os dois itens passam a ser UM caso para o roteamento).
+  linked_form_chat_id INTEGER,
   script_slug TEXT NOT NULL DEFAULT '',
   script_field_index INTEGER NOT NULL DEFAULT 0,
   script_answers TEXT NOT NULL DEFAULT '{}',
@@ -182,3 +206,228 @@ INSERT OR IGNORE INTO bot_settings (key, value) VALUES
   ('ws_stale_sec', '180'),
   ('transfer_attempts', '5'),
   ('transfer_retry_interval_sec', '60');
+
+-- Roteamento por time (1:1 com teams). NULL = herda o global (bot_settings).
+-- Só o formulário de validação tem retry assíncrono; o chat segue o fluxo atual.
+CREATE TABLE IF NOT EXISTS team_routing (
+  team_id INTEGER PRIMARY KEY REFERENCES teams(id) ON DELETE CASCADE,
+  strategy TEXT CHECK (strategy IN ('round_robin', 'priority', 'least_load')),
+  cap_chat INTEGER,
+  cap_form INTEGER,
+  cap_cases INTEGER,
+  require_online INTEGER,
+  respect_window INTEGER,
+  attempts INTEGER,
+  retry_interval_sec INTEGER,
+  fallback TEXT CHECK (fallback IN ('close', 'retry', 'monitor')),
+  form_enabled INTEGER NOT NULL DEFAULT 1,
+  last_assigned_chat TEXT,
+  last_assigned_form TEXT,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Roteamento por membro do time (NULL = herda o cap do time/global).
+CREATE TABLE IF NOT EXISTS team_member_routing (
+  team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+  address TEXT NOT NULL,
+  weight INTEGER NOT NULL DEFAULT 0,
+  cap_chat INTEGER,
+  cap_form INTEGER,
+  cap_cases INTEGER,
+  forms_enabled INTEGER NOT NULL DEFAULT 1,
+  PRIMARY KEY (team_id, address)
+);
+
+-- Retry assíncrono do roteamento (hoje só formulário), drenado pelo tick.
+CREATE TABLE IF NOT EXISTS pending_routes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL CHECK (kind IN ('chat', 'form')),
+  chat_id INTEGER NOT NULL,
+  queue_address TEXT,
+  team_id INTEGER,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_try_at TEXT,
+  status TEXT NOT NULL DEFAULT 'waiting'
+    CHECK (status IN ('waiting', 'done', 'failed', 'cancelled')),
+  detail TEXT NOT NULL DEFAULT '',
+  expires_at TEXT,
+  last_position INTEGER NOT NULL DEFAULT 0,
+  -- Identidade do caso na entrega (sobrevive a restart; ver engine._deliver_*).
+  case_key TEXT NOT NULL DEFAULT '',
+  requester_addr TEXT NOT NULL DEFAULT '',
+  -- Entrega: alvo escolhido (imutavel nas tentativas) e marca do move ja feito.
+  invite_target TEXT NOT NULL DEFAULT '',
+  move_sent_at TEXT,
+  -- `move_chat` recusado pelo TOA (e=10 = formulario ja com alguem): a rota para
+  -- depois de N falhas em vez de girar para sempre.
+  move_fails INTEGER NOT NULL DEFAULT 0,
+  -- Posse da entrega (claim atomico em db.claim_delivery): evita dupla entrega.
+  claimed_by TEXT NOT NULL DEFAULT '',
+  claimed_at TEXT,
+  claim_expires_at TEXT,
+  -- Abertura form-aware: rota do chat que so pode ser entregue ao DONO do caso
+  -- (analista que atende o formulario); sem dono ela espera, sem gastar tentativa.
+  expects_owner INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS pending_routes_due ON pending_routes (status, next_try_at);
+
+-- Uma tentativa por chamada externa de entrega (move/invite/leave): base da
+-- instrumentacao e da medicao de timeout/sem eco (toa.command devolve o `r`).
+CREATE TABLE IF NOT EXISTS delivery_attempts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  at TEXT NOT NULL DEFAULT (datetime('now')),
+  kind TEXT NOT NULL DEFAULT '',
+  chat_id INTEGER,
+  route_id INTEGER,
+  op TEXT NOT NULL,
+  target TEXT NOT NULL DEFAULT '',
+  request_id TEXT NOT NULL DEFAULT '',
+  result TEXT NOT NULL DEFAULT '',
+  latency_ms INTEGER NOT NULL DEFAULT 0,
+  error TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS delivery_attempts_at_idx ON delivery_attempts (at DESC);
+CREATE INDEX IF NOT EXISTS delivery_attempts_chat_idx ON delivery_attempts (chat_id, id);
+
+INSERT OR IGNORE INTO bot_settings (key, value) VALUES
+  ('form_routing_enabled', 'true'),
+  ('max_open_forms_per_agent', '8'),
+  ('form_route_attempts', '5'),
+  ('form_route_retry_interval_sec', '60'),
+  ('form_route_fallback', 'retry'),
+  ('queue_wait_enabled', 'true'),
+  ('queue_max_wait_sec', '1800'),
+  ('routing_strategy', 'round_robin');
+
+-- Ledger de atribuicoes: a carga real por CASO (solicitante distinto).
+-- Formulario + chat do MESMO solicitante contam como um unico caso.
+CREATE TABLE IF NOT EXISTS route_assignments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL CHECK (kind IN ('chat', 'form')),
+  chat_id INTEGER NOT NULL UNIQUE,
+  queue_address TEXT,
+  team_id INTEGER,
+  assignee TEXT NOT NULL,
+  case_key TEXT NOT NULL DEFAULT '',
+  requester_addr TEXT NOT NULL DEFAULT '',
+  requester_name TEXT NOT NULL DEFAULT '',
+  identity_source TEXT NOT NULL DEFAULT 'address',
+  assigned_at TEXT NOT NULL DEFAULT (datetime('now')),
+  closed_at TEXT,
+  -- Motivo do fechamento (chat_removed, stale_boot, form_done, ttl, manual):
+  -- sem isso o case podia "sumir" do ledger sem explicacao.
+  close_reason TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS route_assignments_open
+  ON route_assignments (assignee, closed_at, case_key);
+
+CREATE INDEX IF NOT EXISTS route_assignments_case
+  ON route_assignments (case_key, closed_at);
+
+INSERT OR IGNORE INTO bot_settings (key, value) VALUES
+  ('max_cases_per_agent', '4'),
+  ('route_capacity_source', 'both'),
+  ('route_assign_ttl_sec', '43200'),
+  ('route_reserve_ttl_sec', '300'),
+  ('affinity_enabled', 'true'),
+  ('affinity_require_online', 'false'),
+  ('affinity_match_name', 'false'),
+  ('delivery_claim_ttl_sec', '300'),
+  ('case_stale_confirm_sec', '300'),
+  -- Janela de vida do formulario (o TOA nao avisa a saida do analista):
+  -- acima de `offer` ele deixa de ser oferecido na abertura; acima de `close`
+  -- ele sai do indice e o caso fecha (`form_closed motivo=form_ocioso`).
+  -- Com analista do time dentro vale a regua maior (`form_ocioso_analista`).
+  ('form_idle_offer_min', '30'),
+  ('form_idle_close_min', '120'),
+  ('form_idle_owner_close_min', '240');
+
+-- Textos do fluxo "Pedir info e transferir" com perguntas (aba Templates).
+INSERT OR IGNORE INTO templates (slug, body) VALUES
+  ('ask_received', 'Registrei as informações:'),
+  ('ask_transferring', 'Já estou transferindo para o time responsável.'),
+  ('queue_position', 'Você é o Nº {pos} da fila. Assim que um analista liberar, eu te chamo.');
+
+-- Abertura form-aware (aba Templates): o tecnico abre o chat e ja tem uma
+-- validacao de encerramento em andamento. `{analista}` = quem atende o formulario.
+-- char(10) = quebra de linha de verdade (o texto sai no chat como esta).
+INSERT OR IGNORE INTO templates (slug, body) VALUES
+  ('form_pending', 'Você tem um formulário de validação em andamento com {analista}.'
+    || char(10) || char(10) || 'Digite o número da opção:'
+    || char(10) || '1) Falar sobre o formulário'
+    || char(10) || '2) Abrir o menu'),
+  ('form_pending_wait', 'Você tem um formulário de validação aguardando atendimento.'
+    || char(10) || char(10) || 'Digite o número da opção:'
+    || char(10) || '1) Falar sobre o formulário'
+    || char(10) || '2) Abrir o menu'),
+  ('form_waiting', 'Assim que um analista assumir a sua validação, eu encaminho este chat para ele. Em breve você será atendido.');
+
+-- ---------------------------------------------------------------------------
+-- Painel: usuarios, grupos de permissao e escopo de dados (RBAC).
+-- Aplicado pelo painel (php/bootstrap.php -> bot_migrate_rbac) e tolerado pelo
+-- bot Python (python/db.py -> _migrate_rbac). O motor de atendimento NAO le
+-- nenhuma destas tabelas.
+--   permission_groups  grupo de permissao (is_super = Super Admin)
+--   group_permissions  chaves de permissao do grupo (catalogo fica no PHP)
+--   user_teams         escopo de dados: times que o usuario do painel enxerga
+--   user_queues        excecao de escopo: filas concedidas fora de qualquer time
+-- Escopo dos dados: user_teams -> team_queues -> queues.address.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS permission_groups (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL UNIQUE,
+  active INTEGER NOT NULL DEFAULT 1,
+  is_super INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS group_permissions (
+  group_id INTEGER NOT NULL REFERENCES permission_groups(id) ON DELETE CASCADE,
+  perm_key TEXT NOT NULL,
+  PRIMARY KEY (group_id, perm_key)
+);
+
+CREATE TABLE IF NOT EXISTS user_teams (
+  user_id INTEGER NOT NULL REFERENCES bot_users(id) ON DELETE CASCADE,
+  team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+  PRIMARY KEY (user_id, team_id)
+);
+
+CREATE TABLE IF NOT EXISTS user_queues (
+  user_id INTEGER NOT NULL REFERENCES bot_users(id) ON DELETE CASCADE,
+  queue_address TEXT NOT NULL REFERENCES queues(address) ON DELETE CASCADE,
+  PRIMARY KEY (user_id, queue_address)
+);
+
+-- Escopo de dados POR GRUPO: filas, menus e times que o grupo enxerga.
+-- Filas visiveis = filas dos times marcados (group_teams -> team_queues) + group_queues.
+-- Sem marcacao e sem as chaves scope.all_* o grupo nao ve dado nenhum (negar por padrao).
+-- group_menus da acesso a configuracao daqueles menus (nao concede dados de fila).
+CREATE TABLE IF NOT EXISTS group_teams (
+  group_id INTEGER NOT NULL REFERENCES permission_groups(id) ON DELETE CASCADE,
+  team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+  PRIMARY KEY (group_id, team_id)
+);
+
+CREATE TABLE IF NOT EXISTS group_queues (
+  group_id INTEGER NOT NULL REFERENCES permission_groups(id) ON DELETE CASCADE,
+  queue_address TEXT NOT NULL REFERENCES queues(address) ON DELETE CASCADE,
+  PRIMARY KEY (group_id, queue_address)
+);
+
+CREATE TABLE IF NOT EXISTS group_menus (
+  group_id INTEGER NOT NULL REFERENCES permission_groups(id) ON DELETE CASCADE,
+  menu_id INTEGER NOT NULL REFERENCES menus(id) ON DELETE CASCADE,
+  PRIMARY KEY (group_id, menu_id)
+);
+
+INSERT OR IGNORE INTO permission_groups (id, name, active, is_super) VALUES (1, 'Super Admin', 1, 1);
+
+-- Flags da migracao: '0' = passo ainda nao executado.
+INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('rbac_seeded', '0');
+INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('rbac_scope_groups', '0');
