@@ -99,6 +99,11 @@ async def run_once(conn, page, state: dict):
                     await engine.tick_timeouts()
                     await engine.tick_routes()
                     await engine.process_pending_jobs()
+                    poll_load = max(5, int(engine.cfg.get("load_poll_sec") or 30))
+                    if n % poll_load == 0:
+                        # Carga por analista: le as listas do TOA e grava a medicao
+                        # (aba Carga). E a mesma fonte da capacidade.
+                        await engine.snapshot_load("timer")
                     poll = int(engine.cfg.get("config_poll_sec") or 15)
                     if n % max(poll, 5) == 0:
                         engine.reload_config()

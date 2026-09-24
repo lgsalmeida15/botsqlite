@@ -364,6 +364,9 @@ class Engine:
         # relogio do boot e nunca fecharia.
         self._form_started: dict[int, float] = {}
         self._form_case_at: dict[int, float] = {}
+        # Leituras consecutivas sem o formulario nas listas do TOA (fechamento por
+        # ausencia: e assim que o caso resolvido no TOA libera a vaga do analista).
+        self._form_absent: dict[int, int] = {}
         self._msg_ignored: set[int] = set()
         self._script_inflight: set[int] = set()
         self._route_lock = asyncio.Lock()
@@ -631,7 +634,9 @@ class Engine:
         self._form_last_msg.pop(int(fid), None)
         self._form_started.pop(int(fid), None)
         self._form_case_at.pop(int(fid), None)
-        self._close_case(int(fid), "form_done")
+        # Motivo no ledger: a ausencia nas listas do TOA e o sinal mais forte (o
+        # formulario resolvido desaparece da lista) — vale registrar como tal.
+        self._close_case(int(fid), "form_resolvido_toa" if str(motivo).startswith("form_resolvido_toa") else "form_done")
         self._unblock_linked_chats(int(fid))
         # Formulario encerrado nao tem mais o que entregar: sem isso uma rota
         # `waiting` seguia tentando `move_chat` num chat que o TOA ja recusa —
@@ -2730,6 +2735,247 @@ class Engine:
         return total, por_tipo, {"toa_ok": toa_ok, "chats_toa": len(chats)}
 
 
+    # ------------------------------------------------------------------
+    # Carga por analista (medicao) e resolucao por AUSENCIA no TOA
+    # ------------------------------------------------------------------
+    def _load_poll_sec(self) -> int:
+        try:
+            return max(5, int(self.cfg.get("load_poll_sec") or 30))
+        except (TypeError, ValueError):
+            return 30
+
+    def _form_absent_readings(self) -> int:
+        """Leituras consecutivas de ausencia para dar o formulario por resolvido."""
+        try:
+            return max(1, int(self.cfg.get("form_absent_readings") or 2))
+        except (TypeError, ValueError):
+            return 2
+
+    def _load_keep(self) -> int:
+        try:
+            return max(10, int(self.cfg.get("analyst_load_keep") or 200))
+        except (TypeError, ValueError):
+            return 200
+
+    async def _listas_toa(self, queue_address: str | None) -> tuple[dict[int, dict], bool]:
+        """O que o TOA lista para a fila: `in_process` + `pending` (+ sessao).
+
+        `in_process` e a lista do front (chats E formularios em atendimento) e
+        `pending` e a fila. A uniao e a visao autoritativa de "existe no TOA" — e
+        o que permite fechar por AUSENCIA o que ja foi resolvido la.
+
+        O segundo valor (`ok`) so e True quando as DUAS listas do front
+        responderam: sem essa garantia a ausencia nao pode decidir nada (um
+        timeout no `pending` esconderia um formulario que so espera na fila).
+        """
+        vistos: dict[int, dict] = {}
+        fonte = str(self.cfg.get("route_capacity_source") or "both")
+        if fonte in ("active", "both"):
+            try:
+                ack = await self.sock.command("get_active_chats", {"contact_status": False})
+                d = ack.get("d") if isinstance(ack.get("d"), dict) else ack
+                for c in d.get("chats") or d.get("result") or []:
+                    if not isinstance(c, dict):
+                        continue
+                    cid = c.get("chat_id") or c.get("chatId")
+                    if cid is not None:
+                        vistos[int(cid)] = c
+            except Exception as e:
+                log.warning("get_active_chats carga: %s", e)
+        if not queue_address:
+            return vistos, False
+        ok = True
+        for tipo in ("in_process", "pending"):
+            try:
+                ack = await self.sock.command(
+                    "get_helpdesk_chats",
+                    {"helpdesk_address": queue_address, "chat_type": tipo, "count": 200, "from": 0},
+                )
+                d = ack.get("d") if isinstance(ack.get("d"), dict) else ack
+                if isinstance(ack, dict) and ack.get("timeout"):
+                    ok = False
+                for c in d.get("chats") or d.get("result") or []:
+                    if not isinstance(c, dict):
+                        continue
+                    cid = c.get("chat_id") or c.get("chatId")
+                    if cid is None:
+                        continue
+                    vistos[int(cid)] = c
+            except Exception as e:
+                ok = False
+                log.warning("get_helpdesk_chats %s tipo=%s carga: %s", queue_address, tipo, e)
+        return vistos, ok
+
+    async def snapshot_load(self, motivo: str = "timer") -> int:
+        """Grava a carga por analista e fecha o formulario ja resolvido no TOA.
+
+        Le as listas do TOA por fila do time, cruza com ledger/reservas/online e
+        grava `analyst_load` (+ historico). Formulario com caso aberto que NAO
+        aparece em nenhuma lista do TOA, com leitura bem sucedida, e contado por
+        leitura: ao atingir `form_absent_readings` ele e dado como RESOLVIDO
+        (`form_resolvido_toa`) — e isso que libera a vaga do analista.
+        """
+        fontes: dict[int, dict] = {}
+        ok_geral = False
+        filas: list[str | None] = []
+        equipes: list[tuple[int, str]] = [
+            (int(t["id"]), str(t["name"] or t["id"]))
+            for t in self.conn.execute("SELECT id, name FROM teams WHERE active = 1").fetchall()
+        ]
+        membros_por_time: dict[int, list[dict]] = {}
+        for tid, _nome in equipes:
+            membros_por_time[tid] = db.team_members(self.conn, tid)
+            for r in self.conn.execute(
+                "SELECT queue_address FROM team_queues WHERE team_id = ?", (tid,)
+            ).fetchall():
+                if r["queue_address"] and r["queue_address"] not in filas:
+                    filas.append(r["queue_address"])
+        for q in (filas or [None]):
+            vistos, ok = await self._listas_toa(q)
+            fontes.update(vistos)
+            ok_geral = ok_geral or ok
+        logins = sorted({
+            _member_login(str(m["address"]))
+            for ms in membros_por_time.values() for m in ms if m.get("address")
+        })
+        operadores = {str(m["address"]) for ms in membros_por_time.values() for m in ms if m.get("address")}
+        online: set[str] = set()
+        if logins:
+            try:
+                ack = await self.sock.command("get_online_users", {"users": logins}, timeout=12.0)
+                parsed = _online_logins_from_ack(ack)
+                if parsed is not None:
+                    online = {str(x) for x in parsed}
+            except Exception as e:
+                log.warning("get_online_users carga: %s", e)
+        ledger: dict[str, dict] = {}
+        for row in db.open_assignments(self.conn):
+            addr = str(row.get("assignee") or "")
+            if not addr:
+                continue
+            info = ledger.setdefault(addr, {"chats": 0, "forms": 0, "casos": set(), "forms_ids": []})
+            chave = str(row.get("case_key") or "") or ("chat:" + str(row.get("chat_id")))
+            info["casos"].add(chave)
+            if str(row.get("kind") or "") == "form":
+                info["forms"] += 1
+                info["forms_ids"].append(int(row.get("chat_id")))
+            else:
+                info["chats"] += 1
+        reservas: dict[str, int] = {}
+        for _exp, _kind, addr, _chave in self._reserved():
+            reservas[str(addr)] = reservas.get(str(addr), 0) + 1
+        total = 0
+        for tid, _nome in equipes:
+            for m in membros_por_time[tid]:
+                addr = str(m.get("address") or "")
+                if not addr:
+                    continue
+                chats_toa = forms_toa = 0
+                casos_toa: set[str] = set()
+                for c in fontes.values():
+                    if not self._participante_presente(c, addr):
+                        continue
+                    form = form_open.is_validation_form(c)
+                    req = form_open.requester_key(c, self.own, operadores)
+                    casos_toa.add(req[0] or ("chat:" + str(c.get("chat_id") or c.get("chatId") or "")))
+                    if form:
+                        forms_toa += 1
+                    else:
+                        chats_toa += 1
+                info = ledger.get(addr, {"chats": 0, "forms": 0, "casos": set(), "forms_ids": []})
+                casos = set(info["casos"]) | casos_toa
+                ocioso = 0.0
+                presente = 0
+                for fid in info["forms_ids"]:
+                    ocioso = max(ocioso, self._form_idle_min(fid))
+                    if fid in fontes:
+                        presente = 1
+                db.load_upsert(
+                    self.conn, addr,
+                    name=str(m.get("name") or addr), team_id=tid,
+                    janela=_window_label(m), online=1 if _member_login(addr) in online else 0,
+                    chats_toa=chats_toa, forms_toa=forms_toa,
+                    chats_ledger=int(info["chats"]), forms_ledger=int(info["forms"]),
+                    reservas=int(reservas.get(addr, 0)), casos_total=len(casos),
+                    form_ocioso_min=round(float(ocioso), 1), form_presente_toa=presente,
+                    toa_ok=1 if ok_geral else 0,
+                    detail=(
+                        f"motivo={motivo}; filas={len(filas)}; toa_ok={bool(ok_geral)}; "
+                        f"vistos={len(fontes)}; online={len(online)}"
+                    ),
+                )
+                db.load_add_history(
+                    self.conn, addr,
+                    chats_toa=chats_toa, forms_toa=forms_toa,
+                    chats_ledger=int(info["chats"]), forms_ledger=int(info["forms"]),
+                    casos_total=len(casos), toa_ok=ok_geral,
+                )
+                total += 1
+        db.load_trim_history(self.conn, self._load_keep())
+        resolvidos = self._fecha_ausentes(fontes, ok_geral)
+        self._emit(
+            "analyst_load", None, None,
+            f"motivo={motivo}; analistas={total}; vistos_no_toa={len(fontes)}; "
+            f"toa_ok={bool(ok_geral)}; resolvidos={resolvidos}",
+        )
+        return total
+
+    def _participante_presente(self, chat: dict, addr: str) -> bool:
+        """O analista aparece como participante PRESENTE (ou `assignedUser`) do chat."""
+        alvo = str(addr or "")
+        if not alvo:
+            return False
+        atribuido = chat.get("assignedUser") or chat.get("assigned_user") or {}
+        if isinstance(atribuido, dict) and atribuido.get("active"):
+            if _addr_eq(str(atribuido.get("address") or ""), alvo):
+                return True
+        for p in _parts(chat):
+            if not isinstance(p, dict) or not p.get("present"):
+                continue
+            if _addr_eq(str(p.get("address") or ""), alvo):
+                return True
+        return False
+
+    def _fecha_ausentes(self, fontes: dict[int, dict], toa_ok: bool) -> int:
+        """Formulario resolvido no TOA = ausente das listas por N leituras.
+
+        Nunca decide com leitura falha (`toa_ok=False`): ausencia so vale quando o
+        TOA respondeu. Contador em memoria (reinicia no restart, sem risco).
+        """
+        if not toa_ok:
+            return 0
+        limite = self._form_absent_readings()
+        fechados = 0
+        for row in db.open_assignments(self.conn):
+            if str(row.get("kind") or "") != "form":
+                continue
+            fid = int(row.get("chat_id"))
+            if fid in fontes:
+                self._form_absent.pop(fid, None)
+                continue
+            self._form_absent[fid] = int(self._form_absent.get(fid, 0)) + 1
+            if self._form_absent[fid] >= limite:
+                self._emit(
+                    "form_resolvido_toa", fid, row.get("queue_address"),
+                    f"ausente nas listas do TOA em {self._form_absent[fid]} leituras; "
+                    f"caso={row.get('case_key') or '-'}; analista={row.get('assignee') or '-'}",
+                )
+                self._close_form(fid, "form_resolvido_toa")
+                self._form_absent.pop(fid, None)
+                fechados += 1
+        # Indice sem caso: formulario que sumiu do TOA tambem sai de cena.
+        for fid in list(self._open_forms):
+            if fid in fontes:
+                self._form_absent.pop(fid, None)
+                continue
+            if db.open_assignment(self.conn, fid):
+                continue  # o caso aberto ja foi tratado acima
+            self._form_absent[fid] = int(self._form_absent.get(fid, 0)) + 1
+            if self._form_absent[fid] >= limite:
+                self._forget_open_form(fid, "ausente_no_toa")
+                self._form_absent.pop(fid, None)
+        return fechados
+
     async def pick_assignee(
         self,
         queue_address: str | None,
@@ -3377,6 +3623,9 @@ class Engine:
         try:
             if kind == "catalog_sync":
                 await self.discover_catalog()
+            elif kind == "load_snapshot":
+                # Botao "Atualizar agora" da aba Carga: le as listas do TOA na hora.
+                await self.snapshot_load("painel")
             else:
                 raise ValueError(f"job kind desconhecido: {kind}")
             db.finish_job(self.conn, jid, "done")

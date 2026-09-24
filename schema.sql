@@ -303,7 +303,48 @@ INSERT OR IGNORE INTO bot_settings (key, value) VALUES
   -- Posicao falada ao tecnico so a partir daqui (fila interna conta chat+form,
   -- mas o numero anunciado conta so chats).
   ('queue_top_pos', '5'),
+  -- Medicao de carga por analista (aba Carga): leitura das listas do TOA.
+  ('load_poll_sec', '30'),
+  ('analyst_load_keep', '200'),
+  -- Leitura de formulario: ausente nas listas do TOA por N leituras com leitura
+  -- bem sucedida = resolvido no TOA (fecha o caso e libera a vaga do analista).
+  ('form_absent_readings', '2'),
   ('routing_strategy', 'round_robin');
+
+-- Carga por analista: ultima leitura das listas do TOA + o que o ledger conta.
+-- `analyst_load_history` guarda o historico curto (tendencia na aba Carga).
+CREATE TABLE IF NOT EXISTS analyst_load (
+  address TEXT PRIMARY KEY,
+  at TEXT NOT NULL DEFAULT (datetime('now')),
+  name TEXT NOT NULL DEFAULT '',
+  team_id INTEGER,
+  janela TEXT NOT NULL DEFAULT '',
+  online INTEGER NOT NULL DEFAULT 0,
+  chats_toa INTEGER NOT NULL DEFAULT 0,
+  forms_toa INTEGER NOT NULL DEFAULT 0,
+  chats_ledger INTEGER NOT NULL DEFAULT 0,
+  forms_ledger INTEGER NOT NULL DEFAULT 0,
+  reservas INTEGER NOT NULL DEFAULT 0,
+  casos_total INTEGER NOT NULL DEFAULT 0,
+  form_ocioso_min REAL NOT NULL DEFAULT 0,
+  form_presente_toa INTEGER NOT NULL DEFAULT 0,
+  toa_ok INTEGER NOT NULL DEFAULT 0,
+  detail TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS analyst_load_history (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  at TEXT NOT NULL DEFAULT (datetime('now')),
+  address TEXT NOT NULL,
+  chats_toa INTEGER NOT NULL DEFAULT 0,
+  forms_toa INTEGER NOT NULL DEFAULT 0,
+  chats_ledger INTEGER NOT NULL DEFAULT 0,
+  forms_ledger INTEGER NOT NULL DEFAULT 0,
+  casos_total INTEGER NOT NULL DEFAULT 0,
+  toa_ok INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS analyst_load_history_at ON analyst_load_history (at DESC);
 
 -- Ledger de atribuicoes: a carga real por CASO (solicitante distinto).
 -- Formulario + chat do MESMO solicitante contam como um unico caso.

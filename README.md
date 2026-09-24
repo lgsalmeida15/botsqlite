@@ -308,3 +308,19 @@ A carga soma tres fontes, deduplicadas por solicitante: `get_active_chats` (sess
 `route_capacity_source`), o ledger `route_assignments` (o que o bot entregou e ainda nao fechou) e as
 reservas das entregas em voo. Sem resposta do TOA a carga **nao zera**: vale o ledger, e o evento
 registra `carga_toa=indisponivel`.
+
+### Carga por analista (aba Carga) e fechamento por AUSENCIA no TOA
+
+A aba **Carga** mostra a **leitura das listas do TOA por analista** (`analyst_load`): chats e formularios
+vistos no TOA, o que o ledger do bot conta, casos, reservas, formulario mais antigo (`form_ocioso_min`),
+online, `toa_ok` e a hora da leitura. Uma linha por endereco, mais um historico curto
+(`analyst_load_history`, podado por `analyst_load_keep`, padrao 200); a pagina se atualiza a cada 30 s e
+tem o botao **Atualizar agora** (job `load_snapshot`), que forca a leitura na hora. O card de divergencia
+aponta o analista com formulario no bot **ausente das listas** — candidato a fechamento por ausencia.
+
+O TOA e a **fonte autoritativa**: o formulario resolvido **desaparece da lista** do front. Por isso um
+formulario com caso aberto que fica **ausente de todas as listas** por `form_absent_readings` leituras
+consecutivas **com leitura bem sucedida** (padrao 2) e dado como resolvido no TOA: o caso fecha com
+`close_reason=form_resolvido_toa`, as rotas presas sao canceladas e a **vaga do analista volta na hora**.
+Leitura falha (timeout) **nunca** fecha nada, e se o formulario reaparecer o contador zera (o contador
+vive em memoria, entao o restart tambem zera).

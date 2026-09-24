@@ -26,6 +26,7 @@ function bot_permission_catalog(): array
         "page.queues" => ["group" => "Paginas", "label" => "Filas"],
         "page.operators" => ["group" => "Paginas", "label" => "Operadores"],
         "page.activity" => ["group" => "Paginas", "label" => "Atividade"],
+        "page.load" => ["group" => "Paginas", "label" => "Carga (analistas)"],
         "page.templates" => ["group" => "Paginas", "label" => "Templates"],
         "page.menus" => ["group" => "Paginas", "label" => "Menus"],
         "page.teams" => ["group" => "Paginas", "label" => "Times"],
@@ -39,6 +40,7 @@ function bot_permission_catalog(): array
         "teams.manage" => ["group" => "Acoes", "label" => "Times: criar, editar, membros e filas"],
         "routing.manage" => ["group" => "Acoes", "label" => "Roteamento: ajustes globais, do time e do membro"],
         "settings.manage" => ["group" => "Acoes", "label" => "Ajustes: salvar parametros do bot"],
+        "load.manage" => ["group" => "Acoes", "label" => "Carga: forcar a leitura das listas do TOA"],
         "scope.all_queues" => ["group" => "Escopo", "label" => "Ver dados de TODAS as filas (ignora filas/times marcados)"],
         "scope.all_teams" => ["group" => "Escopo", "label" => "Ver TODOS os times (ignora os times marcados)"],
         "scope.all_menus" => ["group" => "Escopo", "label" => "Ver TODOS os menus (ignora os menus marcados)"],
@@ -53,7 +55,7 @@ function bot_super_only_perms(): array
 /** Paginas do painel (fora login/logout/redirects). */
 function bot_panel_pages(): array
 {
-    return ["dashboard", "queues", "operators", "activity", "templates", "menus", "teams", "routing", "settings", "chats", "users", "groups"];
+    return ["dashboard", "queues", "operators", "activity", "load", "templates", "menus", "teams", "routing", "settings", "chats", "users", "groups"];
 }
 
 function bot_super_only_pages(): array
@@ -77,6 +79,7 @@ function bot_action_permission(string $page, string $action): ?string
         ],
         "templates" => ["save" => "templates.manage"],
         "settings" => ["save" => "settings.manage"],
+        "load" => ["load_now" => "load.manage"],
         "menus" => [
             "create" => "menus.manage",
             "rename" => "menus.manage",

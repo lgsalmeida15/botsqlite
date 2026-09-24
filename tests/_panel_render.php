@@ -18,6 +18,9 @@ if (getenv('SQLITE_PATH') === false || getenv('SQLITE_PATH') === '') {
     fwrite(STDERR, "erro: defina SQLITE_PATH (banco de teste) antes de rodar o harness\n");
     exit(2);
 }
+// O `.env` do projeto tambem define SQLITE_PATH e vencia o ambiente: o override
+// abaixo e o que garante que este harness leia o banco temporario.
+putenv('SQLITE_PATH_OVERRIDE=' . (string) getenv('SQLITE_PATH'));
 
 // Sessao fixa e JA gravada: o session_start() do index.php reabre a mesma
 // sessao (sem warning de "sessao ja ativa") e o usuario chega logado.

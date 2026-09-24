@@ -62,6 +62,11 @@ $pdo->exec("INSERT INTO pending_routes (kind, chat_id, queue_address, status, de
 $pdo->exec("INSERT INTO delivery_attempts (kind, chat_id, op, target, result) VALUES ('chat', 10, 'move_chat', 'u:ana@claro.com', 'ok')");
 $pdo->exec("INSERT INTO route_assignments (kind, chat_id, queue_address, team_id, assignee, case_key) VALUES ('form', 99, 'h:q1', 1, 'u:ana@claro.com', 'a:u:tec@claro.com')");
 $pdo->exec("INSERT INTO route_assignments (kind, chat_id, queue_address, team_id, assignee, case_key) VALUES ('chat', 10, 'h:q1', 1, 'u:ana@claro.com', 'a:u:tec@claro.com')");
+$pdo->exec(
+    "INSERT INTO analyst_load (address, name, team_id, janela, online, chats_toa, forms_toa, chats_ledger,"
+    . " forms_ledger, reservas, casos_total, form_ocioso_min, form_presente_toa, toa_ok, detail)"
+    . " VALUES ('u:ana@claro.com', 'Ana', 1, '09:00-18:00', 1, 2, 1, 2, 1, 0, 2, 25.0, 1, 1, 'motivo=teste')"
+);
 
 // Marcador de conteudo por aba: se o d-none ficar aberto, o marcador some.
 $marcadores = [
@@ -74,19 +79,23 @@ $marcadores = [
     'settings' => 'Timeout de resposta',
     'templates' => 'form_pending',
     'activity' => 'Todos os eventos',
+    'load' => 'Leitura automática a cada',
     'chats' => 'Filtrar',
 ];
 
 putenv('SQLITE_PATH=' . $path);
+putenv('SQLITE_PATH_OVERRIDE=' . $path);
 $php = PHP_BINARY;
 $harness = __DIR__ . DIRECTORY_SEPARATOR . '_panel_render.php';
 
+$htmls = [];
 foreach ($marcadores as $pPage => $marca) {
     $cmd = escapeshellarg($php) . ' ' . escapeshellarg($harness) . ' ' . escapeshellarg($pPage) . ' ' . $uid . ' 2>&1';
     $out = [];
     $code = 0;
     exec($cmd, $out, $code);
     $html = implode("\n", $out);
+    $htmls[$pPage] = $html;
     $erro = (stripos($html, 'Fatal error') !== false)
         || (stripos($html, 'Uncaught') !== false)
         || (stripos($html, 'Warning:') !== false)
@@ -118,6 +127,15 @@ foreach ($marcadores as $pPage => $marca) {
         ok(strpos($html, $marca) !== false, "aba {$pPage}: conteudo esperado presente");
     }
 }
+
+// A aba Carga precisa listar a leitura semeada em analyst_load. Sem isso o
+// harness estaria lendo outro banco (era o caso quando o `.env` vencia o
+// SQLITE_PATH do teste) e a tabela viria vazia.
+$htmlCarga = (string) ($htmls['load'] ?? '');
+ok(strpos($htmlCarga, 'u:ana@claro.com') !== false, 'aba load: lista o analista da leitura (analyst_load)');
+ok(strpos($htmlCarga, '25 min') !== false, 'aba load: ociosidade do formulario mais antigo');
+ok(strpos($htmlCarga, 'leitura(s) com leitura bem sucedida') !== false, 'aba load: explica a regra de ausencia com o ajuste vigente');
+ok(strpos($htmlCarga, 'value="load_now"') !== false, 'aba load: botao Atualizar agora (job load_snapshot)');
 
 @unlink($path);
 exit($failed === 0 ? 0 : 1);

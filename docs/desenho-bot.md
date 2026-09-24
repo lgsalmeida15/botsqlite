@@ -507,8 +507,9 @@ depois do ACK, e um `route_seen` sem atomicidade).
 flowchart TD
   T[Timer a cada 5 s] --> A[tick_timeouts: reply_timeout_sec, scripts presos, TTL do ledger]
   T --> B[tick_routes: formularios em pending_routes]
-  T --> C[process_pending_jobs: catalog_sync pedido pelo painel]
+  T --> C[process_pending_jobs: catalog_sync e load_snapshot pedidos pelo painel]
   T --> D[Cada config_poll_sec: reload_config - filas, menus, times, ajustes]
+  T --> L[Cada load_poll_sec: snapshot_load - carga por analista + ausencia no TOA]
   T --> E[Cada 60 s: get_version]
   E --> F{3 timeouts seguidos ou WebSocket mudo por ws_stale_sec?}
   F -->|sim| G[BrowserStale: fecha o Chromium, relanca e refaz bootstrap]
@@ -528,6 +529,43 @@ flowchart TD
 | `form_idle_owner_close_min` | 240 | mesma janela, mas para formulario parado **com analista do time dentro** (`motivo=form_ocioso_analista`) — o TOA nao avisa quando ele sai |
 | `queue_max_wait_sec` | 1800 | vencimento da espera do chat: ao vencer o bot avisa (`queue_expired`) e aplica o fallback do time (`0` = sem limite) |
 | `queue_top_pos` | 5 | posicao a partir da qual o chat ouve o NUMERO da fila; acima disso recebe o texto de progresso (`0` = sempre fala o numero) |
+| `load_poll_sec` | 30 | intervalo da leitura das listas do TOA que alimenta a aba **Carga** (`snapshot_load`) |
+| `form_absent_readings` | 2 | leituras consecutivas **bem sucedidas** sem o formulario em nenhuma lista para dalo como resolvido no TOA (`form_resolvido_toa`) |
+| `analyst_load_keep` | 200 | leituras guardadas em `analyst_load_history` (podadas por id desc) |
+
+### 8.9 Carga por analista e resolucao por AUSENCIA no TOA
+
+```mermaid
+flowchart TD
+  S[snapshot_load - cada load_poll_sec] --> L["get_helpdesk_chats in_process + pending (+ get_active_chats)"]
+  L --> G[Agrupa por analista presente: chat x formulario, casos, online, reservas]
+  G --> W[Grava analyst_load + analyst_load_history]
+  W --> A{Formulario com caso aberto apareceu nas listas?}
+  A -->|sim| Z[Zera o contador de ausencia]
+  A -->|nao e leitura OK| N[+1 leitura de ausencia]
+  N --> T{Atingiu form_absent_readings?}
+  T -->|sim| C["_close_form: form_resolvido_toa - cap liberado, reservas e rotas canceladas"]
+  T -->|nao| S
+```
+
+- **Quem le o que.** A leitura usa a MESMA fonte da capacidade (`route_capacity_source`): a lista
+  `in_process` do front (chats **e** formularios em atendimento) e a `pending` (fila). O agrupamento por
+  analista segue `_participante_presente` (participante presente ou `assignedUser.active`), e o caso usa a
+  mesma identidade do cap (`requester_key` com os operadores do time) — por isso `casos_total` bate com a
+  carga que decide a entrega.
+- **Ausencia e decisao, nao estimativa.** O TOA nao avisa que o analista resolveu o formulario: o sinal e
+  ele **sumir da lista** na proxima leitura do front. Duas leituras consecutivas ausentes
+  (`form_absent_readings`) com `toa_ok=true` fecham o caso (`close_reason=form_resolvido_toa`), cancelam as
+  rotas presas (`form_route_cancelled`, se houver) e devolvem a vaga (o `_close_case` tambem solta a reserva).
+- **Nunca decide no escuro.** Se qualquer leitura do ciclo falhar (timeout/erro), `toa_ok=0` e o contador
+  nao anda; `analyst_load.toa_ok` fica 0 e a aba mostra **falhou**. Formulario no indice **sem** caso aberto
+  e que sumiu do TOA sai do indice (`form_forget … motivo=ausente_no_toa`) pela mesma regua.
+- **Reapareceu?** O contador zera (formulario voltou a ser listado) e o caso segue aberto — nada e fechado
+  por engano. O contador e em memoria: restart tambem zera.
+- **Painel.** Aba **Carga**: cards (formularios na fila, em atendimento, chats em atendimento, fechados na
+  ultima hora, resolvidos por ausencia, ultima leitura) e a tabela por analista com TOA x bot, casos,
+  reservas, formulario mais antigo e a hora da leitura; atualizacao de 30 s (`load_poll_sec`) e o botao
+  **Atualizar agora** (job `load_snapshot`). Permissao de pagina `page.load` e de acao `load.manage`.
 
 ## 10. Restart, resume e reciclagem
 
@@ -550,7 +588,7 @@ flowchart TD
   confirmacao atual (dentro do `reply_timeout_sec`) e a rota de transferencia enfileirada segue
   sendo drenada pelo tick.
 
-## 11. Banco de dados: 28 tabelas e o papel de cada uma
+## 11. Banco de dados: 30 tabelas e o papel de cada uma
 
 ### Catalogo do TOA
 
@@ -582,6 +620,8 @@ flowchart TD
 | `team_member_routing` | peso e caps por membro |
 | `route_assignments` | **ledger dos casos**: quem atende cada solicitante, `case_key`, contato do solicitante e `closed_at` |
 | `pending_routes` | **fila de espera**: retry do formulario (`kind=form`), fila do chat com posicao (`kind=chat`, `expires_at`, `last_position`) e trava anti-duplicidade |
+| `analyst_load` | **medicao por analista** (aba Carga): ultima leitura das listas do TOA (chats x formularios), ledger, reservas, `form_ocioso_min`, `form_presente_toa`, `toa_ok` |
+| `analyst_load_history` | historico curto das leituras (podado por `analyst_load_keep`) |
 
 ### Estado e observabilidade
 
@@ -622,6 +662,7 @@ de atendimento **nao le** nenhuma dessas tabelas; `bot_migrate_rbac` (PHP) e
 | **Menus** | menus, opcoes, submenus, acao/texto normais, **acao/texto se formulario aberto** e scripts |
 | **Templates** | textos `greeting`, `menu`, `retry`, `closing`, `ask_received`, `ask_transferring`, `queue_position` (posicao na fila de espera) e a abertura form-aware: `form_pending` (`{analista}`), `form_pending_wait` e `form_waiting` |
 | **Atividade** | log de eventos com filtro por tipo e atualizacao automatica na primeira pagina |
+| **Carga** | leitura das listas do TOA por analista (`analyst_load`): TOA x bot, casos, reservas, formulario mais antigo e a hora da leitura; **Atualizar agora** forca a leitura (job `load_snapshot`) |
 | **Chats** | estado dos chats, sem conteudo de conversa |
 | **Ajustes** | timeout de resposta, retries invalidos, poll de config e reciclagem do WebSocket |
 | **Usuarios** (super-only) | contas do painel: login, senha, nome, address do TOA e grupo (o escopo herdado aparece em leitura) |
@@ -636,7 +677,8 @@ de atendimento **nao le** nenhuma dessas tabelas; `bot_migrate_rbac` (PHP) e
 | Scripts | `script_ok`, `script_error`, `script_denied` |
 | Formulario de validacao | `closure`, `form_routed`, `form_no_agent`, `form_route_retry`, `form_no_team`, `form_no_queue`, `form_adopted` (ja estava com um analista do time), `form_move_refused` (`move_chat` recusado no teto), `form_skip_past` (formulario encerrado nao entra na fila) |
 | Abertura form-aware | `case_linked`, `case_link_unconfirmed` (vinculo por palpite de fila, sem identidade), `form_aware_greeting`, `form_aware_choice`, `form_aware_wait`, `form_aware_skip`, `case_sibling_delivered` |
-| Indice do formulario | `form_indexed`, `form_not_open`, `form_dropped`, `form_ignored_payload`, `form_queue_left`, `form_forget`, `form_state` (pendente/em atendimento/passado), `form_closed`, `form_route_cancelled` |
+| Indice do formulario | `form_indexed`, `form_not_open`, `form_dropped`, `form_ignored_payload`, `form_queue_left`, `form_forget` (inclui `motivo=ausente_no_toa`), `form_state` (pendente/em atendimento/passado), `form_closed`, `form_resolvido_toa` (ausente das listas do TOA por `form_absent_readings` leituras: fecha o caso e libera a vaga), `form_route_cancelled` |
+| Carga por analista | `analyst_load` (resumo de cada leitura: analistas, itens vistos no TOA, `toa_ok` e quantos foram resolvidos por ausencia) |
 | Resposta ignorada | `message_ignored` (mensagem do tecnico em status que o bot nao trata; antes era silencioso) |
 | Identidade do caso | `case_key_divergente` (a chave da rota foi ignorada: a identidade do payload manda) |
 | Catalogo | `catalog_synced`, `sync_error` |
@@ -678,6 +720,7 @@ Quem esta na fila de espera continua em `classified` ate ser atribuido (`closed`
 | `transfer_targets` e `menu_option_targets` | **codigo morto**: o motor sempre roteia pelo time; decidir entre implementar ou remover da UI |
 | `CHAT_TYPE_ROUTING` do TOA | existe um modo de roteamento nativo no TOA - vale investigar como bonus |
 | Escopo do `get_active_chats` | validar em producao: o campo `carga_toa=` no detalhe mostra quantos chats o bot enxergou |
+| **Vagas do time ao vivo** | **parcial**: o painel nao fala com o TOA, mas o bot publica a presenca e a carga por analista na aba **Carga** (`analyst_load`) e usa essa leitura para fechar por **ausencia** o formulario resolvido |
 
 ## 16. Como rodar e testar
 
@@ -693,6 +736,7 @@ python tests/test_form_open.py
 python tests/test_form_aware.py
 python tests/test_ask_flow.py
 python tests/test_queue.py
+python tests/test_load.py
 python tests/test_reply_lost.py
 
 # Suites PHP
@@ -704,6 +748,7 @@ php tests/test_queue_schema.php
 php tests/test_questions_schema.php
 php tests/test_delivery_schema.php
 php tests/test_form_aware_schema.php
+php tests/test_load_schema.php
 php tests/test_panel_render.php
 ```
 

@@ -31,6 +31,13 @@ function bot_root(): string
 
 function bot_sqlite_path(): string
 {
+    // Override explicito (so as suites de painel usam): garante banco temporario
+    // mesmo com `.env` definindo SQLITE_PATH — sem isso o harness renderizava o
+    // banco real e o teste "passava" sem exercitar os dados semeados.
+    $override = getenv('SQLITE_PATH_OVERRIDE');
+    if ($override !== false && $override !== '') {
+        return $override;
+    }
     // `.env` manda (é a fonte documentada); sem a chave lá, aceita o ambiente —
     // é o que permite rodar as suítes de painel em banco temporário sem tocar
     // em data/helptoa.sqlite.
@@ -100,6 +107,7 @@ function bot_ensure_schema(PDO $pdo): void
     bot_migrate_ask($pdo);
     bot_migrate_queue($pdo);
     bot_migrate_delivery($pdo);
+    bot_migrate_load($pdo);
     bot_migrate_form_aware($pdo);
 }
 
@@ -123,6 +131,50 @@ function bot_migrate_ask(PDO $pdo): void
     if (!isset($chatCols['moved_at'])) {
         // Transferencia parcial: `move_chat` ja feito e `invite_to_chat` pendente.
         $pdo->exec('ALTER TABLE chats ADD COLUMN moved_at TEXT');
+    }
+}
+
+/**
+ * Carga por analista (medicao): ultima leitura das listas do TOA + historico.
+ * Espelho de python/db.py::_migrate_load — o bot e quem grava; o painel le.
+ */
+function bot_migrate_load(PDO $pdo): void
+{
+    if (!bot_table_exists($pdo, 'analyst_load')) {
+        $pdo->exec(
+            'CREATE TABLE analyst_load ('
+            . ' address TEXT PRIMARY KEY,'
+            . " at TEXT NOT NULL DEFAULT (datetime('now')),"
+            . " name TEXT NOT NULL DEFAULT '',"
+            . ' team_id INTEGER,'
+            . " janela TEXT NOT NULL DEFAULT '',"
+            . ' online INTEGER NOT NULL DEFAULT 0,'
+            . ' chats_toa INTEGER NOT NULL DEFAULT 0,'
+            . ' forms_toa INTEGER NOT NULL DEFAULT 0,'
+            . ' chats_ledger INTEGER NOT NULL DEFAULT 0,'
+            . ' forms_ledger INTEGER NOT NULL DEFAULT 0,'
+            . ' reservas INTEGER NOT NULL DEFAULT 0,'
+            . ' casos_total INTEGER NOT NULL DEFAULT 0,'
+            . ' form_ocioso_min REAL NOT NULL DEFAULT 0,'
+            . ' form_presente_toa INTEGER NOT NULL DEFAULT 0,'
+            . ' toa_ok INTEGER NOT NULL DEFAULT 0,'
+            . " detail TEXT NOT NULL DEFAULT '')"
+        );
+    }
+    if (!bot_table_exists($pdo, 'analyst_load_history')) {
+        $pdo->exec(
+            'CREATE TABLE analyst_load_history ('
+            . ' id INTEGER PRIMARY KEY AUTOINCREMENT,'
+            . " at TEXT NOT NULL DEFAULT (datetime('now')),"
+            . ' address TEXT NOT NULL,'
+            . ' chats_toa INTEGER NOT NULL DEFAULT 0,'
+            . ' forms_toa INTEGER NOT NULL DEFAULT 0,'
+            . ' chats_ledger INTEGER NOT NULL DEFAULT 0,'
+            . ' forms_ledger INTEGER NOT NULL DEFAULT 0,'
+            . ' casos_total INTEGER NOT NULL DEFAULT 0,'
+            . ' toa_ok INTEGER NOT NULL DEFAULT 0)'
+        );
+        $pdo->exec('CREATE INDEX IF NOT EXISTS analyst_load_history_at ON analyst_load_history (at DESC)');
     }
 }
 

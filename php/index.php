@@ -877,6 +877,11 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && $page !== 'login') {
             $pdo->exec("INSERT INTO bot_jobs (kind) VALUES ('catalog_sync')");
             $postSynced = true;
         }
+        if ($page === 'load' && $action === 'load_now') {
+            // Botao "Atualizar agora": o bot le as listas do TOA na hora e grava.
+            $pdo->exec("INSERT INTO bot_jobs (kind) VALUES ('load_snapshot')");
+            $postSynced = true;
+        }
         if ($page === 'operators' && $action === 'add_operator') {
             $opName = trim((string) ($_POST['operator_name'] ?? ''));
             $opAddr = trim((string) ($_POST['operator_address'] ?? ''));
@@ -1337,6 +1342,7 @@ $nav = [
     'queues' => 'Filas',
     'operators' => 'Operadores',
     'activity' => 'Atividade',
+    'load' => 'Carga',
     'templates' => 'Templates',
     'menus' => 'Menus',
     'teams' => 'Times',
@@ -1359,12 +1365,12 @@ foreach ($nav as $navKey => $navLabel) {
     }
 }
 
-function layout_start(string $title, array $nav, string $page, bool $autoRefresh = false): void
+function layout_start(string $title, array $nav, string $page, bool|int $autoRefresh = false): void
 {
     echo '<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">';
     echo '<title>' . h($title) . '</title>';
     if ($autoRefresh) {
-        echo '<meta http-equiv="refresh" content="5">';
+        echo '<meta http-equiv="refresh" content="' . (is_int($autoRefresh) ? (int) $autoRefresh : 5) . '">';
     }
     echo '<link href="assets/bootstrap.min.css" rel="stylesheet">';
     echo '<link href="assets/panel.css" rel="stylesheet">';
@@ -1479,8 +1485,8 @@ if ($page === 'options' || $page === 'targets') {
 $listPage = list_page();
 $filterReason = preg_replace('/[^a-z_]/', '', (string) ($_GET['reason'] ?? '')) ?: '';
 $filterStatus = preg_replace('/[^a-z_]/', '', (string) ($_GET['status'] ?? '')) ?: '';
-$autoRefresh = $page === 'activity' && $listPage === 1 && $filterReason === '' && empty($_GET['filas']) && empty($_GET['de']) && empty($_GET['ate']);
-layout_start('HELPTOA Bot', $nav, $page, $autoRefresh);
+$autoRefresh = ($page === 'activity' && $listPage === 1 && $filterReason === '' && empty($_GET['filas']) && empty($_GET['de']) && empty($_GET['ate'])) || $page === 'load';
+layout_start('HELPTOA Bot', $nav, $page, $page === 'load' ? 30 : $autoRefresh);
 
 if ($page === 'queues') {
     $syncBtn = bot_can($pdo, 'queues.manage')
@@ -2696,6 +2702,159 @@ if ($page === 'chats') {
         $chatPg['ate'] = $chAteRaw;
     }
     echo_pagination('chats', $listPage, $total, $chatPg, $per);
+}
+
+if ($page === 'load') {
+    $loadPoll = 30;
+    $loadAbsent = 2;
+    try {
+        foreach ($pdo->query('SELECT key, value FROM bot_settings') as $rCfg) {
+            $kCfg = (string) $rCfg['key'];
+            if ($kCfg === 'load_poll_sec') {
+                $loadPoll = max(5, (int) $rCfg['value']);
+            } elseif ($kCfg === 'form_absent_readings') {
+                $loadAbsent = max(1, (int) $rCfg['value']);
+            }
+        }
+    } catch (Throwable $e) {
+        $loadPoll = 30;
+    }
+    $loadParams = [];
+    $loadWhere = bot_scope_team_where($pdo, 'l.team_id', $loadParams);
+    $loadRows = [];
+    $loadErro = '';
+    try {
+        $stLoad = $pdo->prepare(
+            'SELECT l.*, t.name AS team_name FROM analyst_load l'
+            . ' LEFT JOIN teams t ON t.id = l.team_id'
+            . ' WHERE 1 = 1' . $loadWhere
+            . ' ORDER BY l.casos_total DESC, l.form_ocioso_min DESC, l.name'
+        );
+        $stLoad->execute($loadParams);
+        $loadRows = $stLoad->fetchAll();
+    } catch (Throwable $e) {
+        $loadErro = 'Tabela analyst_load ausente. Reinicie o bot (ou rode o bot no painel) para criar.';
+    }
+    // Resumo dos formularios: fila, atendimento (cap) e desfechos na ultima hora.
+    $formFila = 0;
+    $capForm = 0;
+    $capChat = 0;
+    $fechadosHora = 0;
+    $resolvidosHora = 0;
+    try {
+        $formFila = (int) $pdo->query("SELECT COUNT(*) FROM pending_routes WHERE kind = 'form' AND status = 'waiting'")->fetchColumn();
+    } catch (Throwable $e) {
+    }
+    try {
+        $capParams = [];
+        $capWhere = bot_scope_team_where($pdo, 'team_id', $capParams);
+        $stCap = $pdo->prepare("SELECT kind, COUNT(*) AS n FROM route_assignments WHERE closed_at IS NULL" . $capWhere . ' GROUP BY kind');
+        $stCap->execute($capParams);
+        foreach ($stCap->fetchAll() as $rCap) {
+            if ((string) $rCap['kind'] === 'form') {
+                $capForm = (int) $rCap['n'];
+            } else {
+                $capChat = (int) $rCap['n'];
+            }
+        }
+    } catch (Throwable $e) {
+    }
+    try {
+        foreach ($pdo->query(
+            "SELECT reason, COUNT(*) AS n FROM bot_events WHERE at >= datetime('now', '-1 hour')"
+            . " AND reason IN ('form_closed', 'form_resolvido_toa') GROUP BY reason"
+        ) as $rEv) {
+            if ((string) $rEv['reason'] === 'form_resolvido_toa') {
+                $resolvidosHora = (int) $rEv['n'];
+            } else {
+                $fechadosHora = (int) $rEv['n'];
+            }
+        }
+    } catch (Throwable $e) {
+    }
+    $ultimaLeitura = '';
+    foreach ($loadRows as $rUlt) {
+        if ((string) ($rUlt['at'] ?? '') > $ultimaLeitura) {
+            $ultimaLeitura = (string) $rUlt['at'];
+        }
+    }
+    $loadBtn = bot_can($pdo, 'load.manage')
+        ? '<form method="post" class="d-inline"><input type="hidden" name="csrf" value="' . h($csrf) . '"><input type="hidden" name="action" value="load_now"><button class="btn btn-primary btn-sm">Atualizar agora</button></form>'
+        : '';
+    page_header(
+        'Carga',
+        'Leitura das listas do TOA por analista (chats x formularios) e o que o bot contabiliza.',
+        $loadBtn
+    );
+    echo '<div class="d-none">';
+    echo '<h1 class="h3 mb-0">Carga</h1>';
+    echo '<form method="post" class="d-inline"><input type="hidden" name="csrf" value="' . h($csrf) . '"><input type="hidden" name="action" value="load_now">';
+    echo '<button class="btn btn-primary">Atualizar (reler listas do TOA)</button></form></div>';
+    if (($_GET['synced'] ?? '') === '1') {
+        echo '<div class="alert alert-success py-2 mt-2 mb-2">Leitura solicitada — o bot relê as listas do TOA em até ~5 s.</div>';
+    }
+    if ($loadErro !== '') {
+        echo '<div class="alert alert-danger py-2 mb-2">' . h($loadErro) . '</div>';
+    }
+    echo '<div class="row g-3 mb-3">';
+    $cards = [
+        ['Formularios na fila', (string) $formFila, 'bg-primary'],
+        ['Formularios em atendimento', (string) $capForm, 'bg-info text-dark'],
+        ['Chats em atendimento', (string) $capChat, 'bg-secondary'],
+        ['Fechados na ultima hora', (string) $fechadosHora, 'bg-dark'],
+        ['Resolvidos por ausencia no TOA (1 h)', (string) $resolvidosHora, 'bg-success'],
+        ['Ultima leitura', $ultimaLeitura !== '' ? fmt_dt($ultimaLeitura) : '—', 'bg-light text-dark'],
+    ];
+    foreach ($cards as $card) {
+        echo '<div class="col-6 col-md-4 col-xl-2"><div class="card h-100"><div class="card-body py-2">';
+        echo '<div class="text-muted small">' . h($card[0]) . '</div>';
+        echo '<div class="fs-4"><span class="badge ' . h($card[2]) . '">' . h($card[1]) . '</span></div>';
+        echo '</div></div></div>';
+    }
+    echo '</div>';
+    echo '<p class="text-muted small">Leitura automática a cada <strong>' . (int) $loadPoll . ' s</strong>. Formulario ausente nas listas do TOA por <strong>' . (int) $loadAbsent . '</strong> leitura(s) com leitura bem sucedida é dado como resolvido no TOA (<code>form_resolvido_toa</code>): o caso fecha, a vaga do analista libera e as rotas sao canceladas.</p>';
+    $divergentes = 0;
+    foreach ($loadRows as $rDiv) {
+        if ((int) $rDiv['forms_ledger'] > 0 && !(int) $rDiv['form_presente_toa']) {
+            $divergentes++;
+        }
+    }
+    if (!$loadRows) {
+        echo '<p class="text-muted">Nenhuma leitura ainda. Confira se ha time ativo com membros e filas; a primeira leitura sai em ate '
+            . (int) $loadPoll . ' s (ou clique em <strong>Atualizar agora</strong>).</p>';
+    } else {
+        if ($divergentes > 0) {
+            echo '<div class="alert alert-warning py-2">' . (int) $divergentes . ' analista(s) com formulario no bot e <strong>ausente das listas do TOA</strong> — devem ser fechados por ausencia na proxima leitura.</div>';
+        }
+        echo '<div class="table-responsive sticky-head"><table class="table table-slim table-hover align-middle bg-white mb-0">';
+        echo '<thead><tr><th>Analista</th><th>Time</th><th>Online</th><th class="text-end">TOA chat</th><th class="text-end">TOA form</th>'
+            . '<th class="text-end">Bot chat</th><th class="text-end">Bot form</th><th class="text-end">Casos</th><th class="text-end">Reservas</th>'
+            . '<th class="text-end">Form + velho</th><th>TOA</th><th>Leitura</th></tr></thead><tbody>';
+        foreach ($loadRows as $r) {
+            $addr = (string) $r['address'];
+            $nome = (string) ($r['name'] !== '' ? $r['name'] : $addr);
+            $online = (int) $r['online'] === 1;
+            $toaOk = (int) $r['toa_ok'] === 1;
+            $pres = (int) $r['form_presente_toa'] === 1;
+            $ocioso = (float) $r['form_ocioso_min'];
+            echo '<tr>';
+            echo '<td><strong>' . h($nome) . '</strong><div class="text-muted small"><code>' . h($addr) . '</code></div></td>';
+            echo '<td>' . h((string) ($r['team_name'] ?? '')) . '</td>';
+            echo '<td>' . badge_state($online, 'sim', 'não') . '</td>';
+            echo '<td class="text-end">' . (int) $r['chats_toa'] . '</td>';
+            echo '<td class="text-end">' . (int) $r['forms_toa'] . ($pres ? ' <span class="badge bg-info text-dark">presente</span>' : '') . '</td>';
+            echo '<td class="text-end">' . (int) $r['chats_ledger'] . '</td>';
+            echo '<td class="text-end">' . (int) $r['forms_ledger'] . '</td>';
+            echo '<td class="text-end"><span class="badge ' . ((int) $r['casos_total'] > 0 ? 'bg-secondary' : 'bg-light text-dark') . '">'
+                . (int) $r['casos_total'] . '</span></td>';
+            echo '<td class="text-end">' . (int) $r['reservas'] . '</td>';
+            echo '<td class="text-end">' . ($ocioso > 0 ? h(number_format($ocioso, 0) . ' min') : '<span class="text-muted">—</span>') . '</td>';
+            echo '<td>' . badge_state($toaOk, 'ok', 'falhou') . '</td>';
+            echo '<td>' . h(fmt_dt($r['at'])) . '</td>';
+            echo '</tr>';
+        }
+        echo '</tbody></table></div>';
+    }
 }
 
 if ($page === 'users') {

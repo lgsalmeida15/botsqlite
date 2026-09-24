@@ -54,6 +54,7 @@ def ensure_schema(conn) -> None:
     _migrate_delivery(conn)
     _migrate_form_aware(conn)
     _migrate_case_keys(conn)
+    _migrate_load(conn)
 
 
 def _table_columns(conn, table: str) -> set[str]:
@@ -385,6 +386,119 @@ def _migrate_case_keys(conn) -> None:
             f"UPDATE {tabela} SET case_key = 'a:' || case_key"
             f" WHERE case_key LIKE 'u:%'{filtro}"
         )
+
+
+def _migrate_load(conn) -> None:
+    """Carga por analista (medicao): estado atual + historico curto.
+
+    O bot le `get_helpdesk_chats(in_process)` por fila (mesma fonte da capacidade)
+    e guarda por analista: chats/formularios vistos no TOA, o que o ledger conta,
+    reservas e a ociosidade do formulario mais antigo — e e essa leitura que
+    permite fechar por AUSENCIA o formulario ja resolvido no TOA.
+    """
+    if "analyst_load" not in _table_names(conn):
+        conn.execute(
+            """CREATE TABLE analyst_load (
+                 address TEXT PRIMARY KEY,
+                 at TEXT NOT NULL DEFAULT (datetime('now')),
+                 name TEXT NOT NULL DEFAULT '',
+                 team_id INTEGER,
+                 janela TEXT NOT NULL DEFAULT '',
+                 online INTEGER NOT NULL DEFAULT 0,
+                 chats_toa INTEGER NOT NULL DEFAULT 0,
+                 forms_toa INTEGER NOT NULL DEFAULT 0,
+                 chats_ledger INTEGER NOT NULL DEFAULT 0,
+                 forms_ledger INTEGER NOT NULL DEFAULT 0,
+                 reservas INTEGER NOT NULL DEFAULT 0,
+                 casos_total INTEGER NOT NULL DEFAULT 0,
+                 form_ocioso_min REAL NOT NULL DEFAULT 0,
+                 form_presente_toa INTEGER NOT NULL DEFAULT 0,
+                 toa_ok INTEGER NOT NULL DEFAULT 0,
+                 detail TEXT NOT NULL DEFAULT ''
+               )"""
+        )
+    if "analyst_load_history" not in _table_names(conn):
+        conn.execute(
+            """CREATE TABLE analyst_load_history (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 at TEXT NOT NULL DEFAULT (datetime('now')),
+                 address TEXT NOT NULL,
+                 chats_toa INTEGER NOT NULL DEFAULT 0,
+                 forms_toa INTEGER NOT NULL DEFAULT 0,
+                 chats_ledger INTEGER NOT NULL DEFAULT 0,
+                 forms_ledger INTEGER NOT NULL DEFAULT 0,
+                 casos_total INTEGER NOT NULL DEFAULT 0,
+                 toa_ok INTEGER NOT NULL DEFAULT 0
+               )"""
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS analyst_load_history_at ON analyst_load_history (at DESC)"
+        )
+
+
+def load_upsert(conn, address: str, **campos) -> None:
+    """Grava a leitura atual do analista (uma linha por endereco)."""
+    base = {
+        "name": "", "team_id": None, "janela": "", "online": 0, "chats_toa": 0, "forms_toa": 0,
+        "chats_ledger": 0, "forms_ledger": 0, "reservas": 0, "casos_total": 0,
+        "form_ocioso_min": 0.0, "form_presente_toa": 0, "toa_ok": 0, "detail": "",
+    }
+    base.update({k: v for k, v in campos.items() if k in base})
+    conn.execute(
+        f"""INSERT INTO analyst_load
+              (address, at, {', '.join(base)})
+            VALUES (?, datetime('now'), {', '.join('?' * len(base))})
+            ON CONFLICT (address) DO UPDATE SET
+              at = datetime('now'),
+              {', '.join(f'{k} = excluded.{k}' for k in base)}""",
+        [str(address)] + list(base.values()),
+    )
+
+
+def load_trim_history(conn, keep: int = 200) -> int:
+    """Mantem so as `keep` leituras mais recentes do historico."""
+    cur = conn.execute(
+        """DELETE FROM analyst_load_history
+            WHERE id NOT IN (SELECT id FROM analyst_load_history ORDER BY id DESC LIMIT ?)""",
+        (int(max(keep, 1)),),
+    )
+    return int(cur.rowcount or 0)
+
+
+def load_add_history(conn, address: str, **campos) -> None:
+    """Uma linha por analista por rodada de leitura."""
+    conn.execute(
+        """INSERT INTO analyst_load_history
+             (address, chats_toa, forms_toa, chats_ledger, forms_ledger, casos_total, toa_ok)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (
+            str(address),
+            int(campos.get("chats_toa") or 0),
+            int(campos.get("forms_toa") or 0),
+            int(campos.get("chats_ledger") or 0),
+            int(campos.get("forms_ledger") or 0),
+            int(campos.get("casos_total") or 0),
+            1 if campos.get("toa_ok") else 0,
+        ),
+    )
+
+
+def load_rows(conn) -> list[dict]:
+    """Leitura atual de todos os analistas (a aba Carga le daqui)."""
+    return conn.execute("SELECT * FROM analyst_load ORDER BY casos_total DESC, name").fetchall()
+
+
+def load_history(conn, address: str | None = None, limit: int = 60) -> list[dict]:
+    """Historico recente (por analista ou geral)."""
+    if address:
+        return conn.execute(
+            """SELECT * FROM analyst_load_history WHERE address = ?
+                ORDER BY id DESC LIMIT ?""",
+            (str(address), int(limit)),
+        ).fetchall()
+    return conn.execute(
+        "SELECT * FROM analyst_load_history ORDER BY id DESC LIMIT ?", (int(limit),)
+    ).fetchall()
 
 
 def _migrate_form_aware(conn) -> None:
