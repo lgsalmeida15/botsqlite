@@ -138,6 +138,19 @@ function bot_migrate_ask(PDO $pdo): void
  * Carga por analista (medicao): ultima leitura das listas do TOA + historico.
  * Espelho de python/db.py::_migrate_load — o bot e quem grava; o painel le.
  */
+/**
+ * Status de chat em que o BOT esta atuando (antes de passar para um analista).
+ * Espelho de python/db.py::resume_chats — use sempre por aqui, para nao divergir.
+ */
+function bot_open_chat_statuses(): array
+{
+    return [
+        'joined', 'menu_sent', 'awaiting_reply', 'classified', 'monitoring',
+        'awaiting_script_answer', 'awaiting_script_confirm', 'awaiting_script_run',
+        'awaiting_form_choice',
+    ];
+}
+
 function bot_migrate_load(PDO $pdo): void
 {
     if (!bot_table_exists($pdo, 'analyst_load')) {
@@ -158,8 +171,12 @@ function bot_migrate_load(PDO $pdo): void
             . ' form_ocioso_min REAL NOT NULL DEFAULT 0,'
             . ' form_presente_toa INTEGER NOT NULL DEFAULT 0,'
             . ' toa_ok INTEGER NOT NULL DEFAULT 0,'
+            . ' casos_toa_keys TEXT NOT NULL DEFAULT \'\','
             . " detail TEXT NOT NULL DEFAULT '')"
         );
+    }
+    if (bot_table_exists($pdo, 'analyst_load') && !isset(bot_table_columns($pdo, 'analyst_load')['casos_toa_keys'])) {
+        $pdo->exec("ALTER TABLE analyst_load ADD COLUMN casos_toa_keys TEXT NOT NULL DEFAULT ''");
     }
     if (!bot_table_exists($pdo, 'analyst_load_history')) {
         $pdo->exec(
@@ -232,7 +249,11 @@ function bot_migrate_form_aware(PDO $pdo): void
 }
 
 /**
- * Fila de espera (Fase 2): expiracao da espera e ultima posicao avisada ao tecnico.
+ * Fila de espera (Fase 2): ultima posicao avisada e o encerramento manual.
+ *
+ * A espera **nao tem prazo**: `expires_at` fica so como marcador do botao
+ * "Encerrar espera"; a chave antiga `queue_max_wait_sec` e removida do banco.
+ * Espelho de python/db.py::_migrate_queue.
  */
 function bot_migrate_queue(PDO $pdo): void
 {
@@ -243,6 +264,15 @@ function bot_migrate_queue(PDO $pdo): void
     if (!isset($cols['expires_at'])) {
         $pdo->exec('ALTER TABLE pending_routes ADD COLUMN expires_at TEXT');
     }
+    if (bot_table_exists($pdo, 'bot_settings')) {
+        $pdo->exec("DELETE FROM bot_settings WHERE key = 'queue_max_wait_sec'");
+    }
+    // Rotas que ja esperavam com prazo automatico perdem o vencimento (o pedido
+    // manual do painel grava `expires_at` no passado e e preservado).
+    $pdo->exec(
+        "UPDATE pending_routes SET expires_at = NULL"
+        . " WHERE status = 'waiting' AND expires_at IS NOT NULL AND expires_at > datetime('now')"
+    );
     if (!isset($cols['last_position'])) {
         $pdo->exec('ALTER TABLE pending_routes ADD COLUMN last_position INTEGER NOT NULL DEFAULT 0');
     }

@@ -34,7 +34,7 @@ bot_ensure_schema($pdo);
 $colunas = [
     'address', 'at', 'name', 'team_id', 'janela', 'online', 'chats_toa', 'forms_toa',
     'chats_ledger', 'forms_ledger', 'reservas', 'casos_total', 'form_ocioso_min',
-    'form_presente_toa', 'toa_ok', 'detail',
+    'form_presente_toa', 'toa_ok', 'detail', 'casos_toa_keys',
 ];
 $cols = bot_table_columns($pdo, 'analyst_load');
 $faltando = array_values(array_diff($colunas, array_keys($cols)));
@@ -73,26 +73,52 @@ $_SESSION['bot_user_id'] = (int) $pdo->lastInsertId();
 bot_reset_panel_cache();
 $pdo->exec("INSERT INTO teams (name, active) VALUES ('T1', 1)");
 $pdo->exec("INSERT INTO teams (name, active) VALUES ('T2', 1)");
+// Ana esta ATIVA no roteamento; o outro membro esta inativo e, mesmo com a maior
+// carga fisica, tem que aparecer depois dela (regra da aba).
+$pdo->exec("INSERT INTO team_members (team_id, address, name, active) VALUES (1, 'u:ana@claro.com', 'Ana', 1)");
+$pdo->exec("INSERT INTO team_members (team_id, address, name, active) VALUES (1, 'u:inativo@claro.com', 'Inativo', 0)");
 $pdo->exec(
     "INSERT INTO analyst_load (address, name, team_id, janela, online, chats_toa, forms_toa, chats_ledger, forms_ledger,"
     . " reservas, casos_total, form_ocioso_min, form_presente_toa, toa_ok, detail) VALUES"
     . " ('u:ana@claro.com', 'Ana', 1, '09:00-18:00', 1, 2, 1, 2, 1, 0, 2, 25.5, 1, 1, 'motivo=timer'),"
-    . " ('u:bia@claro.com', 'Bia', 2, '', 0, 0, 0, 0, 1, 1, 1, 240.0, 0, 1, 'motivo=timer')"
+    . " ('u:bia@claro.com', 'Bia', 2, '', 0, 0, 0, 0, 1, 1, 1, 240.0, 0, 1, 'motivo=timer'),"
+    . " ('u:inativo@claro.com', 'Inativo', 1, '', 0, 9, 0, 9, 0, 0, 9, 0.0, 0, 1, 'motivo=timer')"
 );
 $params = [];
 $where = bot_scope_team_where($pdo, 'l.team_id', $params);
 ok($where === '', 'super admin le todos os times (sem filtro de escopo)');
 ok(count($params) === 0, 'escopo do super nao gera parametros');
 $st = $pdo->prepare(
-    'SELECT l.*, t.name AS team_name FROM analyst_load l'
-    . ' LEFT JOIN teams t ON t.id = l.team_id WHERE 1 = 1' . $where
-    . ' ORDER BY l.casos_total DESC, l.form_ocioso_min DESC, l.name'
+    'SELECT l.*, t.name AS team_name, COALESCE(tm.active, 0) AS roteando'
+    . ' FROM analyst_load l'
+    . ' LEFT JOIN teams t ON t.id = l.team_id'
+    . ' LEFT JOIN team_members tm ON tm.team_id = l.team_id AND tm.address = l.address'
+    . ' WHERE 1 = 1' . $where
+    . ' ORDER BY (CASE WHEN COALESCE(tm.active, 0) = 1 THEN 0 ELSE 1 END),'
+    . ' (l.chats_toa + l.forms_toa) DESC, l.form_ocioso_min DESC, l.name'
 );
 $st->execute($params);
 $linhas = $st->fetchAll();
-ok(count($linhas) === 2, 'aba lista os dois analistas com o nome do time');
-ok((string) $linhas[0]['address'] === 'u:ana@claro.com', 'ordenacao por casos desc (2 casos antes de 1)');
+ok(count($linhas) === 3, 'aba lista os tres analistas com o nome do time');
+ok((string) $linhas[0]['address'] === 'u:ana@claro.com', 'ativo no roteamento vem primeiro');
+ok((int) $linhas[0]['roteando'] === 1, 'coluna roteando = ativo no roteamento');
 ok((string) $linhas[0]['team_name'] === 'T1', 'LEFT JOIN traz o nome do time');
+$porEndereco = [];
+foreach ($linhas as $i => $l) {
+    $porEndereco[(string) $l['address']] = $i;
+}
+ok(
+    $porEndereco['u:inativo@claro.com'] > $porEndereco['u:ana@claro.com'],
+    'inativo no roteamento vai para o fim (mesmo com carga fisica maior)'
+);
+ok(
+    $porEndereco['u:inativo@claro.com'] < $porEndereco['u:bia@claro.com'],
+    'entre os inativos/fora do time vale a carga fisica (TOA chat + TOA form)'
+);
+ok(
+    (int) $linhas[$porEndereco['u:inativo@claro.com']]['roteando'] === 0,
+    'quem nao tem vinculo ativo no time conta como inativo'
+);
 
 // Card de divergencia: formulario no bot sem aparecer nas listas do TOA.
 $divergentes = 0;

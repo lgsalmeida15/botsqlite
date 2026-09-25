@@ -101,25 +101,28 @@ transferência (com ou sem perguntas) **e para o formulário** — o formulário
 **em silêncio** (não existe chat para avisar). A cada 5 s o bot tenta atribuir, respeitando
 cap/janela/online; ao conseguir, entrega e registra `queued_assigned` com o tempo de espera.
 
-- **Posição falada:** a fila interna é única (chat + formulário, ordem de entrega), mas o número que o
-  técnico ouve conta **só chats** — ele não vê os formulários na frente dele (antes disso, com 18
-  formulários na fila, um chat com 2 chats à frente ouvia "Nº 20").
-- **Número só no topo:** a partir de `queue_top_pos` (padrão **5**) o técnico ouve o número
-  (`queue_position`, com `{pos}`, atualizado **apenas quando melhora**); acima disso ele recebe o texto de
-  progresso `queue_progress` ("Você avançou na fila") — sem expor uma posição alta que soa como fila que
-  nunca anda.
-- **A espera tem vencimento:** `queue_max_wait_sec` (padrão 1800 s) — ao vencer, o bot registra
-  `queue_expired`, avisa o técnico (texto `queue_expired` quando o fallback é *monitorar*; com *encerrar* o
-  texto de encerramento já informa) e aplica o fallback do time. `0` = sem limite. Antecipar continua sendo
-  o botão **Encerrar espera** (que aplica o mesmo caminho).
-- **Formulário no vencimento:** a rota é encerrada com `form_no_agent` e vai para "rotas com falha" no
-  painel — antes ela girava para sempre (tentativas 58/66 no banco real).
+- **Duas linhas:** chat e formulário têm **filas apartadas** — a posição é contada só entre iguais, então
+  um formulário enviado depois de 10 chats é o **1º da linha dele** (não o 11º) e é tentado no mesmo tick
+  em que a cabeça da linha de chat é tentada.
+- **Aviso padrão:** o técnico ouve apenas **"Você avançou na fila"** (`queue_progress`) na entrada e quando
+  a posição melhora — **sem número**. Para voltar a falar o número, escolha *Falar o número da fila* em
+  Roteamento → Globais (`queue_show_pos`), e ele aparece enquanto a posição estiver dentro de
+  `queue_top_pos` (padrão **5**); acima disso volta o texto de progresso — antes disso, com 18 formulários
+  na fila, um chat com 2 chats à frente ouvia "Nº 20".
+- **Sem prazo:** a espera **não vence sozinha** — o item só sai da fila por **entrega**, porque o **técnico
+  saiu do chat** (ou o chat foi removido), porque **sumiu das listas do TOA** (resolvido:
+  `chat_resolvido_toa`/`form_resolvido_toa`) ou pelo botão **Encerrar espera** (aí o bot aplica o fallback do
+  time). O antigo `queue_max_wait_sec` foi **removido** — ele encerrava chats sem transferência quando o time
+  ficava saturado (caso real: 30 min de espera, técnico em 1º lugar, ninguém elegível e o bot fechando o chat).
+- **Formulário:** mesma régua — sem prazo, não gasta tentativas e não cai no fallback com a fila ligada
+  (tentativas e fallback valem com a fila desligada). A rota dele também termina com `form_no_agent` quando
+  o item some das listas do TOA.
 - **Entrar na fila não é falha:** com a fila ligada o evento é `queued` (com o motivo "sem analista
   elegível") para chat **e** formulário; `form_no_agent` fica reservado para a fila desligada/fallback
   *monitorar* — antes o painel mostrava "sem analista" para item que estava esperando a vez.
 - Com a fila **ligada** o formulário também espera e **não gasta** tentativas; `form_route_attempts`/fallback do formulário valem com a fila **desligada**.
-- O card **Fila de espera (agora)** na aba Roteamento mostra posição, tempo, tentativas e o vencimento
-  ("sem limite" quando não há), com o botão **Encerrar espera**.
+- O card **Fila de espera (agora)** na aba Roteamento mostra posição, tempo, tentativas e o prazo
+  ("sem prazo" quando não há), com o botão **Encerrar espera**.
 - No **Dashboard**, o card "Fila de espera do chat" mostra quantos esperam agora, a espera média e a
   maior espera do período (espera = do "queued" até a atribuição a um analista).
 - Em Roteamento, **Fila de espera (chat) = Desligada** volta ao comportamento antigo: apenas
@@ -264,10 +267,21 @@ O banco guarda uma linha por `chat_id` (status, classificação, retries, timest
 ## Roteamento (chat e formulário)
 
 A aba **Roteamento** concentra cap por analista, estratégia (`rodízio`, `prioridade` por peso,
-`menor carga`), tentativas/intervalo, fallback, **fila de espera** (`queue_wait_enabled`; o
-`queue_max_wait_sec` ficou legado) e os ajustes por time e por membro. A herança é **membro → time → global**
-(campo vazio = herda). O diagnóstico da aba mostra quem está dentro da janela de plantão agora;
-online e carga são lidos no TOA a cada transferência.
+`menor carga`), tentativas/intervalo, fallback, **fila de espera** (`queue_wait_enabled`) e os ajustes
+por time e por membro. A herança é **membro → time → global** (campo vazio = herda). O diagnóstico da
+aba mostra quem está dentro da janela de plantão agora; online e carga são lidos no TOA a cada
+transferência.
+
+Distribuição de carga:
+
+- **Casos** é o número que a escolha usa: formulário e chat do **mesmo autor** contam **um caso**;
+  autores distintos contam um caso cada. O campo existe no global (`max_cases_per_agent`), no time e no
+  operador — com os checkboxes **fazer valer para todos os times** / **e para todos os operadores** (limpa
+  os overrides; `NULL` = herda) e **replicar para todos os operadores** no bloco do time.
+- **Tipo de atendimento por operador** (`kinds`): **ambos** (padrão), **só chat** ou **só formulário**.
+  O time tem um **padrão dos operadores** (`member_kinds`) aplicado a quem não tem ajuste individual, com
+  a opção de replicar para todos. Quem atende só chat não recebe formulário e vice-versa (`so_chat`/
+  `so_form` no log da decisão). O antigo "recebe formulário" continua valendo como espelho.
 
 O **formulário de validação** do TOA não é chat de menu: quando chega, o bot o roteia para o time
 da fila dele com a mesma dinâmica do chat (janela de plantão, online, cap e estratégia), sem
@@ -298,6 +312,13 @@ tecnico** contam como **um caso** — por isso o chat de quem ja tem formulario 
 mesmo analista** (afinidade), mesmo com o cap cheio. `Cap chat` e `Cap form` seguem como tetos
 extras por tipo.
 
+A contagem e o **cenario fisico** do operador: a decisao usa a **ultima leitura da aba Carga**, que varre
+**todas as filas do time** (`analyst_load.casos_toa_keys`, deduplicado por **autor**) e **nao** o ledger do
+bot. O numero do cap e, portanto, `fisico (TOA, por autor) + reservas em voo` — a mesma peca nao entra duas
+vezes por ter duas chaves (`a:u:...` no ledger e `chat:<id>` na leitura). A leitura vale por
+`2 x load_poll_sec` (minimo 60 s); se estiver velha ou com `toa_ok=0`, valem a fila do item, o ledger e as
+reservas (fallback — nunca decide as cegas).
+
 O cap vale para o **rodízio**: quem está no limite não recebe item novo — ele **espera na fila** (chat e
 formulário na mesma linha) e vai sendo entregue conforme a carga dos analistas diminui. E a identidade do
 caso **nunca** sai de nome genérico: formulário sem o address do técnico vira um caso **por item**
@@ -324,3 +345,21 @@ consecutivas **com leitura bem sucedida** (padrao 2) e dado como resolvido no TO
 `close_reason=form_resolvido_toa`, as rotas presas sao canceladas e a **vaga do analista volta na hora**.
 Leitura falha (timeout) **nunca** fecha nada, e se o formulario reaparecer o contador zera (o contador
 vive em memoria, entao o restart tambem zera).
+
+A **mesma regua vale para o caso de CHAT** (`close_reason=chat_resolvido_toa`): quando o item sai das
+listas do TOA por 2 leituras boas, o caso fecha e a vaga volta. `chats.status='closed'` **nao** serve de
+sinal — e o que o bot grava ao entregar o chat e sair, com o caso ainda nas maos do analista. So vale para
+chats cuja **fila foi lida** naquele ciclo (fila fora do time nao gera falso positivo). Sem isso o caso
+ficava contando na carga ate o TTL de 12 h e a distribuicao travava com o time "cheio" (caso real: 15 de
+15 casos de chat abertos com o chat ja encerrado).
+**Na tela.** Os cards seguem a ordem **ChatBot — Em atendimento** (chats com o bot: status vivo e
+`moved_at` nulo), **Fila de chat**, **Chat em atendimento**, **Fila de formulário**, **Formulário em
+atendimento** e **Última leitura**. A tabela por analista mostra `TOA chat`/`TOA form`, **Casos** = físico
+(`TOA chat + TOA form`, o que ele tem aberto no front) com o número de **solicitantes distintos** em cinza
+ao lado (form + chat do mesmo autor = 1 caso, que é o número do cap), reservas, formulário mais antigo, TOA
+e a hora da leitura — as antigas colunas "Bot chat"/"Bot form" saíram da visualização (o dado continua
+alimentando o alerta de divergentes). Quem está **inativo no roteamento** aparece **no fim** da tabela, com
+selo `inativo`, mesmo com carga maior. O **filtro de time (múltiplo)** vale para todos os cards, a tabela e
+os alertas, e a escolha fica **gravada na sessão** (sobrevive ao auto-refresh de 30 s e à navegação).
+
+

@@ -189,10 +189,12 @@ flowchart TD
   so" do desenho). O cap vale para o **rodizio**: quem esta no limite nao recebe
   item novo, que **espera na fila** (a mesma do chat) e vai sendo liberado
   conforme a carga dos analistas diminui.
-- **Fila unica:** chat e formulario esperam na **mesma linha** (a posicao conta os
-  dois tipos). Com a fila ligada o formulario **espera sem limite**, como o chat;
-  `form_route_attempts`/fallback valem com a fila **desligada**. O formulario
-  continua **sem anunciar posicao** (ninguem recebe mensagem nele).
+- **Duas linhas na fila:** chat e formulario esperam em **linhas apartadas** — chat na
+  linha do chat, formulario na linha do formulario. Um formulario enviado depois de 10
+  chats e o **1o da linha dele** (nao o 11o), e o tick tenta a cabeca das duas na mesma
+  passada, alternando por qual comeca. Com a fila ligada o formulario **espera sem
+  limite**, como o chat; `form_route_attempts`/fallback valem com a fila **desligada**.
+  O formulario continua **sem anunciar posicao** (ninguem recebe mensagem nele).
 - **Restart:** o bot nao e participante do formulario, entao `_open_forms` (memoria)
   e reidratado no boot a partir do ledger (`bootstrap` -> `_hydrate_open_forms`) e
   os reidratados passam pela leitura de estado (`_validate_open_forms`).
@@ -383,11 +385,17 @@ flowchart TD
 |---|---|---|
 | Chats do operador no TOA | `get_active_chats` - participante com `present` | `route_capacity_source` = active |
 | Chats em atendimento na fila | `get_helpdesk_chats` com `chat_type = in_process` - ja traz participantes | `route_capacity_source` = helpdesk |
-| Ledger do bot | `route_assignments` abertos: o que o bot entregou e ainda nao fechou | `route_assign_ttl_sec` |
-| Reservas | entregas em voo, contadas antes do TOA refletir | `route_reserve_ttl_sec` |
+| **FISICO do operador (preferido)** | ultima leitura da aba Carga (`analyst_load.casos_toa_keys`): **todas as filas do time**, por **autor** — e o que ele tem aberto no front | valida por `2 x load_poll_sec` (min. 60 s) e exige `toa_ok=1` |
+| Ledger do bot | `route_assignments` abertos: **fallback** quando a leitura daquele analista nao esta disponivel | `route_assign_ttl_sec` + ausencia no TOA |
+| Reservas | entregas em voo, contadas antes do TOA refletir (somam sempre) | `route_reserve_ttl_sec` |
 
 - Padrao `route_capacity_source = both`: soma as duas fontes do TOA, deduplicando por `chat_id`.
-- **Se o TOA nao responder**, a carga **nao zera**: vale o ledger e as reservas, e o evento registra `carga_toa=indisponivel`.
+- **A carga e o FISICO** (o que o operador tem aberto no TOA), deduplicado por **autor**: chat e
+  formularios do mesmo solicitante = **um caso**. A leitura completa entra como base — foi o que faltava:
+  um caso aberto em **outra fila do time** nao contava, e a mesma peca podia entrar com duas chaves
+  (`a:u:...` no ledger e `chat:<id>` na leitura) inflando o numero.
+- **Ledger e fila do item sao fallback**: valem quando a leitura daquele analista esta velha ou falhou
+  (`toa_ok=0`), para nunca decidir as cegas.
 
 ### 8.2 Ordem exata da decisao
 
@@ -397,10 +405,15 @@ flowchart TD
 2. **Membros ativos do time**, na ordem do campo Ordem da aba Times.
 3. **Janela de plantao** do membro - vazio ou inicio igual ao fim = 24 h; madrugada 22:00-06:00 atravessa a meia-noite.
 4. **Online no TOA** - apenas se `require_online` (membro, time ou global).
-5. **Cap de casos** - `cap_cases` do membro, senao do time, senao `max_cases_per_agent` (padrao 4).
-6. **Sub-limites** por tipo - `cap_chat` e `cap_form` contam so o proprio tipo.
-7. **Estrategia** - escolhe entre os elegiveis.
-8. **Reserva** o escolhido e emite `move_chat` (**unico por chat**, marca em `chats.moved_at`) + `invite_to_chat`.
+5. **Tipo de atendimento** - `kinds` do operador (membro -> `member_kinds` do time -> `both`): quem atende so chat nao recebe formulario (`so_chat` no log) e quem atende so formulario nao recebe chat (`so_form`).
+6. **Cap de casos** - `cap_cases` do membro, senao do time, senao `max_cases_per_agent` (padrao 4).
+7. **Sub-limites** por tipo - `cap_chat` e `cap_form` contam so o proprio tipo.
+8. **Estrategia** - escolhe entre os elegiveis.
+9. **Reserva** o escolhido e emite `move_chat` (**unico por chat**, marca em `chats.moved_at`) + `invite_to_chat`.
+
+O painel (aba Roteamento -> Globais) tem o campo **Casos** com os checkboxes *fazer valer para
+todos os times* / *e para todos os operadores*: marcar limpa o `cap_cases` de time/operador (NULL =
+herda o global), sem apagar peso, cap por tipo ou o tipo de atendimento.
 
 ### 8.3 Estrategias
 
@@ -417,7 +430,7 @@ flowchart TD
 | Chat | `close` - encerra e o bot sai - ou `monitor` - fica em `monitoring` | `close` |
 | Formulario | `retry` - insiste em segundo plano - ou `monitor` - nao insiste | `retry` |
 
-Com a **fila de espera** ligada (padrao), o chat aguarda **ate `queue_max_wait_sec`** e nao gasta tentativas: a espera termina quando um analista elegivel aparece, quando o tecnico sai, pelo botao **Encerrar espera** ou **no vencimento** — nos tres ultimos casos cai neste mesmo fallback (`close` encerra, `monitor` deixa em `monitoring`). Com `queue_max_wait_sec = 0` a espera volta a ser sem limite. No vencimento o bot avisa o tecnico (texto `queue_expired`; com `close` o texto de encerramento ja informa) e, no caso do **formulario**, encerra a rota (`form_no_agent`) em vez de gira-la para sempre. **Excecao:** se o `move_chat` **ja foi feito** e o `invite_to_chat` esta falhando, as tentativas contam (`transferred_partial` + `route_retry`, sem repetir o move) e, ao esgotar, cai no fallback.
+Com a **fila de espera** ligada (padrao), o chat aguarda **sem prazo** e nao gasta tentativas: a espera termina quando um analista elegivel aparece; quando o **tecnico sai do chat** (`closed_originator_left`) ou o chat e removido; quando o item **some das listas do TOA** (`chat_resolvido_toa`/`form_resolvido_toa`); ou pelo botao **Encerrar espera** do painel. Nesses encerramentos vale o fallback do time (`close` encerra, `monitor` deixa em `monitoring`; no **formulario** a rota termina com `form_no_agent` em vez de girar para sempre). **Nao existe mais vencimento automatico** (`queue_max_wait_sec` foi removido): o timeout antigo matava chats sem transferencia com o time saturado. **Excecao:** se o `move_chat` **ja foi feito** e o `invite_to_chat` esta falhando, as tentativas contam (`transferred_partial` + `route_retry`, sem repetir o move) e, ao esgotar, cai no fallback.
 
 **Posicao e mensagens da fila.** A fila interna e uma so (chat + formulario, ordem de entrega por `id`), mas o **numero falado** conta apenas **chats** (`db.queue_position(..., so_chat=True)`) — o tecnico nao sabe que existem formularios na frente dele. E o numero so aparece a partir de `queue_top_pos` (padrao 5): acima disso ele recebe o texto de progresso `queue_progress` ("Voce avancou na fila"), que nao expoe uma posicao alta (inflada) que soa como fila que nunca anda. Entrar na fila emite `queued` para os DOIS tipos; o formulario continua **sem receber mensagem** (so o evento).
 
@@ -459,11 +472,11 @@ A propria `pending_routes` e a fila: `kind` (`chat` ou `form`), `team_id`, `expi
 
 | Etapa | O que acontece |
 |---|---|
-| Entrada | em **qualquer** opcao de transferencia (`transfer_only` e `ask_and_transfer`, com ou sem perguntas) e tambem no **formulario**: o bot tenta entregar na hora; sem ninguem elegivel, a rota fica `waiting` **sem limite de tempo** (`expires_at` nulo) |
-| Aviso | o tecnico recebe o template `queue_position` (com `{pos}`) na entrada e **so quando a posicao melhora**; o formulario espera em silencio (nao existe chat para avisar) |
-| Posicao | FIFO **por time**, contando chat e formulario na **mesma linha** |
-| Varredura | a cada 5 s o tick tenta atribuir (FIFO por `id`, respeitando cap/janela/online); ao conseguir grava `queued_assigned` com `espera=NNs` e entrega |
-| Saida | atribuido (`done`), tecnico saiu/chat removido (rota `failed` + `leave`), ou **Encerrar espera** no painel (`queue_expired` + fallback do time) |
+| Entrada | em **qualquer** opcao de transferencia (`transfer_only` e `ask_and_transfer`, com ou sem perguntas) e tambem no **formulario**: o bot tenta entregar na hora; sem ninguem elegivel, a rota fica `waiting` |
+| Aviso | o tecnico recebe o texto `queue_progress` ("Voce avancou na fila") na entrada e **so quando a posicao melhora**; com `queue_show_pos=true` ele recebe `queue_position` (com `{pos}`) enquanto a posicao estiver dentro de `queue_top_pos`. O formulario espera em silencio (nao existe chat para avisar) |
+| Posicao | FIFO **por time e por LINHA**: o chat conta so chats, o formulario conta so formularios (`kind` entra na conta) |
+| Varredura | a cada 5 s o tick le a cabeca de **cada linha** e alterna por qual comeca; um formulario novo nao espera os chats que entraram antes dele. Respeita cap/janela/online e grava `queued_assigned` com `espera=NNs` |
+| Saida | atribuido (`done`); **tecnico saiu do chat** ou chat removido (rota `failed` + `leave`); item **ausente nas listas do TOA** (`chat_resolvido_toa`/`form_resolvido_toa`); ou **Encerrar espera** no painel (fallback do time). A espera **nao vence sozinha** |
 
 Com a fila **ligada**, o formulario **nao gasta tentativas** (`form_route_attempts`) nem cai no
 fallback: ele espera a vez e vai sendo liberado conforme a carga dos analistas diminui. Tentativas e
@@ -471,9 +484,9 @@ fallback do formulario valem com a fila **desligada**.
 
 - `queue_wait_enabled=false` devolve o comportamento antigo: N tentativas (`transfer_attempts`) e depois fallback.
 - A fila vive no banco: kill/restart nao perde posicao nem o aviso ja enviado (`last_position`).
-- `queue_max_wait_sec` ficou como legado: a espera do chat nao vence sozinha, so pelo botao.
-- Na aba **Roteamento** o card **Fila de espera (agora)** mostra posicao, tempo de espera, tentativas e o vencimento ("sem limite"); **Encerrar espera** vence a espera na hora e deixa o motor aplicar o fallback.
-- Quando a rota do chat e encerrada por outro motivo (timeout, tecnico saiu, chat removido), a linha em `pending_routes` e fechada junto, para o tick nao insistir num chat que nao existe mais.
+- **Sem prazo:** nao existe mais `queue_max_wait_sec` — a rota nasce sem `expires_at` (o campo continua na tabela apenas como marcador do botao **Encerrar espera**). O timeout antigo encerrava o chat sem transferencia quando o time ficava saturado.
+- Na aba **Roteamento** o card **Fila de espera (agora)** mostra posicao, tempo de espera, tentativas e o prazo ("sem prazo"); **Encerrar espera** encerra na hora e deixa o motor aplicar o fallback.
+- Quando a rota do chat e encerrada por outro motivo (tecnico saiu, chat removido, ausencia no TOA), a linha em `pending_routes` e fechada junto, para o tick nao insistir num chat que nao existe mais.
 
 ### 8.8 Entrega robusta (FASE A)
 
@@ -527,8 +540,8 @@ flowchart TD
 | `form_idle_offer_min` | 30 | minutos sem mensagem nova (e sem analista do time dentro) para o formulario **deixar de ser oferecido** na abertura |
 | `form_idle_close_min` | 120 | minutos sem sinal de vida para o formulario **sair do indice** e o caso fechar (`form_closed motivo=form_ocioso`) |
 | `form_idle_owner_close_min` | 240 | mesma janela, mas para formulario parado **com analista do time dentro** (`motivo=form_ocioso_analista`) — o TOA nao avisa quando ele sai |
-| `queue_max_wait_sec` | 1800 | vencimento da espera do chat: ao vencer o bot avisa (`queue_expired`) e aplica o fallback do time (`0` = sem limite) |
 | `queue_top_pos` | 5 | posicao a partir da qual o chat ouve o NUMERO da fila; acima disso recebe o texto de progresso (`0` = sempre fala o numero) |
+| `queue_show_pos` | false | fala a POSICAO ao tecnico? `false` (padrao) = so "Voce avancou na fila", nunca o numero; `true` volta ao comportamento por `queue_top_pos` |
 | `load_poll_sec` | 30 | intervalo da leitura das listas do TOA que alimenta a aba **Carga** (`snapshot_load`) |
 | `form_absent_readings` | 2 | leituras consecutivas **bem sucedidas** sem o formulario em nenhuma lista para dalo como resolvido no TOA (`form_resolvido_toa`) |
 | `analyst_load_keep` | 200 | leituras guardadas em `analyst_load_history` (podadas por id desc) |
@@ -548,6 +561,15 @@ flowchart TD
   T -->|nao| S
 ```
 
+- **Ausencia vale para os DOIS tipos.** O caso de **chat** tambem morre quando o item sai das listas do TOA
+  por `form_absent_readings` leituras boas (`chat_resolvido_toa`) — **`chats.status='closed'` nao serve de
+  sinal**: e exatamente o que o bot grava ao entregar o chat e sair (o caso segue com o analista). So vale
+  para chats cuja **fila foi lida** neste ciclo (fila fora do time nao gera falso positivo) e nunca com
+  leitura falha.
+- **A mesma leitura alimenta o cap.** `analyst_load.casos_toa_keys` guarda as chaves (autor) vistas no TOA em
+  **todas as filas do time**, e a decisao conta `fisico (por autor) + reservas em voo` — o ledger e a fila do
+  item sao **fallback**, usados so quando a leitura daquele analista esta velha ou falhou. Assim o cap, a
+  tabela e o fisico do front falam o mesmo numero (a mesma peca nao conta 2x por ter duas chaves).
 - **Quem le o que.** A leitura usa a MESMA fonte da capacidade (`route_capacity_source`): a lista
   `in_process` do front (chats **e** formularios em atendimento) e a `pending` (fila). O agrupamento por
   analista segue `_participante_presente` (participante presente ou `assignedUser.active`), e o caso usa a
@@ -562,10 +584,16 @@ flowchart TD
   e que sumiu do TOA sai do indice (`form_forget … motivo=ausente_no_toa`) pela mesma regua.
 - **Reapareceu?** O contador zera (formulario voltou a ser listado) e o caso segue aberto — nada e fechado
   por engano. O contador e em memoria: restart tambem zera.
-- **Painel.** Aba **Carga**: cards (formularios na fila, em atendimento, chats em atendimento, fechados na
-  ultima hora, resolvidos por ausencia, ultima leitura) e a tabela por analista com TOA x bot, casos,
-  reservas, formulario mais antigo e a hora da leitura; atualizacao de 30 s (`load_poll_sec`) e o botao
-  **Atualizar agora** (job `load_snapshot`). Permissao de pagina `page.load` e de acao `load.manage`.
+- **Painel.** Aba **Carga**: cards, nesta ordem — **ChatBot — Em atendimento** (chats com o bot: status de
+  `resume_chats` e `moved_at IS NULL`), **Fila de chat**, **Chat em atendimento** (ledger), **Fila de
+  formulario**, **Formulario em atendimento** (ledger) e **Ultima leitura**; e a tabela por analista com
+  TOA chat/form, **Casos** (= fisico `TOA chat + TOA form`, com o numero de solicitantes distintos em cinza
+  ao lado — as colunas do ledger "Bot chat/Bot form" sairam da visualizacao), reservas, formulario mais
+  antigo e a hora da leitura. **Ordenacao:** quem esta **ativo no roteamento** (`team_members.active`)
+  primeiro, maior carga fisica no topo; inativo (ou fora do time) vai para o fim, com selo `inativo`.
+  **Filtro de time multiplo** vale para os cards, a tabela e os alertas, com o estado gravado na sessao.
+  Atualizacao de 30 s (`load_poll_sec`) e o botao **Atualizar agora** (job `load_snapshot`). Permissao de
+  pagina `page.load` e de acao `load.manage`.
 
 ## 10. Restart, resume e reciclagem
 

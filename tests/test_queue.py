@@ -63,19 +63,46 @@ class QueueTest(unittest.IsolatedAsyncioTestCase):
         await eng.handle_reply(cid, chat_row(conn, cid), "protocolo")
         await eng.handle_reply(cid, chat_row(conn, cid), "1")
 
-    async def test_entra_na_fila_e_avisa_a_posicao(self):
+    async def test_entra_na_fila_e_avisa_o_progresso(self):
         eng, conn, sock = self._eng(online=[])
         await self._entra_na_fila(eng, conn)
         wait = routes(conn, "waiting")
         self.assertEqual(len(wait), 1)
         self.assertEqual(wait[0]["kind"], "chat")
         self.assertEqual(int(wait[0]["last_position"]), 1)
-        # A espera tem vencimento (`queue_max_wait_sec`): ao vencer o bot avisa e
-        # aplica o fallback. O botao "Encerrar espera" do painel antecipa.
-        self.assertIsNotNone(wait[0]["expires_at"])
+        # A espera NAO tem prazo: a rota nasce sem vencimento e so sai da fila por
+        # entrega, saida do autor, remocao do chat, ausencia no TOA ou pelo botao
+        # "Encerrar espera" do painel.
+        self.assertIsNone(wait[0]["expires_at"])
         self.assertIn("queued", events(conn))
-        self.assertTrue(any("N\u00ba 1" in t for t in sock.sent_texts()))
+        # Padrao (`queue_show_pos=false`): o tecnico ouve que AVANCOU, nunca o numero.
+        textos = sock.sent_texts()
+        self.assertTrue(any("avan" in t.lower() for t in textos), textos)
+        self.assertFalse(any("N\u00ba" in t for t in textos), textos)
         self.assertNotIn("leave_chat", sock.names())
+
+    async def test_fila_ligada_nao_vence_sozinha(self):
+        """Sem prazo: por mais que o tick rode, a rota segue `waiting` (sem timeout)."""
+        eng, conn, sock = self._eng(online=[])
+        await self._entra_na_fila(eng, conn)
+        for k in range(5):
+            conn.execute(
+                "UPDATE pending_routes SET next_try_at = datetime('now', '-1 seconds')"
+            )
+            await eng.tick_routes()
+        wait = routes(conn, "waiting")
+        self.assertEqual(len(wait), 1, "a rota continua esperando")
+        self.assertIsNone(wait[0]["expires_at"], "sem vencimento")
+        self.assertEqual(chat_row(conn)["status"], "classified", "o chat segue vivo")
+        self.assertNotIn("queue_expired", events(conn))
+        self.assertNotIn("leave_chat", sock.names())
+
+    async def test_posicao_falada_quando_o_painel_liga(self):
+        """`queue_show_pos=true` volta a falar o numero (comportamento antigo)."""
+        eng, conn, sock = self._eng(online=[])
+        eng.cfg["queue_show_pos"] = "true"
+        await self._entra_na_fila(eng, conn)
+        self.assertTrue(any("N\u00ba 1" in t for t in sock.sent_texts()), sock.sent_texts())
 
     async def test_posicao_anunciada_conta_so_chats(self):
         """Formulario na fila nao infla o numero que o tecnico ouve."""
@@ -88,8 +115,9 @@ class QueueTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(db.queue_position(conn, rid, so_chat=True), 1)
 
     async def test_acima_do_topo_avisa_progresso_sem_numero(self):
-        """Acima de `queue_top_pos` o tecnico ouve que AVANCOU, nunca o numero."""
+        """Com a posicao ligada, acima de `queue_top_pos` o tecnico ouve que AVANCOU."""
         eng, conn, sock = self._eng(online=[])
+        eng.cfg["queue_show_pos"] = "true"
         eng.cfg["queue_top_pos"] = "1"   # so o primeiro da fila ouve numero
         db.enqueue_route(conn, "chat", 20, "h:q1", 1, detail="chat", delay_sec=0)
         db.enqueue_route(conn, "chat", 21, "h:q1", 1, detail="chat", delay_sec=0)
@@ -98,6 +126,25 @@ class QueueTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("N\u00ba 1" in t for t in textos), textos)
         self.assertTrue(any("avan" in t.lower() for t in textos), textos)
         self.assertFalse(any("N\u00ba 2" in t for t in textos), "acima do topo nao fala numero")
+
+    async def test_formulario_nao_espera_a_linha_do_chat(self):
+        """Linhas apartadas: com 10 chats na frente, o formulario e tentado no mesmo tick."""
+        eng, conn, sock = self._eng(online=["ana"])
+        eng.cfg["max_cases_per_agent"] = "1"   # Ana entrega 1 caso: o resto fica na fila
+        for cid in range(11, 21):
+            db.enqueue_route(conn, "chat", cid, "h:q1", 1, detail="chat", delay_sec=0)
+        db.enqueue_route(conn, "form", 99, "h:q1", 1, detail="formulario", delay_sec=0)
+        await eng.tick_routes()
+        # O chat da cabeca foi entregue...
+        self.assertEqual(len(routes(conn, "done")), 1)
+        self.assertEqual(str(routes(conn, "done")[0]["kind"]), "chat")
+        # ...e o formulario foi tentado NESTE tick (posicao 1 da linha dele).
+        porTipo = {}
+        for r in routes(conn, "waiting"):
+            porTipo.setdefault(str(r["kind"]), []).append(int(r["attempts"]))
+        self.assertEqual(porTipo.get("form"), [1], "formulario tentado no mesmo tick")
+        # Algum chat do fim da linha nem foi tentado: o form nao esperou os 10.
+        self.assertIn(0, porTipo.get("chat") or [], porTipo)
 
     async def test_espera_do_formulario_vence_e_encerra_a_rota(self):
         """Formulario sem elegivel nao gira para sempre: a espera vence e a rota para."""
@@ -112,6 +159,7 @@ class QueueTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_posicao_melhora_quando_o_da_frente_e_atendido(self):
         eng, conn, sock = self._eng(online=[])
+        eng.cfg["queue_show_pos"] = "true"   # numero falado (o avanco tambem e anunciado)
         await self._entra_na_fila(eng, conn, 10)
         await self._entra_na_fila(eng, conn, 11)
         porId = {int(r["chat_id"]): r for r in routes(conn, "waiting")}
@@ -226,7 +274,7 @@ class QueueSchemaTest(unittest.TestCase):
         self.assertIn("moved_at", db._table_columns(conn, "chats"))
         cfg = db.settings(conn)
         self.assertIn("queue_wait_enabled", cfg)
-        self.assertIn("queue_max_wait_sec", cfg)
+        self.assertNotIn("queue_max_wait_sec", cfg, "a espera nao tem prazo (ajuste removido)")
         self.assertIn("queue_top_pos", cfg)
         tpl = db.templates(conn)
         self.assertIn("{pos}", tpl.get("queue_position", ""))

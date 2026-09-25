@@ -221,6 +221,9 @@ CREATE TABLE IF NOT EXISTS team_routing (
   retry_interval_sec INTEGER,
   fallback TEXT CHECK (fallback IN ('close', 'retry', 'monitor')),
   form_enabled INTEGER NOT NULL DEFAULT 1,
+  -- Tipo de atendimento padrao dos operadores do time (membro sem linha herda
+  -- isto): 'both' (padrao), 'chat' ou 'form'.
+  member_kinds TEXT CHECK (member_kinds IN ('both', 'chat', 'form')),
   last_assigned_chat TEXT,
   last_assigned_form TEXT,
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -235,6 +238,9 @@ CREATE TABLE IF NOT EXISTS team_member_routing (
   cap_form INTEGER,
   cap_cases INTEGER,
   forms_enabled INTEGER NOT NULL DEFAULT 1,
+  -- Tipo de atendimento do operador: 'both' (padrao), 'chat' (so chat) ou
+  -- 'form' (so formulario). `forms_enabled` fica como espelho de leitura.
+  kinds TEXT NOT NULL DEFAULT 'both' CHECK (kinds IN ('both', 'chat', 'form')),
   PRIMARY KEY (team_id, address)
 );
 
@@ -299,10 +305,15 @@ INSERT OR IGNORE INTO bot_settings (key, value) VALUES
   ('form_route_retry_interval_sec', '60'),
   ('form_route_fallback', 'retry'),
   ('queue_wait_enabled', 'true'),
-  ('queue_max_wait_sec', '1800'),
+  -- A espera da fila NAO tem prazo: a rota so sai por entrega, saida do autor,
+  -- remocao do chat, ausencia nas listas do TOA ou "Encerrar espera" no painel.
+  -- (A antiga `queue_max_wait_sec` e removida na migracao.)
   -- Posicao falada ao tecnico so a partir daqui (fila interna conta chat+form,
   -- mas o numero anunciado conta so chats).
   ('queue_top_pos', '5'),
+  -- Fala a posicao ao tecnico? `false` (padrao) = so "avancou na fila", nunca o
+  -- numero. `true` volta ao comportamento por `queue_top_pos`.
+  ('queue_show_pos', 'false'),
   -- Medicao de carga por analista (aba Carga): leitura das listas do TOA.
   ('load_poll_sec', '30'),
   ('analyst_load_keep', '200'),

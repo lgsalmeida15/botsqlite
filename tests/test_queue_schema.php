@@ -38,7 +38,8 @@ foreach ($pdo->query('SELECT key, value FROM bot_settings') as $r) {
     $cfg[$r['key']] = $r['value'];
 }
 ok(($cfg['queue_wait_enabled'] ?? '') === 'true', 'bot_settings.queue_wait_enabled (ligado por padrao)');
-ok(($cfg['queue_max_wait_sec'] ?? '') === '1800', 'bot_settings.queue_max_wait_sec de 30 minutos');
+ok(!array_key_exists('queue_max_wait_sec', $cfg), 'a espera nao tem prazo (queue_max_wait_sec removida)');
+ok(($cfg['queue_show_pos'] ?? '') === 'false', 'bot_settings.queue_show_pos desligado por padrao (nao fala numero)');
 
 $tpl = [];
 foreach ($pdo->query('SELECT slug, body FROM templates') as $r) {
@@ -143,6 +144,26 @@ $filtroFora = ' AND date(datetime(s.at, ?)) BETWEEN date(?) AND date(?)';
 $stFora = $pdo->prepare("SELECT COUNT(*) FROM bot_events s WHERE s.reason = 'queued'" . $filtroFora);
 $stFora->execute(['-3 hours', '2000-01-01', '2000-01-02']);
 ok((int) $stFora->fetchColumn() === 0, 'metricas: periodo sem amostra fica zerado (card mostra "-")');
+
+// Linhas apartadas: o formulario abre a PROPRIA linha (nao e o "N+1" dos chats).
+$insLin = $pdo->prepare(
+    "INSERT INTO pending_routes (kind, chat_id, queue_address, team_id, next_try_at, detail) VALUES (?, ?, ?, ?, datetime('now'), '')"
+);
+$insLin->execute(['form', 90, 'h:q1', $tid]);
+$f1 = (int) $pdo->lastInsertId();
+$posForm = static function (PDO $pdo, int $id): int {
+    $st = $pdo->prepare(
+        "SELECT COUNT(*) FROM pending_routes WHERE status = 'waiting' AND kind = 'form' AND id < ?
+           AND team_id IS (SELECT team_id FROM pending_routes WHERE id = ?)"
+    );
+    $st->execute([$id, $id]);
+    return (int) $st->fetchColumn() + 1;
+};
+$linhaUnica = (int) $pdo->query(
+    "SELECT COUNT(*) FROM pending_routes WHERE status = 'waiting' AND id < $f1"
+)->fetchColumn() + 1;
+ok($posForm($pdo, $f1) === 1, 'formulario e o 1o da linha de formularios');
+ok($linhaUnica > 1, 'na linha unica ele seria o ultimo (o N+1 que motivou a separacao)');
 
 @unlink($path);
 exit($failed === 0 ? 0 : 1);

@@ -367,11 +367,16 @@ class Engine:
         # Leituras consecutivas sem o formulario nas listas do TOA (fechamento por
         # ausencia: e assim que o caso resolvido no TOA libera a vaga do analista).
         self._form_absent: dict[int, int] = {}
+        # Mesma regua para o caso de CHAT: ausente das listas do TOA por N leituras
+        # boas = resolvido (`chat_resolvido_toa`).
+        self._chat_absent: dict[int, int] = {}
         self._msg_ignored: set[int] = set()
         self._script_inflight: set[int] = set()
         self._route_lock = asyncio.Lock()
         self._reserve: dict[str, list] = {}
         self._recent: dict[int, list[dict]] = {}
+        # Fila em duas linhas (chat e formulario): de qual delas o tick comeca.
+        self._turno_fila = 0
 
     def reload_config(self) -> None:
         self.cfg = db.settings(self.conn)
@@ -777,6 +782,40 @@ class Engine:
             f"{row.get('assignee') or ''}; motivo={reason or 'nao informado'}",
         )
         return True
+
+    def _fecha_chats_ausentes(self, fontes: dict[int, dict], toa_ok: bool, filas: list) -> int:
+        """Caso de CHAT resolvido no TOA = ausente das listas por N leituras boas.
+
+        `chats.status` NAO serve de sinal: `closed` e justamente o que o bot grava
+        quando entrega o chat e sai — o caso segue com o analista. O que diz que o
+        caso acabou e o item sair das listas do TOA (mesma regua do formulario,
+        `form_resolvido_toa`). Só vale para chats cuja fila foi lida neste ciclo e
+        nunca com leitura falha.
+        """
+        if not toa_ok:
+            return 0
+        limite = self._form_absent_readings()
+        lidas = {str(q) for q in filas if q}
+        fechados = 0
+        for row in db.open_chat_assignments(self.conn):
+            cid = int(row.get("chat_id"))
+            q = str(row.get("queue_address") or "")
+            if q and q not in lidas:
+                continue  # fila fora do time: sem base para dizer que o item sumiu
+            if cid in fontes:
+                self._chat_absent.pop(cid, None)
+                continue
+            self._chat_absent[cid] = int(self._chat_absent.get(cid, 0)) + 1
+            if self._chat_absent[cid] >= limite:
+                self._emit(
+                    "chat_resolvido_toa", cid, q,
+                    f"ausente nas listas do TOA em {self._chat_absent[cid]} leituras; "
+                    f"caso={row.get('case_key') or '-'}; analista={row.get('assignee') or '-'}",
+                )
+                self._close_case(cid, "chat_resolvido_toa")
+                self._chat_absent.pop(cid, None)
+                fechados += 1
+        return fechados
 
     def _queue_chat_snapshot(self, cid: int, row: dict) -> dict:
         mem = MEM.get(cid, {})
@@ -2067,9 +2106,9 @@ class Engine:
         )
         self._emit("ask_collected", cid, q, detalhe[:800])
         # Rota aberta (restart/reconfirmacao) e reaproveitada; sem rota nova a entrada
-        # na fila acontece aqui. A espera e limitada pelo `queue_max_wait_sec` do
-        # painel: no vencimento o bot aplica o fallback do time (o botao "Encerrar
-        # espera" continua valendo para antecipar).
+        # na fila acontece aqui. A espera NAO vence sozinha: a rota nasce sem prazo e
+        # so sai da fila por entrega, pelo autor sair do chat, pelo chat ser removido,
+        # por ausencia nas listas do TOA ou pelo botao "Encerrar espera" do painel.
         rota = db.waiting_route(self.conn, "chat", cid)
         rid = int(rota["id"]) if rota else None
         if rid is None and not db.route_seen(self.conn, "chat", cid):
@@ -2077,7 +2116,6 @@ class Engine:
             rid = db.enqueue_route(
                 self.conn, "chat", cid, q, int(team["id"]) if team else None,
                 detail=detalhe[:800] or "ask_collected", delay_sec=0,
-                expires_at=self._queue_expires_at(),
             )
         await self._finish_leaf_action(
             cid, row, opt, "transfer_only", reply="", route_id=rid, from_ask=True
@@ -2518,6 +2556,11 @@ class Engine:
         except (TypeError, ValueError):
             return 5
 
+    def _queue_show_pos(self) -> bool:
+        """Fala a POSICAO ao tecnico? `false` (padrao) = so "avancou na fila"."""
+        valor = str(self.cfg.get("queue_show_pos") or "false").strip().lower()
+        return valor in ("true", "1", "yes", "sim")
+
     async def _notify_queue_expired(self, cid: int, q: str | None, settings: dict) -> None:
         """Avisa o tecnico que a espera na fila venceu.
 
@@ -2530,22 +2573,14 @@ class Engine:
         if texto:
             await self.send_guarded(cid, texto, q)
 
-    def _queue_expires_at(self) -> str | None:
-        """Vencimento da espera (UTC, formato do SQLite) quando a fila tem limite.
-
-        O `queue_max_wait_sec` do painel so valia pelo botao "Encerrar espera";
-        agora o proprio bot vence a espera e aplica o fallback do time.
-        """
-        try:
-            limite = int(self.cfg.get("queue_max_wait_sec") or 0)
-        except (TypeError, ValueError):
-            limite = 0
-        if not self._queue_on() or limite <= 0:
-            return None
-        quando = datetime.now(timezone.utc) + timedelta(seconds=limite)
-        return quando.strftime("%Y-%m-%d %H:%M:%S")
-
     def _queue_expired(self, row: dict) -> bool:
+        """A rota tem `expires_at` vencido? (so o botao "Encerrar espera" grava isso)
+
+        A fila NAO tem prazo: `_queue_expires_at` nao existe mais e as rotas nascem
+        sem vencimento. Este teste existe apenas para o encerramento **manual** do
+        painel (que grava o `expires_at` vencido na rota) e para rotas antigas que
+        porventura ainda tenham prazo no banco.
+        """
         expira = row.get("expires_at")
         if not expira:
             return False
@@ -2606,10 +2641,10 @@ class Engine:
             self._emit("queue_position", cid, q, "posicao %d -> %d" % (anterior, pos))
         if routing.kind_of(row.get("kind")) == "form":
             return
-        # Numero so no TOPO da fila (`queue_top_pos`, padrao 5). Acima disso o
-        # tecnico ouve que AVANCOU — contar posicao alta (inflada pelos
-        # formularios que ele nao ve) soa como fila que nunca anda.
-        if pos <= self._queue_top_pos():
+        # Numero so quando o painel manda falar posicao (`queue_show_pos`) E a
+        # fila esta no topo (`queue_top_pos`). Fora disso o tecnico ouve que
+        # AVANCOU — contar posicao alta soa como fila que nunca anda.
+        if self._queue_show_pos() and pos <= self._queue_top_pos():
             texto = self._queue_text("queue_position", pos)
         else:
             texto = self._queue_text("queue_progress", 0)
@@ -2692,10 +2727,32 @@ class Engine:
     async def _capacidade(
         self, members: list[dict], kind: str, queue_address: str | None
     ) -> tuple[dict[str, int], dict[str, int], dict]:
-        """Carga por CASO (solicitante distinto): TOA (por fila) + ledger + reservas."""
+        """Carga do analista = o FISICO do TOA (por autor) + reservas em voo.
+
+        Regra do roteamento (a mesma da aba Carga): conta o que o operador tem
+        aberto no front — `TOA chat + TOA form` — deduplicado por **autor** (form +
+        chat do mesmo solicitante = 1 caso), somando so as **reservas** (entrega ja
+        feita e ainda nao refletida no TOA).
+
+        O ledger do bot e a fila do item servem de **fallback** por analista: valem
+        quando a leitura daquele analista nao esta disponivel (velha ou com
+        `toa_ok=0`), para nunca decidir as cegas. Sem isso, a mesma peca podia
+        entrar com duas chaves (`a:u:...` no ledger e `chat:<id>` na leitura) e o
+        analista ficava "cheio" um item antes do real.
+        """
         operadores = {str(m["address"]) for m in members}
         casos: dict[str, set] = {str(m["address"]): set() for m in members}
         por_tipo: dict[str, int] = {str(m["address"]): 0 for m in members}
+        # 1. Fisico: a leitura completa (todas as filas do time), por analista.
+        do_fisico: set[str] = set()
+        for m in members:
+            addr = str(m["address"])
+            lido = db.load_reading(self.conn, addr, fresh_sec=self._load_fresh_sec())
+            if lido is None:
+                continue
+            casos[addr] |= db.load_case_keys(lido)
+            por_tipo[addr] = int(lido["chats_toa"] if kind == "chat" else lido["forms_toa"])
+            do_fisico.add(addr)
         fonte = str(self.cfg.get("route_capacity_source") or "both")
         chats, toa_ok = await self._chats_toa(queue_address, fonte)
         for c in chats:
@@ -2710,19 +2767,23 @@ class Engine:
                     if not _addr_eq(pa, m["address"]):
                         continue
                     addr = str(m["address"])
+                    if addr in do_fisico:
+                        continue  # a leitura ja conta esta fila tambem
                     casos[addr].add(chave)
                     if (kind == "form") == bool(form):
                         por_tipo[addr] = por_tipo.get(addr, 0) + 1
         for row in db.open_assignments(self.conn):
             addr = str(row.get("assignee") or "")
-            if addr not in casos:
-                continue
+            if addr not in casos or addr in do_fisico:
+                continue  # com o fisico disponivel o ledger nao soma
             chave = str(row.get("case_key") or "") or ("chat:" + str(row.get("chat_id")))
             if chave in casos[addr]:
                 continue
             casos[addr].add(chave)
             if str(row.get("kind") or "") == kind:
                 por_tipo[addr] = por_tipo.get(addr, 0) + 1
+        # 2. Reservas: entrega em andamento que o TOA ainda nao refletiu. Entra
+        # sempre (e so nao duplica quando a chave ja esta na conta).
         for item in self._reserved():
             _exp, kres, ares, chave = item
             if ares not in casos:
@@ -2756,6 +2817,19 @@ class Engine:
             return max(10, int(self.cfg.get("analyst_load_keep") or 200))
         except (TypeError, ValueError):
             return 200
+
+    def _load_fresh_sec(self) -> float:
+        """Validade da ultima leitura de carga (2 ciclos da aba Carga, minimo 60 s).
+
+        A decisao usa a leitura como carga FISICA do analista (todas as filas do
+        time); se ela estiver mais velha que isso, ou se uma das listas falhou
+        (`toa_ok=0`), o calculo volta a ser o da fila do item.
+        """
+        try:
+            poll = float(self.cfg.get("load_poll_sec") or 30)
+        except (TypeError, ValueError):
+            poll = 30.0
+        return max(poll * 2.0, 60.0)
 
     async def _listas_toa(self, queue_address: str | None) -> tuple[dict[int, dict], bool]:
         """O que o TOA lista para a fila: `in_process` + `pending` (+ sessao).
@@ -2835,7 +2909,7 @@ class Engine:
             fontes.update(vistos)
             ok_geral = ok_geral or ok
         logins = sorted({
-            _member_login(str(m["address"]))
+            _member_login_raw(str(m["address"]))
             for ms in membros_por_time.values() for m in ms if m.get("address")
         })
         operadores = {str(m["address"]) for ms in membros_por_time.values() for m in ms if m.get("address")}
@@ -2845,7 +2919,9 @@ class Engine:
                 ack = await self.sock.command("get_online_users", {"users": logins}, timeout=12.0)
                 parsed = _online_logins_from_ack(ack)
                 if parsed is not None:
-                    online = {str(x) for x in parsed}
+                    # O TOA devolve como digitado (F119537); normaliza para casar
+                    # com member_login(addr) — mesma regra do roteamento.
+                    online = {_member_login(x) for x in parsed}
             except Exception as e:
                 log.warning("get_online_users carga: %s", e)
         ledger: dict[str, dict] = {}
@@ -2883,7 +2959,10 @@ class Engine:
                     else:
                         chats_toa += 1
                 info = ledger.get(addr, {"chats": 0, "forms": 0, "casos": set(), "forms_ids": []})
-                casos = set(info["casos"]) | casos_toa
+                # O numero da tabela e do CAP e o FISICO do TOA, por autor (form +
+                # chat do mesmo solicitante = 1 caso). O ledger so entra como piso
+                # quando a leitura falhou — senao a tabela zeraria com caso aberto.
+                casos = set(casos_toa) if ok_geral else set(info["casos"])
                 ocioso = 0.0
                 presente = 0
                 for fid in info["forms_ids"]:
@@ -2899,9 +2978,12 @@ class Engine:
                     reservas=int(reservas.get(addr, 0)), casos_total=len(casos),
                     form_ocioso_min=round(float(ocioso), 1), form_presente_toa=presente,
                     toa_ok=1 if ok_geral else 0,
+                    # Chaves do TOA desta leitura: a decisao usa isso como carga
+                    # FISICA do analista (todas as filas do time, nao so a do item).
+                    casos_toa_keys=json.dumps(sorted(casos_toa)),
                     detail=(
                         f"motivo={motivo}; filas={len(filas)}; toa_ok={bool(ok_geral)}; "
-                        f"vistos={len(fontes)}; online={len(online)}"
+                        f"vistos={len(fontes)}; online={len(online)}; ledger={len(info['casos'])}"
                     ),
                 )
                 db.load_add_history(
@@ -2913,6 +2995,7 @@ class Engine:
                 total += 1
         db.load_trim_history(self.conn, self._load_keep())
         resolvidos = self._fecha_ausentes(fontes, ok_geral)
+        resolvidos += self._fecha_chats_ausentes(fontes, ok_geral, filas)
         self._emit(
             "analyst_load", None, None,
             f"motivo={motivo}; analistas={total}; vistos_no_toa={len(fontes)}; "
@@ -3305,7 +3388,6 @@ class Engine:
         db.enqueue_route(
             self.conn, "form", cid, queue_address, int(team["id"]),
             detail=detail, delay_sec=settings["retry_interval_sec"],
-            expires_at=self._queue_expires_at(),
         )
         # A fila ligada ENFILEIRA (nao falha): o evento tem que dizer isso — antes
         # saia `form_no_agent` e o painel mostrava "sem analista" para um item que
@@ -3341,9 +3423,30 @@ class Engine:
         return recuperados
 
     async def tick_routes(self) -> None:
-        """Drena a fila de roteamento: retry do formulario e fila de espera do chat."""
+        """Drena a fila de roteamento em DUAS linhas: chat e formulario.
+
+        Cada linha e FIFO por conta propria: a cada tick o bot comeca por uma
+        delas (alternando) e tenta a cabeca das duas na mesma passada — assim um
+        formulario enviado depois de 10 chats e o 1o da linha dele, nao o 11.
+        """
         self._recover_classified()
-        for row in db.due_routes(self.conn):
+        linhas = db.due_routes(self.conn)
+        if self._turno_fila % 2 == 0:
+            primeira = list(linhas.get("chat") or [])
+            segunda = list(linhas.get("form") or [])
+        else:
+            primeira = list(linhas.get("form") or [])
+            segunda = list(linhas.get("chat") or [])
+        self._turno_fila += 1
+        # Alterna as linhas dentro do MESMO tick (chat, form, chat, form...): a
+        # cabeca do formulario nao espera a linha do chat andar inteira.
+        fila: list[dict] = []
+        for i in range(max(len(primeira), len(segunda))):
+            if i < len(primeira):
+                fila.append(primeira[i])
+            if i < len(segunda):
+                fila.append(segunda[i])
+        for row in fila:
             rid = int(row["id"])
             atual = db.delivery_marks(self.conn, rid)
             if str(atual.get("status") or "") != "waiting":
@@ -3385,9 +3488,9 @@ class Engine:
                     await self._apply_chat_fallback(cid, q)
                 continue
             if fila and self._queue_expired(row):
-                detail = "espera encerrada (limite de %ss da fila)" % (
-                    self.cfg.get("queue_max_wait_sec") or 0
-                )
+                # Sem prazo automatico: chegar aqui significa que o painel pediu o
+                # encerramento ("Encerrar espera") ou que a rota e antiga.
+                detail = "espera encerrada no painel (Encerrar espera)"
                 db.finish_route(self.conn, rid, "failed", detail)
                 self._emit("queue_expired", cid, q, detail)
                 if kind == "form":

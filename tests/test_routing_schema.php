@@ -42,13 +42,14 @@ bot_ensure_schema($pdo);
 $tr = bot_table_columns($pdo, 'team_routing');
 foreach (
     ['strategy', 'cap_chat', 'cap_form', 'require_online', 'respect_window', 'attempts',
-        'retry_interval_sec', 'fallback', 'form_enabled', 'last_assigned_chat', 'last_assigned_form']
+        'retry_interval_sec', 'fallback', 'form_enabled', 'last_assigned_chat', 'last_assigned_form',
+        'cap_cases', 'member_kinds']
     as $col
 ) {
     ok(isset($tr[$col]), "team_routing.$col");
 }
 $tmr = bot_table_columns($pdo, 'team_member_routing');
-foreach (['weight', 'cap_chat', 'cap_form', 'forms_enabled'] as $col) {
+foreach (['weight', 'cap_chat', 'cap_form', 'forms_enabled', 'cap_cases', 'kinds'] as $col) {
     ok(isset($tmr[$col]), "team_member_routing.$col");
 }
 $pr = bot_table_columns($pdo, 'pending_routes');
@@ -92,12 +93,37 @@ ok(
     throws(fn() => $pdo->exec("UPDATE team_routing SET fallback = 'xpto' WHERE team_id = 1")),
     'CHECK recusa fallback invalido'
 );
+ok(
+    throws(fn() => $pdo->exec("UPDATE team_routing SET member_kinds = 'xpto' WHERE team_id = 1")),
+    'CHECK recusa tipo padrao invalido'
+);
+$pdo->exec("UPDATE team_routing SET member_kinds = 'form' WHERE team_id = 1");
+ok(true, 'team_routing aceita member_kinds (padrao dos operadores)');
 
 $mr = $pdo->prepare(
-    'INSERT INTO team_member_routing (team_id, address, weight, cap_form, forms_enabled) VALUES (?, ?, ?, ?, ?)'
+    'INSERT INTO team_member_routing (team_id, address, weight, cap_form, forms_enabled, kinds) VALUES (?, ?, ?, ?, ?, ?)'
 );
-$mr->execute([1, 'u:ana@claro.com', 5, 1, 1]);
-ok(true, 'team_member_routing aceita peso e cap');
+$mr->execute([1, 'u:ana@claro.com', 5, 1, 1, 'both']);
+ok(true, 'team_member_routing aceita peso, cap e tipo de atendimento');
+ok(
+    throws(fn() => $pdo->exec("UPDATE team_member_routing SET kinds = 'xpto' WHERE address = 'u:ana@claro.com'")),
+    'CHECK recusa tipo de atendimento invalido'
+);
+$pdo->exec("UPDATE team_member_routing SET kinds = 'chat' WHERE address = 'u:ana@claro.com'");
+ok(true, 'operador pode atender so chat');
+
+// "Fazer valer para todos": limpar o override (NULL) faz o time/operador herdar
+// o cap de casos global — a acao que o painel dispara nos checkboxes.
+$pdo->exec('UPDATE team_routing SET cap_cases = 7 WHERE team_id = 1');
+$pdo->exec("UPDATE team_member_routing SET cap_cases = 3 WHERE address = 'u:ana@claro.com'");
+$pdo->exec('UPDATE team_routing SET cap_cases = NULL WHERE cap_cases IS NOT NULL');
+$pdo->exec('UPDATE team_member_routing SET cap_cases = NULL WHERE cap_cases IS NOT NULL');
+$herdando = $pdo->query('SELECT cap_cases FROM team_routing WHERE team_id = 1')->fetchColumn();
+ok($herdando === null, 'time volta a herdar o cap de casos global');
+$linhaAna = $pdo->query(
+    "SELECT cap_cases, weight, kinds FROM team_member_routing WHERE address = 'u:ana@claro.com'"
+)->fetch();
+ok($linhaAna['cap_cases'] === null && (int) $linhaAna['weight'] === 5 && $linhaAna['kinds'] === 'chat', 'replicar limpa so o cap de casos (peso e tipo ficam)');
 ok(
     throws(fn() => $pdo->prepare('INSERT INTO team_member_routing (team_id, address) VALUES (1, ?)')
         ->execute(['u:ana@claro.com'])),

@@ -62,10 +62,20 @@ $pdo->exec("INSERT INTO pending_routes (kind, chat_id, queue_address, status, de
 $pdo->exec("INSERT INTO delivery_attempts (kind, chat_id, op, target, result) VALUES ('chat', 10, 'move_chat', 'u:ana@claro.com', 'ok')");
 $pdo->exec("INSERT INTO route_assignments (kind, chat_id, queue_address, team_id, assignee, case_key) VALUES ('form', 99, 'h:q1', 1, 'u:ana@claro.com', 'a:u:tec@claro.com')");
 $pdo->exec("INSERT INTO route_assignments (kind, chat_id, queue_address, team_id, assignee, case_key) VALUES ('chat', 10, 'h:q1', 1, 'u:ana@claro.com', 'a:u:tec@claro.com')");
+// Uma rota esperando: exercita o card "Fila de espera (agora)" (posicao por tipo+time).
+$pdo->exec("INSERT INTO pending_routes (kind, chat_id, queue_address, team_id, status, detail) VALUES ('chat', 12, 'h:q1', 1, 'waiting', 'na fila')");
 $pdo->exec(
     "INSERT INTO analyst_load (address, name, team_id, janela, online, chats_toa, forms_toa, chats_ledger,"
     . " forms_ledger, reservas, casos_total, form_ocioso_min, form_presente_toa, toa_ok, detail)"
     . " VALUES ('u:ana@claro.com', 'Ana', 1, '09:00-18:00', 1, 2, 1, 2, 1, 0, 2, 25.0, 1, 1, 'motivo=teste')"
+);
+// Analista inativo no roteamento com carga fisica MAIOR: a tabela tem que deixar
+// a linha dele no fim (e sem o "presente" no TOA form).
+$pdo->exec("INSERT INTO team_members (team_id, address, name, active) VALUES (1, 'u:inativo@claro.com', 'Inativo', 0)");
+$pdo->exec(
+    "INSERT INTO analyst_load (address, name, team_id, janela, online, chats_toa, forms_toa, chats_ledger,"
+    . " forms_ledger, reservas, casos_total, form_ocioso_min, form_presente_toa, toa_ok, detail)"
+    . " VALUES ('u:inativo@claro.com', 'Inativo', 1, '', 0, 9, 0, 9, 0, 0, 9, 0.0, 0, 1, 'motivo=teste')"
 );
 
 // Marcador de conteudo por aba: se o d-none ficar aberto, o marcador some.
@@ -136,6 +146,81 @@ ok(strpos($htmlCarga, 'u:ana@claro.com') !== false, 'aba load: lista o analista 
 ok(strpos($htmlCarga, '25 min') !== false, 'aba load: ociosidade do formulario mais antigo');
 ok(strpos($htmlCarga, 'leitura(s) com leitura bem sucedida') !== false, 'aba load: explica a regra de ausencia com o ajuste vigente');
 ok(strpos($htmlCarga, 'value="load_now"') !== false, 'aba load: botao Atualizar agora (job load_snapshot)');
+
+// Aba Carga: cards na ordem pedida, filtro de time e tabela sem as colunas do bot.
+ok(strpos($htmlCarga, 'ChatBot — Em atendimento') !== false, 'aba load: card ChatBot em atendimento');
+ok(strpos($htmlCarga, 'Fechados na ultima hora') === false, 'aba load: card de fechados removido');
+ok(strpos($htmlCarga, 'Resolvidos por ausencia') === false, 'aba load: card de resolvidos por ausencia removido');
+$ordemCards = [
+    'ChatBot — Em atendimento',
+    'Fila de chat',
+    'Chat em atendimento',
+    'Fila de formulário',
+    'Formulário em atendimento',
+    'Última leitura',
+];
+$posAnt = -1;
+$ordemOk = true;
+foreach ($ordemCards as $rotuloCard) {
+    $posCard = strpos($htmlCarga, $rotuloCard);
+    if ($posCard === false || $posCard < $posAnt) {
+        $ordemOk = false;
+        break;
+    }
+    $posAnt = $posCard;
+}
+ok($ordemOk, 'aba load: cards na ordem pedida (chatbot, fila de chat, chat, fila de form, form, ultima leitura)');
+ok(strpos($htmlCarga, 'name="teams[]"') !== false, 'aba load: filtro de time multiplo');
+ok(strpos($htmlCarga, '>Limpar<') !== false, 'aba load: botao Limpar do filtro');
+ok(strpos($htmlCarga, 'Bot chat') === false, 'aba load: coluna Bot chat fora da tabela');
+ok(strpos($htmlCarga, 'Bot form') === false, 'aba load: coluna Bot form fora da tabela');
+ok(strpos($htmlCarga, '(2 casos)') !== false, 'aba load: Casos mostra o fisico com os casos distintos em cinza');
+ok(strpos($htmlCarga, 'title="Fisico: TOA chat + TOA form') !== false, 'aba load: explicacao do fisico no titulo da celula');
+$posAna = strpos($htmlCarga, 'u:ana@claro.com');
+$posInativo = strpos($htmlCarga, 'u:inativo@claro.com');
+ok($posAna !== false && $posInativo !== false && $posAna < $posInativo, 'aba load: inativo no roteamento vai para o fim da tabela');
+ok(strpos($htmlCarga, '>inativo</span>') !== false, 'aba load: selo de inativo no roteamento');
+
+// Filtro de time: aplica na requisicao, grava na sessao e sobrevive a proxima
+// requisicao (duas execucoes do harness com o MESMO id de sessao).
+function render_load(string $extra, int $uid, string $dumpKey = ''): array
+{
+    $cmd = escapeshellarg(PHP_BINARY) . ' ' . escapeshellarg(__DIR__ . DIRECTORY_SEPARATOR . '_panel_render.php')
+        . ' load ' . escapeshellarg((string) $uid) . ' '
+        . escapeshellarg($extra) . ' ' . escapeshellarg($dumpKey) . ' 2>&1';
+    $out = [];
+    $code = 0;
+    exec($cmd, $out, $code);
+    return [implode("\n", $out), $code];
+}
+
+putenv('PANEL_RENDER_SESSION=loadfilter' . getmypid());
+[$htmlFiltro, $codeFiltro] = render_load('teams[]=1', $uid, 'load_teams');
+ok($codeFiltro === 0, 'aba load (filtro): renderizou sem erro');
+ok(strpos($htmlFiltro, '<!-- session:load_teams=[1] -->') !== false, 'aba load: filtro gravado na sessao');
+ok(strpos($htmlFiltro, '<option value="1" selected>') !== false, 'aba load: time selecionado marcado no select');
+ok(strpos($htmlFiltro, 'u:bia@claro.com') === false, 'aba load: tabela filtrada so traz o time escolhido');
+[$htmlSemParam, $codeSemParam] = render_load('', $uid, 'load_teams');
+ok($codeSemParam === 0, 'aba load (sem filtro na URL): renderizou sem erro');
+ok(
+    strpos($htmlSemParam, '<!-- session:load_teams=[1] -->') !== false
+    && strpos($htmlSemParam, '<option value="1" selected>') !== false,
+    'aba load: estado do filtro sobrevive a proxima requisicao'
+);
+[$htmlLimpo, $codeLimpo] = render_load('teams=', $uid, 'load_teams');
+ok($codeLimpo === 0 && strpos($htmlLimpo, '<!-- session:load_teams=[] -->') !== false, 'aba load: Limpar zera o filtro na sessao');
+
+// Aba Roteamento: distribuicao (casos global/time/operador) e tipo de atendimento.
+$htmlRouting = (string) ($htmls['routing'] ?? '');
+ok(strpos($htmlRouting, 'name="max_cases_per_agent"') !== false, 'aba routing: campo Casos global');
+ok(strpos($htmlRouting, 'name="cases_all_teams"') !== false, 'aba routing: "fazer valer para todos os times"');
+ok(strpos($htmlRouting, 'name="cases_all_members"') !== false, 'aba routing: replicar casos aos operadores do time');
+ok(strpos($htmlRouting, 'name="queue_show_pos"') !== false, 'aba routing: falar (ou nao) a posicao ao tecnico');
+ok(strpos($htmlRouting, 'name="kinds_all_members"') !== false, 'aba routing: replicar o tipo de atendimento');
+ok(strpos($htmlRouting, 'name="member_kinds"') !== false, 'aba routing: tipo padrao dos operadores do time');
+ok(strpos($htmlRouting, 'name="kinds"') !== false, 'aba routing: tipo de atendimento por operador');
+ok(strpos($htmlRouting, 'linhas apartadas') !== false, 'aba routing: explica as duas linhas da fila');
+ok(strpos($htmlRouting, 'value="queue_expire"') !== false, 'aba routing: Encerrar espera do chat na fila');
 
 @unlink($path);
 exit($failed === 0 ? 0 : 1);

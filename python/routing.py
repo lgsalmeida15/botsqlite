@@ -17,6 +17,9 @@ except ZoneInfoNotFoundError:
     TZ_BRT = timezone(timedelta(hours=-3))
 
 KINDS = ("chat", "form")
+# Tipo de atendimento do OPERADOR (nao confundir com o tipo da rota): `both` e o
+# padrao — o operador recebe chat e formulario.
+MEMBER_KINDS = ("both", "chat", "form")
 STRATEGIES = ("round_robin", "priority", "least_load")
 # 'close' não faz sentido no formulário (o bot não é participante do form).
 CHAT_FALLBACKS = ("close", "monitor")
@@ -148,6 +151,12 @@ def kind_of(value) -> str:
     return v if v in KINDS else "chat"
 
 
+def kinds_of(value) -> str:
+    """Tipo de atendimento do operador: `both` (padrao), `chat` ou `form`."""
+    v = str(value or "").strip().lower()
+    return v if v in MEMBER_KINDS else "both"
+
+
 def _addr(member: dict | None) -> str:
     return str((member or {}).get("address") or "")
 
@@ -200,6 +209,9 @@ def resolve_settings(cfg: dict, routing_row: dict | None, kind: str) -> dict:
         "fallback": fallback,
         "form_enabled": _to_bool(row.get("form_enabled"), True),
         "cap_cases": max(_to_int(casos, 4), 0),
+        # Tipo de atendimento padrao dos operadores do time (membro sem linha e
+        # sem `forms_enabled` herda isto): `both` (padrao), `chat` ou `form`.
+        "member_kinds": kinds_of(row.get("member_kinds")),
         "capacity_source": fonte,
         "affinity": _to_bool(cfg.get("affinity_enabled"), True),
         "affinity_require_online": _to_bool(cfg.get("affinity_require_online"), False),
@@ -217,11 +229,21 @@ def member_rules(member_row: dict | None, settings: dict, kind: str) -> dict:
     casos = row.get("cap_cases")
     if casos is None or casos == "":
         casos = settings.get("cap_cases")
+    # Tipo de atendimento: `kinds` do membro → `member_kinds` do time → ambos.
+    # `forms_enabled` do legado (0 = so chat) e respeitado quando `kinds` nao veio.
+    kinds = str(row.get("kinds") or "").strip().lower()
+    if kinds not in MEMBER_KINDS:
+        if row.get("forms_enabled") is not None:
+            kinds = "both" if _to_bool(row.get("forms_enabled"), True) else "chat"
+        else:
+            kinds = kinds_of(settings.get("member_kinds"))
     return {
         "cap": max(_to_int(cap, 8), 0),
         "cap_cases": max(_to_int(casos, 4), 0),
         "weight": _to_int(row.get("weight"), 0),
-        "forms_enabled": _to_bool(row.get("forms_enabled"), True),
+        "kinds": kinds,
+        # Espelho de leitura: `forms_enabled` continua sendo o campo do legado.
+        "forms_enabled": kinds != "chat",
     }
 
 
@@ -295,6 +317,7 @@ def decide(
     off_window: list[dict] = []
     offline: list[dict] = []
     only_chat: list[dict] = []
+    only_form: list[dict] = []
     over_cap: list[dict] = []
     cand: list[dict] = []
     weights: dict[str, int] = {}
@@ -302,8 +325,13 @@ def decide(
     for m in members:
         addr = _addr(m)
         rules = member_rules(mrouting.get(addr), settings, kind)
-        if kind == "form" and not rules["forms_enabled"]:
+        # Tipo de atendimento do operador: quem so atende chat nao recebe
+        # formulario e quem so atende formulario nao recebe chat.
+        if kind == "form" and rules["kinds"] == "chat":
             only_chat.append(m)
+            continue
+        if kind == "chat" and rules["kinds"] == "form":
+            only_form.append(m)
             continue
         weights[addr] = rules["weight"]
         if settings.get("respect_window", True) and not _in_route_window(m, now):
@@ -348,7 +376,7 @@ def decide(
         f"time={team_name or '—'}; estrategia={strategy}; cap={settings.get('cap')}; "
         f"membros={_names(members)}; janela={_names(eligible, windows=True)}; "
         f"fora_horario={_names(off_window, windows=True)}; sem_online={_names(offline)}; "
-        f"so_chat={_names(only_chat)}; no_cap={_names(over_cap)}; "
+        f"so_chat={_names(only_chat)}; so_form={_names(only_form)}; no_cap={_names(over_cap)}; "
         f"casos={casos or '—'}; carga={carga or '—'}; tentativas={int(attempts_used)}"
     )
     if pick:

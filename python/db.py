@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 from contextlib import contextmanager
@@ -55,6 +56,7 @@ def ensure_schema(conn) -> None:
     _migrate_form_aware(conn)
     _migrate_case_keys(conn)
     _migrate_load(conn)
+    _migrate_kinds(conn)
 
 
 def _table_columns(conn, table: str) -> set[str]:
@@ -261,7 +263,13 @@ def option_questions(conn, option_id: int | None) -> list[dict]:
 
 
 def _migrate_queue(conn) -> None:
-    """Fila de espera (Fase 2): expiracao e ultima posicao avisada."""
+    """Fila de espera (Fase 2): ultima posicao avisada e o encerramento manual.
+
+    A espera **nao tem prazo** (nao existe mais `queue_max_wait_sec`): o
+    `expires_at` continua na tabela apenas como marcador do botao "Encerrar
+    espera" do painel. A chave antiga e removida aqui para nao voltar a aparecer
+    como ajuste na aba Roteamento.
+    """
     if "pending_routes" not in _table_names(conn):
         return
     cols = _table_columns(conn, "pending_routes")
@@ -269,6 +277,14 @@ def _migrate_queue(conn) -> None:
         conn.execute("ALTER TABLE pending_routes ADD COLUMN expires_at TEXT")
     if "last_position" not in cols:
         conn.execute("ALTER TABLE pending_routes ADD COLUMN last_position INTEGER NOT NULL DEFAULT 0")
+    if "bot_settings" in _table_names(conn):
+        conn.execute("DELETE FROM bot_settings WHERE key = 'queue_max_wait_sec'")
+    # Rotas que ja estavam esperando com prazo automatico perdem o vencimento (o
+    # pedido MANUAL do painel grava `expires_at` no passado e e preservado).
+    conn.execute(
+        "UPDATE pending_routes SET expires_at = NULL"
+        " WHERE status = 'waiting' AND expires_at IS NOT NULL AND expires_at > datetime('now')"
+    )
 
 
 def _migrate_delivery(conn) -> None:
@@ -388,6 +404,27 @@ def _migrate_case_keys(conn) -> None:
         )
 
 
+def _migrate_kinds(conn) -> None:
+    """Tipo de atendimento por operador (chat / form / ambos) e padrao do time.
+
+    `team_member_routing.forms_enabled` continua existindo como espelho: a
+    migracao converte o `0` (so chat) para `kinds='chat'` e deixa o resto em
+    `both` (padrao = atende os dois, como sempre foi).
+    """
+    tabelas = _table_names(conn)
+    if "team_routing" in tabelas and "member_kinds" not in _table_columns(conn, "team_routing"):
+        conn.execute("ALTER TABLE team_routing ADD COLUMN member_kinds TEXT")
+    if "team_member_routing" in tabelas and "kinds" not in _table_columns(conn, "team_member_routing"):
+        conn.execute(
+            "ALTER TABLE team_member_routing ADD COLUMN kinds TEXT NOT NULL DEFAULT 'both'"
+        )
+    if "team_member_routing" in tabelas:
+        conn.execute(
+            "UPDATE team_member_routing SET kinds = 'chat'"
+            " WHERE kinds = 'both' AND forms_enabled = 0"
+        )
+
+
 def _migrate_load(conn) -> None:
     """Carga por analista (medicao): estado atual + historico curto.
 
@@ -414,6 +451,10 @@ def _migrate_load(conn) -> None:
                  form_ocioso_min REAL NOT NULL DEFAULT 0,
                  form_presente_toa INTEGER NOT NULL DEFAULT 0,
                  toa_ok INTEGER NOT NULL DEFAULT 0,
+                 -- Chaves de caso (autor) vistas no TOA nessa leitura: a decisao
+                 -- usa isso como a CARGA FISICA do analista (todas as filas do
+                 -- time), em vez de depender so da fila do item.
+                 casos_toa_keys TEXT NOT NULL DEFAULT '',
                  detail TEXT NOT NULL DEFAULT ''
                )"""
         )
@@ -434,6 +475,43 @@ def _migrate_load(conn) -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS analyst_load_history_at ON analyst_load_history (at DESC)"
         )
+    if "analyst_load" in _table_names(conn) and "casos_toa_keys" not in _table_columns(conn, "analyst_load"):
+        conn.execute(
+            "ALTER TABLE analyst_load ADD COLUMN casos_toa_keys TEXT NOT NULL DEFAULT ''"
+        )
+
+
+def load_reading(conn, address: str, fresh_sec: float = 90.0) -> dict | None:
+    """Ultima leitura de carga do analista — so se recente E bem sucedida.
+
+    Serve para a decisao usar a carga FISICA (o que o analista tem aberto no TOA,
+    somado a todas as filas do time). Leitura velha ou com `toa_ok=0` (uma das
+    listas falhou) nao decide nada: o chamador cai no calculo por fila.
+    """
+    row = conn.execute(
+        "SELECT *, (julianday('now') - julianday(at)) * 86400 AS idade"
+        " FROM analyst_load WHERE address = ?",
+        (str(address),),
+    ).fetchone()
+    if not row or not int(row.get("toa_ok") or 0):
+        return None
+    if float(row.get("idade") or 0) > float(fresh_sec):
+        return None
+    return row
+
+
+def load_case_keys(row: dict | None) -> set[str]:
+    """Chaves de caso (autor) que a ultima leitura viu no TOA para o analista."""
+    if not row:
+        return set()
+    bruto = str(row.get("casos_toa_keys") or "")
+    if not bruto:
+        return set()
+    try:
+        dados = json.loads(bruto)
+    except ValueError:
+        return set()
+    return {str(x) for x in dados if x} if isinstance(dados, list) else set()
 
 
 def load_upsert(conn, address: str, **campos) -> None:
@@ -441,7 +519,8 @@ def load_upsert(conn, address: str, **campos) -> None:
     base = {
         "name": "", "team_id": None, "janela": "", "online": 0, "chats_toa": 0, "forms_toa": 0,
         "chats_ledger": 0, "forms_ledger": 0, "reservas": 0, "casos_total": 0,
-        "form_ocioso_min": 0.0, "form_presente_toa": 0, "toa_ok": 0, "detail": "",
+        "form_ocioso_min": 0.0, "form_presente_toa": 0, "toa_ok": 0, "casos_toa_keys": "",
+        "detail": "",
     }
     base.update({k: v for k, v in campos.items() if k in base})
     conn.execute(
@@ -1067,15 +1146,24 @@ def finish_routes_for_chat(conn, chat_id: int, status: str, detail: str = "") ->
     return int(cur.rowcount or 0)
 
 
-def due_routes(conn, limit: int = 5) -> list[dict]:
-    return conn.execute(
-        """SELECT * FROM pending_routes
-           WHERE status = 'waiting'
-             AND (next_try_at IS NULL OR datetime(next_try_at) <= datetime('now'))
-           ORDER BY id
-           LIMIT ?""",
-        (int(limit),),
-    ).fetchall()
+def due_routes(conn, per_line: int = 5) -> dict[str, list[dict]]:
+    """Rotas vencidas por LINHA: chat e formulario esperam em filas apartadas.
+
+    Devolve as duas listas (cada uma FIFO por `id`) para o tick tentar a cabeca
+    de cada linha na mesma passada — um formulario enviado depois de 10 chats e
+    o 1o da linha dele, nao o 11.
+    """
+    linhas: dict[str, list[dict]] = {}
+    for kind in ("chat", "form"):
+        linhas[kind] = conn.execute(
+            """SELECT * FROM pending_routes
+               WHERE status = 'waiting' AND kind = ?
+                 AND (next_try_at IS NULL OR datetime(next_try_at) <= datetime('now'))
+               ORDER BY id
+               LIMIT ?""",
+            (kind, max(1, int(per_line))),
+        ).fetchall()
+    return linhas
 
 
 def retry_route(conn, route_id: int, attempts: int, delay_sec: float, detail: str = "") -> None:
@@ -1364,6 +1452,18 @@ def assign_close_stale(conn, ttl_sec: int) -> int:
         (str(int(max(ttl_sec, 0))),),
     )
     return int(cur.rowcount or 0)
+
+
+def open_chat_assignments(conn) -> list[dict]:
+    """Casos de CHAT ainda abertos no ledger (reconciliacao com o chat real).
+
+    O caso de um chat tem que morrer junto com o chat: sem isso ele segue
+    contando na carga do analista ate o TTL (`route_assign_ttl_sec`, 12 h) e a
+    distribuicao trava com o time "cheio" sem ninguem atendendo.
+    """
+    return conn.execute(
+        "SELECT * FROM route_assignments WHERE kind = 'chat' AND closed_at IS NULL ORDER BY id"
+    ).fetchall()
 
 
 def open_assignments(conn) -> list[dict]:

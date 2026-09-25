@@ -1164,16 +1164,17 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && $page !== 'login') {
                 );
                 foreach (
                     [
-                        'max_open_chats_per_agent', 'transfer_attempts', 'transfer_retry_interval_sec',
+                        'max_open_chats_per_agent', 'max_cases_per_agent', 'transfer_attempts',
+                        'transfer_retry_interval_sec',
                         'max_open_forms_per_agent', 'form_route_attempts', 'form_route_retry_interval_sec',
-                        'queue_max_wait_sec',
+                        'queue_top_pos',
                     ] as $k
                 ) {
                     if (isset($_POST[$k])) {
                         $st->execute([$k, trim((string) $_POST[$k])]);
                     }
                 }
-                foreach (['bot_enabled', 'form_routing_enabled', 'queue_wait_enabled'] as $k) {
+                foreach (['bot_enabled', 'form_routing_enabled', 'queue_wait_enabled', 'queue_show_pos'] as $k) {
                     $st->execute([$k, ((string) ($_POST[$k] ?? 'false')) === 'true' ? 'true' : 'false']);
                 }
                 $strategy = (string) ($_POST['routing_strategy'] ?? 'round_robin');
@@ -1186,6 +1187,24 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && $page !== 'login') {
                     $fbForm = 'retry';
                 }
                 $st->execute(['form_route_fallback', $fbForm]);
+                // "Fazer valer para todos": limpa os overrides (NULL = herda o global).
+                $nTimes = 0;
+                $nOperadores = 0;
+                if (((string) ($_POST['cases_all_teams'] ?? '')) === '1') {
+                    $nTimes = (int) $pdo->exec(
+                        "UPDATE team_routing SET cap_cases = NULL, updated_at = datetime('now')"
+                        . ' WHERE cap_cases IS NOT NULL'
+                    );
+                }
+                if (((string) ($_POST['cases_all_members'] ?? '')) === '1') {
+                    $nOperadores = (int) $pdo->exec(
+                        'UPDATE team_member_routing SET cap_cases = NULL WHERE cap_cases IS NOT NULL'
+                    );
+                }
+                if ($nTimes > 0 || $nOperadores > 0) {
+                    $queueMsg = $nTimes . ' time(s) e ' . $nOperadores
+                        . ' operador(es) passaram a herdar o cap de casos global.';
+                }
             } elseif ($action === 'queue_expire') {
                 $ridQ = (int) ($_POST['route_id'] ?? 0);
                 $qParamsA = [];
@@ -1197,7 +1216,8 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && $page !== 'login') {
                 if (!$stQ->fetchColumn()) {
                     $formError = 'Item de fila inexistente ou fora do seu escopo.';
                 } else {
-                    // Vence a espera agora; o motor expira na proxima varredura e aplica o fallback do time.
+                    // Encerra a espera agora: o motor aplica o fallback do time na
+                    // proxima varredura (a fila nao tem prazo automatico).
                     $pdo->prepare("UPDATE pending_routes SET expires_at = datetime('now', '-1 seconds') WHERE id = ?")
                         ->execute([$ridQ]);
                     $queueMsg = 'Espera encerrada: o bot libera o tecnico na proxima varredura (ate 5 s).';
@@ -1251,18 +1271,23 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && $page !== 'login') {
                     if (!in_array($fallback, ['', 'close', 'retry', 'monitor'], true)) {
                         $fallback = '';
                     }
+                    $memberKinds = (string) ($_POST['member_kinds'] ?? 'both');
+                    if (!in_array($memberKinds, ['both', 'chat', 'form'], true)) {
+                        $memberKinds = 'both';
+                    }
                     $pdo->prepare(
                         "INSERT INTO team_routing
                            (team_id, strategy, cap_chat, cap_form, cap_cases, require_online, respect_window,
-                            attempts, retry_interval_sec, fallback, form_enabled)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            attempts, retry_interval_sec, fallback, form_enabled, member_kinds)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                          ON CONFLICT (team_id) DO UPDATE SET
                            strategy = excluded.strategy, cap_chat = excluded.cap_chat,
                            cap_form = excluded.cap_form, cap_cases = excluded.cap_cases,
                            require_online = excluded.require_online,
                            respect_window = excluded.respect_window, attempts = excluded.attempts,
                            retry_interval_sec = excluded.retry_interval_sec, fallback = excluded.fallback,
-                           form_enabled = excluded.form_enabled, updated_at = datetime('now')"
+                           form_enabled = excluded.form_enabled, member_kinds = excluded.member_kinds,
+                           updated_at = datetime('now')"
                     )->execute([
                         $rid,
                         $strategy === '' ? null : $strategy,
@@ -1275,7 +1300,29 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && $page !== 'login') {
                         $int_or_null('retry_interval_sec'),
                         $fallback === '' ? null : $fallback,
                         ((string) ($_POST['form_enabled'] ?? '1')) === '1' ? 1 : 0,
+                        $memberKinds,
                     ]);
+                    // "Replicar para todos os operadores": limpa o ajuste individual
+                    // (NULL = herda o time) e, se pedido, o tipo individual tambem.
+                    $replicou = 0;
+                    if (((string) ($_POST['cases_all_members'] ?? '')) === '1') {
+                        $stRep = $pdo->prepare(
+                            'UPDATE team_member_routing SET cap_cases = NULL WHERE team_id = ?'
+                        );
+                        $stRep->execute([$rid]);
+                        $replicou += (int) $stRep->rowCount();
+                    }
+                    if (((string) ($_POST['kinds_all_members'] ?? '')) === '1') {
+                        $stRep = $pdo->prepare(
+                            'UPDATE team_member_routing SET kinds = ?, forms_enabled = ? WHERE team_id = ?'
+                        );
+                        $stRep->execute([$memberKinds, $memberKinds === 'chat' ? 0 : 1, $rid]);
+                        $replicou += (int) $stRep->rowCount();
+                    }
+                    if ($replicou > 0) {
+                        $queueMsg = 'Ajustes replicados para os operadores do time ('
+                            . $replicou . ' linha(s) atualizada(s)).';
+                    }
                 }
             } elseif ($action === 'reset_team_routing' && $rid > 0) {
                 $pdo->prepare('DELETE FROM team_routing WHERE team_id = ?')->execute([$rid]);
@@ -1284,13 +1331,17 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && $page !== 'login') {
                 if ($rid < 1 || $addr === '') {
                     $formError = 'Membro inválido.';
                 } else {
+                    $kindsMembro = (string) ($_POST['kinds'] ?? 'both');
+                    if (!in_array($kindsMembro, ['both', 'chat', 'form'], true)) {
+                        $kindsMembro = 'both';
+                    }
                     $pdo->prepare(
-                        'INSERT INTO team_member_routing (team_id, address, weight, cap_chat, cap_form, cap_cases, forms_enabled)
-                         VALUES (?, ?, ?, ?, ?, ?, ?)
+                        'INSERT INTO team_member_routing (team_id, address, weight, cap_chat, cap_form, cap_cases, forms_enabled, kinds)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                          ON CONFLICT (team_id, address) DO UPDATE SET
                            weight = excluded.weight, cap_chat = excluded.cap_chat,
                            cap_form = excluded.cap_form, cap_cases = excluded.cap_cases,
-                           forms_enabled = excluded.forms_enabled'
+                           forms_enabled = excluded.forms_enabled, kinds = excluded.kinds'
                     )->execute([
                         $rid,
                         $addr,
@@ -1298,7 +1349,8 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && $page !== 'login') {
                         $int_or_null('cap_chat'),
                         $int_or_null('cap_form'),
                         $int_or_null('cap_cases'),
-                        ((string) ($_POST['forms_enabled'] ?? '1')) === '1' ? 1 : 0,
+                        $kindsMembro === 'chat' ? 0 : 1,
+                        $kindsMembro,
                     ]);
                 }
             } elseif ($action === 'reset_member_routing') {
@@ -2005,15 +2057,18 @@ if ($page === 'routing') {
     echo '<div class="col-md-3"><label class="form-label">Fila de espera (chat)</label><select class="form-select" name="queue_wait_enabled">';
     echo '<option value="true"' . (($map['queue_wait_enabled'] ?? 'true') === 'true' ? ' selected' : '') . '>Ligada (avisa a posição)</option>';
     echo '<option value="false"' . (($map['queue_wait_enabled'] ?? '') === 'false' ? ' selected' : '') . '>Desligada (só tenta de novo)</option></select></div>';
+    echo '<div class="col-md-3"><label class="form-label">Posição falada no chat</label><select class="form-select" name="queue_show_pos">';
+    echo '<option value="false"' . (($map['queue_show_pos'] ?? 'false') === 'false' ? ' selected' : '') . '>Não falar o número (só "avançou na fila")</option>';
+    echo '<option value="true"' . (($map['queue_show_pos'] ?? '') === 'true' ? ' selected' : '') . '>Falar o número da fila</option></select></div>';
     echo '<div class="col-md-3"><label class="form-label">Fallback do formulário</label><select class="form-select" name="form_route_fallback">';
     echo '<option value="retry"' . (($map['form_route_fallback'] ?? 'retry') === 'retry' ? ' selected' : '') . '>Repetir até achar analista</option>';
     echo '<option value="monitor"' . (($map['form_route_fallback'] ?? '') === 'monitor' ? ' selected' : '') . '>Não insistir</option></select></div>';
     $globFields = [
         'max_open_chats_per_agent' => ['Cap de chats por analista', '8'],
         'max_open_forms_per_agent' => ['Cap de formulários por analista', '8'],
+        'max_cases_per_agent' => ['Casos por analista (form + chat do mesmo autor = 1 caso)', '4'],
         'transfer_attempts' => ['Tentativas de transferência (chat)', '5'],
         'transfer_retry_interval_sec' => ['Intervalo entre tentativas do chat (s)', '60'],
-        'queue_max_wait_sec' => ['Espera máxima do chat na fila (s) — o bot aplica o fallback ao vencer; 0 = sem limite', '1800'],
         'queue_top_pos' => ['Posição a partir da qual o chat ouve o número (0 = sempre)', '5'],
         'form_route_attempts' => ['Tentativas de rota do formulário', '5'],
         'form_route_retry_interval_sec' => ['Intervalo entre tentativas do formulário (s)', '60'],
@@ -2022,8 +2077,15 @@ if ($page === 'routing') {
         echo '<div class="col-md-3"><label class="form-label">' . h($gv[0]) . '</label>';
         echo '<input class="form-control" name="' . h($gk) . '" value="' . h($map[$gk] ?? $gv[1]) . '"></div>';
     }
+    echo '<div class="col-12 mt-3"><div class="form-check form-check-inline">';
+    echo '<input class="form-check-input" type="checkbox" name="cases_all_teams" id="casesAllTeams" value="1">';
+    echo '<label class="form-check-label" for="casesAllTeams">Fazer o <strong>Casos</strong> global valer para <strong>todos os times</strong></label></div>';
+    echo '<div class="form-check form-check-inline">';
+    echo '<input class="form-check-input" type="checkbox" name="cases_all_members" id="casesAllMembers" value="1">';
+    echo '<label class="form-check-label" for="casesAllMembers">… e também para <strong>todos os operadores</strong></label></div>';
+    echo '<div class="form-text">Marcar limpa o cap de casos configurado no time/operador: eles passam a herdar este valor (nenhum peso ou outra configuração é perdido).</div></div>';
     echo '<button class="btn btn-primary mt-3">Salvar globais</button></form>';
-    echo '<p class="text-muted small mb-0 mt-3">O cap limita quantos chats/formulários simultâneos o analista recebe. O intervalo do chat é a espera entre as consultas de online; o do formulário é o intervalo do retry, que roda em background e não trava o atendimento. Com a <strong>fila de espera</strong> ligada, o chat fica aguardando <strong>até a espera máxima</strong>: ao vencer, o bot avisa o técnico (texto <em>queue_expired</em> quando o fallback é monitorar) e aplica o fallback do time; antecipar continua sendo o botão <em>Encerrar espera</em>. A posição falada conta <strong>só chats</strong> e o número só aparece a partir do campo <em>Posição a partir da qual o chat ouve o número</em> — acima disso o técnico recebe apenas "avançou na fila" (os formulários esperam na mesma fila, mas ele não os vê). Desligada, o bot apenas repete as tentativas e aplica o fallback do time.</p>';
+    echo '<p class="text-muted small mb-0 mt-3">O cap limita quantos chats/formulários simultâneos o analista recebe; o <strong>Casos</strong> limita solicitantes distintos (formulário e chat do <strong>mesmo autor</strong> contam como um caso) e é o número usado na escolha do analista. O intervalo do chat é a espera entre as consultas de online; o do formulário é o intervalo do retry, que roda em background e não trava o atendimento. Com a <strong>fila de espera</strong> ligada, o item <strong>aguarda sem prazo</strong>: ele só sai da fila por <strong>entrega</strong>, porque o <strong>técnico saiu do chat</strong> (ou o chat foi removido), porque o item <strong>sumiu das listas do TOA</strong> (resolvido) ou pelo botão <em>Encerrar espera</em>, que aplica o fallback do time. A <strong>posição falada</strong> é contada só entre chats (a linha do formulário é apartada) e, no padrão, o técnico ouve apenas "Você avançou na fila" — para falar o número, escolha <em>Falar o número da fila</em> e o número aparece a partir do campo <em>Posição a partir da qual o chat ouve o número</em>. Desligada, o bot apenas repete as tentativas e aplica o fallback do time.</p>';
     echo '</div></div>';
     $qParams = [];
     $qWhere = bot_scope_team_where($pdo, 'r.team_id', $qParams);
@@ -2059,11 +2121,11 @@ if ($page === 'routing') {
     $qRestante = static function (?string $iso) use ($agoraTs): string {
         $ts = $iso ? strtotime($iso . ' UTC') : 0;
         if (!$ts) {
-            return 'sem limite';
+            return 'sem prazo';
         }
         $seg = $ts - $agoraTs;
         if ($seg <= 0) {
-            return 'vencendo';
+            return 'encerrando';
         }
         if ($seg < 3600) {
             return 'em ' . max(1, (int) floor($seg / 60)) . ' min';
@@ -2083,7 +2145,7 @@ if ($page === 'routing') {
         echo '<p class="text-muted mb-0">Ninguém esperando.</p>';
     } else {
         echo '<div class="table-responsive"><table class="table table-sm table-hover align-middle mb-0">';
-        echo '<thead><tr><th>#</th><th>Tipo</th><th>Fila</th><th>Time</th><th>Chat</th><th>Esperando</th><th>Expira</th><th></th></tr></thead><tbody>';
+        echo '<thead><tr><th>#</th><th>Tipo</th><th>Fila</th><th>Time</th><th>Chat</th><th>Esperando</th><th>Prazo</th><th></th></tr></thead><tbody>';
         foreach ($queueRows as $rq) {
             $ridQ = (int) $rq['id'];
             $ehChat = (string) $rq['kind'] === 'chat';
@@ -2103,12 +2165,12 @@ if ($page === 'routing') {
             if ($ehChat) {
                 echo '<form method="post" class="d-inline"><input type="hidden" name="csrf" value="' . h($csrf) . '">';
                 echo '<input type="hidden" name="action" value="queue_expire"><input type="hidden" name="route_id" value="' . $ridQ . '">';
-                echo '<button class="btn btn-sm btn-outline-secondary" title="Vence a espera agora; o bot aplica o fallback do time">Encerrar espera</button></form>';
+                echo '<button class="btn btn-sm btn-outline-secondary" title="Encerra a espera agora: o bot aplica o fallback do time">Encerrar espera</button></form>';
             }
             echo '</td></tr>';
         }
         echo '</tbody></table></div>';
-        echo '<p class="small text-muted mb-0 mt-2">Posição é por time e por tipo, em ordem de chegada. A espera do chat não vence sozinha: só sai da fila quando um analista elegível aparece, quando o técnico sai ou por "Encerrar espera". O aviso de posição vai apenas para o chat; o formulário espera em silêncio.</p>';
+        echo '<p class="small text-muted mb-0 mt-2">Chat e formulário esperam em <strong>linhas apartadas</strong>: a posição é contada por time e por tipo, em ordem de chegada — um formulário enviado depois de 10 chats é o <strong>1º da linha dele</strong>, não o 11º. A espera <strong>não vence sozinha</strong>: o item só sai da fila por <strong>entrega</strong>, porque o <strong>técnico saiu do chat</strong> (ou o chat foi removido), porque <strong>sumiu das listas do TOA</strong> (resolvido) ou pelo botão <em>Encerrar espera</em> (aí o bot aplica o fallback do time). O aviso de posição vai apenas para o chat; o formulário espera em silêncio.</p>';
     }
     echo '</div></div>';
     // Entregas paradas, casos sem entrega e ledger (FASE A: o que era invisivel).
@@ -2280,8 +2342,24 @@ if ($page === 'routing') {
             echo '<option value="' . h((string) $k) . '"' . ((string) (int) ($tr['form_enabled'] ?? 1) === $k ? ' selected' : '') . '>' . h($l) . '</option>';
         }
         echo '</select></div>';
+        echo '<div class="col-md-2"><label class="form-label">Padrão dos operadores</label><select class="form-select form-select-sm" name="member_kinds">';
+        foreach (['both' => 'atende os dois', 'chat' => 'só chat', 'form' => 'só formulário'] as $k => $l) {
+            $atualMK = (string) ($tr['member_kinds'] ?? 'both');
+            if ($atualMK === '' || $atualMK === '0') {
+                $atualMK = 'both';
+            }
+            echo '<option value="' . h($k) . '"' . ($atualMK === $k ? ' selected' : '') . '>' . h($l) . '</option>';
+        }
+        echo '</select></div>';
         echo '<div class="col-auto"><button class="btn btn-primary btn-sm">Salvar</button></div>';
-        echo '<div class="col-12"><p class="text-muted small mb-0">Vazio = herda o global. <strong>Sem ninguém</strong>: no formulário, <em>repetir</em> tenta de novo a cada intervalo até o limite de tentativas e <em>não insistir</em> registra o evento e para; no chat, <em>encerrar</em> mantém o comportamento atual (bot sai) e <em>não insistir</em> deixa o chat em monitoramento.</p></div>';
+        echo '<div class="col-12"><p class="text-muted small mb-0">Vazio = herda o global. <strong>Sem ninguém</strong>: no formulário, <em>repetir</em> tenta de novo a cada intervalo até o limite de tentativas e <em>não insistir</em> registra o evento e para; no chat, <em>encerrar</em> mantém o comportamento atual (bot sai) e <em>não insistir</em> deixa o chat em monitoramento. <strong>Casos</strong> conta solicitantes distintos: formulário e chat do <strong>mesmo autor</strong> são um caso só, e é esse número (não a soma de itens) que a escolha do analista usa.</p>';
+        echo '<div class="form-check mt-2">';
+        echo '<input class="form-check-input" type="checkbox" name="cases_all_members" id="casesAllMembers' . $id . '" value="1">';
+        echo '<label class="form-check-label small" for="casesAllMembers' . $id . '">Replicar o <strong>Casos</strong> deste time para <strong>todos os operadores</strong> (limpa o cap de casos individual)</label></div>';
+        echo '<div class="form-check">';
+        echo '<input class="form-check-input" type="checkbox" name="kinds_all_members" id="kindsAllMembers' . $id . '" value="1">';
+        echo '<label class="form-check-label small" for="kindsAllMembers' . $id . '">Replicar o <strong>Padrão dos operadores</strong> para todos (limpa o tipo individual)</label></div>';
+        echo '</div>';
         echo '</form>';
         echo '<form method="post" class="mt-2"><input type="hidden" name="csrf" value="' . h($csrf) . '">';
         echo '<input type="hidden" name="action" value="reset_team_routing"><input type="hidden" name="team_id" value="' . $id . '">';
@@ -2297,7 +2375,7 @@ if ($page === 'routing') {
             echo '<p class="text-muted small">Sem membros. Adicione na aba <a href="?page=teams#team-' . $id . '">Times</a>.</p>';
         } else {
             echo '<div class="table-responsive"><table class="table table-sm table-hover align-middle bg-white">';
-            echo '<thead><tr><th>Ordem</th><th>Nome</th><th>Peso</th><th>Cap chat</th><th>Cap form</th><th>Casos</th><th>Formulário</th><th>Plantão agora</th><th></th></tr></thead><tbody>';
+            echo '<thead><tr><th>Ordem</th><th>Nome</th><th>Peso</th><th>Cap chat</th><th>Cap form</th><th>Casos</th><th>Atende</th><th>Plantão agora</th><th></th></tr></thead><tbody>';
             foreach ($mRows as $mem) {
                 $addr = (string) $mem['address'];
                 $mr = $mrByTeam[$id][$addr] ?? [];
@@ -2310,9 +2388,13 @@ if ($page === 'routing') {
                 echo '<td style="width:6rem"><input class="form-control form-control-sm" type="number" min="0" name="cap_chat" value="' . h($numOrNull($mr['cap_chat'] ?? null)) . '" placeholder="' . h((string) ($tr['cap_chat'] ?? ($map['max_open_chats_per_agent'] ?? '8'))) . '"></td>';
                 echo '<td style="width:6rem"><input class="form-control form-control-sm" type="number" min="0" name="cap_form" value="' . h($numOrNull($mr['cap_form'] ?? null)) . '" placeholder="' . h((string) ($tr['cap_form'] ?? ($map['max_open_forms_per_agent'] ?? '8'))) . '"></td>';
                 echo '<td style="width:6rem"><input class="form-control form-control-sm" type="number" min="0" name="cap_cases" value="' . h($numOrNull($mr['cap_cases'] ?? null)) . '" placeholder="' . h((string) ($tr['cap_cases'] ?? ($map['max_cases_per_agent'] ?? '4'))) . '"></td>';
-                echo '<td><select class="form-select form-select-sm" name="forms_enabled">';
-                foreach (['1' => 'recebe', '0' => 'só chat'] as $k => $l) {
-                    echo '<option value="' . h((string) $k) . '"' . ((string) (int) ($mr['forms_enabled'] ?? 1) === $k ? ' selected' : '') . '>' . h($l) . '</option>';
+                $kindsAtual = (string) ($mr['kinds'] ?? '');
+                if (!in_array($kindsAtual, ['both', 'chat', 'form'], true)) {
+                    $kindsAtual = ((string) (int) ($mr['forms_enabled'] ?? 1)) === '0' ? 'chat' : 'both';
+                }
+                echo '<td style="width:9rem"><select class="form-select form-select-sm" name="kinds">';
+                foreach (['both' => 'ambos', 'form' => 'formulário', 'chat' => 'só chat'] as $k => $l) {
+                    echo '<option value="' . h($k) . '"' . ($kindsAtual === $k ? ' selected' : '') . '>' . h($l) . '</option>';
                 }
                 echo '</select></td>';
                 echo '<td>' . badge_state($naJanela, 'na janela', 'fora') . '</td>';
@@ -2719,55 +2801,120 @@ if ($page === 'load') {
     } catch (Throwable $e) {
         $loadPoll = 30;
     }
+    // ---- Filtro de time (multiplo) da aba --------------------------------
+    // Vale para os cards, a tabela e o alerta de divergentes. O estado fica na
+    // sessao (a pagina tem auto-refresh de 30 s, entao so a URL nao bastaria) e a
+    // selecao e sempre limitada ao escopo de times do usuario.
+    $ltParams = [];
+    $ltWhere = bot_scope_team_where($pdo, 'id', $ltParams);
+    $loadTeams = [];
+    try {
+        $stLt = $pdo->prepare('SELECT id, name FROM teams WHERE 1 = 1' . $ltWhere . ' ORDER BY name');
+        $stLt->execute($ltParams);
+        foreach ($stLt->fetchAll() as $lt) {
+            $loadTeams[(int) $lt['id']] = (string) $lt['name'];
+        }
+    } catch (Throwable $e) {
+        $loadTeams = [];
+    }
+    $selTimes = [];
+    $temFiltro = array_key_exists('teams', $_GET);
+    foreach ((array) ($temFiltro ? $_GET['teams'] : ($_SESSION['load_teams'] ?? [])) as $tv) {
+        $tv = (int) $tv;
+        if (isset($loadTeams[$tv])) {
+            $selTimes[$tv] = true;
+        }
+    }
+    $filtroTimes = array_keys($selTimes);
+    if ($temFiltro) {
+        $_SESSION['load_teams'] = $filtroTimes;
+    }
+    // Fragmento por COLUNA de time (rotas e ledger).
+    $filtroTimeSql = static function (string $col) use ($filtroTimes): string {
+        if (!$filtroTimes) {
+            return '';
+        }
+        return ' AND ' . $col . ' IN (' . implode(',', array_fill(0, count($filtroTimes), '?')) . ')';
+    };
+    // Fragmento por FILA (o chat nao tem team_id: filtra pelas filas do time).
+    $filtroFilaSql = static function (string $col) use ($filtroTimes): string {
+        if (!$filtroTimes) {
+            return '';
+        }
+        $marc = implode(',', array_fill(0, count($filtroTimes), '?'));
+        return ' AND ' . $col . ' IN (SELECT queue_address FROM team_queues WHERE team_id IN (' . $marc . '))';
+    };
     $loadParams = [];
     $loadWhere = bot_scope_team_where($pdo, 'l.team_id', $loadParams);
     $loadRows = [];
     $loadErro = '';
     try {
+        // ATIVO no roteamento primeiro (maior carga fisica no topo); inativo no
+        // time (ou removido dele) vai para o fim da lista, com selo na linha.
         $stLoad = $pdo->prepare(
-            'SELECT l.*, t.name AS team_name FROM analyst_load l'
+            'SELECT l.*, t.name AS team_name, COALESCE(tm.active, 0) AS roteando'
+            . ' FROM analyst_load l'
             . ' LEFT JOIN teams t ON t.id = l.team_id'
-            . ' WHERE 1 = 1' . $loadWhere
-            . ' ORDER BY l.casos_total DESC, l.form_ocioso_min DESC, l.name'
+            . ' LEFT JOIN team_members tm ON tm.team_id = l.team_id AND tm.address = l.address'
+            . ' WHERE 1 = 1' . $loadWhere . $filtroTimeSql('l.team_id')
+            . ' ORDER BY (CASE WHEN COALESCE(tm.active, 0) = 1 THEN 0 ELSE 1 END),'
+            . ' (l.chats_toa + l.forms_toa) DESC, l.form_ocioso_min DESC, l.name'
         );
-        $stLoad->execute($loadParams);
+        $stLoad->execute(array_merge($loadParams, $filtroTimes));
         $loadRows = $stLoad->fetchAll();
     } catch (Throwable $e) {
         $loadErro = 'Tabela analyst_load ausente. Reinicie o bot (ou rode o bot no painel) para criar.';
     }
-    // Resumo dos formularios: fila, atendimento (cap) e desfechos na ultima hora.
-    $formFila = 0;
-    $capForm = 0;
-    $capChat = 0;
-    $fechadosHora = 0;
-    $resolvidosHora = 0;
+    // Cards: chatbot (chats com o bot), filas e o que esta em atendimento (ledger).
+    $botAtende = 0;
+    $filaChat = 0;
+    $filaForm = 0;
+    $chatAtende = 0;
+    $formAtende = 0;
+    $statusBot = bot_open_chat_statuses();
     try {
-        $formFila = (int) $pdo->query("SELECT COUNT(*) FROM pending_routes WHERE kind = 'form' AND status = 'waiting'")->fetchColumn();
+        $botParams = [];
+        $stBot = $pdo->prepare(
+            'SELECT COUNT(*) FROM chats c WHERE c.moved_at IS NULL'
+            . ' AND c.status IN (' . implode(',', array_fill(0, count($statusBot), '?')) . ')'
+            . bot_scope_queue_where($pdo, 'c.queue_address', $botParams)
+            . $filtroFilaSql('c.queue_address')
+        );
+        $stBot->execute(array_merge($statusBot, $botParams, $filtroTimes));
+        $botAtende = (int) $stBot->fetchColumn();
     } catch (Throwable $e) {
+        $botAtende = 0;
     }
     try {
-        $capParams = [];
-        $capWhere = bot_scope_team_where($pdo, 'team_id', $capParams);
-        $stCap = $pdo->prepare("SELECT kind, COUNT(*) AS n FROM route_assignments WHERE closed_at IS NULL" . $capWhere . ' GROUP BY kind');
-        $stCap->execute($capParams);
-        foreach ($stCap->fetchAll() as $rCap) {
-            if ((string) $rCap['kind'] === 'form') {
-                $capForm = (int) $rCap['n'];
+        $filaParams = [];
+        $stFila = $pdo->prepare(
+            "SELECT kind, COUNT(*) AS n FROM pending_routes r"
+            . " WHERE r.status = 'waiting'" . bot_scope_team_where($pdo, 'r.team_id', $filaParams)
+            . $filtroTimeSql('r.team_id') . ' GROUP BY kind'
+        );
+        $stFila->execute(array_merge($filaParams, $filtroTimes));
+        foreach ($stFila->fetchAll() as $rFila) {
+            if ((string) $rFila['kind'] === 'form') {
+                $filaForm = (int) $rFila['n'];
             } else {
-                $capChat = (int) $rCap['n'];
+                $filaChat = (int) $rFila['n'];
             }
         }
     } catch (Throwable $e) {
     }
     try {
-        foreach ($pdo->query(
-            "SELECT reason, COUNT(*) AS n FROM bot_events WHERE at >= datetime('now', '-1 hour')"
-            . " AND reason IN ('form_closed', 'form_resolvido_toa') GROUP BY reason"
-        ) as $rEv) {
-            if ((string) $rEv['reason'] === 'form_resolvido_toa') {
-                $resolvidosHora = (int) $rEv['n'];
+        $capParams = [];
+        $capWhere = bot_scope_team_where($pdo, 'team_id', $capParams);
+        $stCap = $pdo->prepare(
+            'SELECT kind, COUNT(*) AS n FROM route_assignments WHERE closed_at IS NULL'
+            . $capWhere . $filtroTimeSql('team_id') . ' GROUP BY kind'
+        );
+        $stCap->execute(array_merge($capParams, $filtroTimes));
+        foreach ($stCap->fetchAll() as $rCap) {
+            if ((string) $rCap['kind'] === 'form') {
+                $formAtende = (int) $rCap['n'];
             } else {
-                $fechadosHora = (int) $rEv['n'];
+                $chatAtende = (int) $rCap['n'];
             }
         }
     } catch (Throwable $e) {
@@ -2796,14 +2943,28 @@ if ($page === 'load') {
     if ($loadErro !== '') {
         echo '<div class="alert alert-danger py-2 mb-2">' . h($loadErro) . '</div>';
     }
+    echo '<div class="card mb-3"><div class="card-body py-2">';
+    echo '<form method="get" class="row g-2 align-items-end">';
+    echo '<input type="hidden" name="page" value="load">';
+    echo '<div class="col-md-5 col-xl-4"><label class="form-label mb-1">Times (vale para os cards e a tabela)</label>';
+    echo '<select class="form-select form-select-sm" name="teams[]" multiple size="6">';
+    foreach ($loadTeams as $ltId => $ltNome) {
+        echo '<option value="' . (int) $ltId . '"' . (isset($selTimes[$ltId]) ? ' selected' : '') . '>' . h($ltNome) . '</option>';
+    }
+    echo '</select></div>';
+    echo '<div class="col-auto"><button class="btn btn-primary btn-sm">Filtrar</button> ';
+    echo '<a class="btn btn-outline-secondary btn-sm" href="?page=load&amp;teams=">Limpar</a></div>';
+    echo '<div class="col-12"><div class="form-text mb-0">Sem seleção = todos os times do seu acesso. '
+        . 'A escolha fica gravada na sessão e vale para os cards, a tabela e os alertas.</div></div>';
+    echo '</form></div></div>';
     echo '<div class="row g-3 mb-3">';
     $cards = [
-        ['Formularios na fila', (string) $formFila, 'bg-primary'],
-        ['Formularios em atendimento', (string) $capForm, 'bg-info text-dark'],
-        ['Chats em atendimento', (string) $capChat, 'bg-secondary'],
-        ['Fechados na ultima hora', (string) $fechadosHora, 'bg-dark'],
-        ['Resolvidos por ausencia no TOA (1 h)', (string) $resolvidosHora, 'bg-success'],
-        ['Ultima leitura', $ultimaLeitura !== '' ? fmt_dt($ultimaLeitura) : '—', 'bg-light text-dark'],
+        ['ChatBot — Em atendimento', (string) $botAtende, 'bg-dark'],
+        ['Fila de chat', (string) $filaChat, 'bg-warning text-dark'],
+        ['Chat em atendimento', (string) $chatAtende, 'bg-secondary'],
+        ['Fila de formulário', (string) $filaForm, 'bg-primary'],
+        ['Formulário em atendimento', (string) $formAtende, 'bg-info text-dark'],
+        ['Última leitura', $ultimaLeitura !== '' ? fmt_dt($ultimaLeitura) : '—', 'bg-light text-dark'],
     ];
     foreach ($cards as $card) {
         echo '<div class="col-6 col-md-4 col-xl-2"><div class="card h-100"><div class="card-body py-2">';
@@ -2812,7 +2973,12 @@ if ($page === 'load') {
         echo '</div></div></div>';
     }
     echo '</div>';
-    echo '<p class="text-muted small">Leitura automática a cada <strong>' . (int) $loadPoll . ' s</strong>. Formulario ausente nas listas do TOA por <strong>' . (int) $loadAbsent . '</strong> leitura(s) com leitura bem sucedida é dado como resolvido no TOA (<code>form_resolvido_toa</code>): o caso fecha, a vaga do analista libera e as rotas sao canceladas.</p>';
+    echo '<p class="text-muted small">Leitura automática a cada <strong>' . (int) $loadPoll . ' s</strong>. '
+        . 'Item ausente nas listas do TOA por <strong>' . (int) $loadAbsent . '</strong> leitura(s) com leitura bem sucedida é dado como resolvido '
+        . '(<code>form_resolvido_toa</code> para o formulário, <code>chat_resolvido_toa</code> para o chat): o caso fecha, a vaga do analista libera e as rotas são canceladas. '
+        . 'Na tabela, <strong>Casos</strong> mostra o <em>físico</em> (TOA chat + TOA form, o que o operador tem aberto no front) e, em cinza, o número de casos '
+        . '(solicitantes distintos — form + chat do mesmo autor = 1 caso), que é o número do cap; as reservas em voo somam por cima. '
+        . 'Quem está <strong>inativo</strong> no roteamento aparece no fim da lista.</p>';
     $divergentes = 0;
     foreach ($loadRows as $rDiv) {
         if ((int) $rDiv['forms_ledger'] > 0 && !(int) $rDiv['form_presente_toa']) {
@@ -2828,7 +2994,7 @@ if ($page === 'load') {
         }
         echo '<div class="table-responsive sticky-head"><table class="table table-slim table-hover align-middle bg-white mb-0">';
         echo '<thead><tr><th>Analista</th><th>Time</th><th>Online</th><th class="text-end">TOA chat</th><th class="text-end">TOA form</th>'
-            . '<th class="text-end">Bot chat</th><th class="text-end">Bot form</th><th class="text-end">Casos</th><th class="text-end">Reservas</th>'
+            . '<th class="text-end">Casos</th><th class="text-end">Reservas</th>'
             . '<th class="text-end">Form + velho</th><th>TOA</th><th>Leitura</th></tr></thead><tbody>';
         foreach ($loadRows as $r) {
             $addr = (string) $r['address'];
@@ -2837,16 +3003,24 @@ if ($page === 'load') {
             $toaOk = (int) $r['toa_ok'] === 1;
             $pres = (int) $r['form_presente_toa'] === 1;
             $ocioso = (float) $r['form_ocioso_min'];
-            echo '<tr>';
-            echo '<td><strong>' . h($nome) . '</strong><div class="text-muted small"><code>' . h($addr) . '</code></div></td>';
+            // Fisico = o que ele tem aberto no front; casos = solicitantes
+            // distintos (form + chat do mesmo autor = 1), que e o numero do cap.
+            $fisico = (int) $r['chats_toa'] + (int) $r['forms_toa'];
+            $casos = (int) $r['casos_total'];
+            $roteando = (int) ($r['roteando'] ?? 0) === 1;
+            echo '<tr' . ($roteando ? '' : ' class="text-muted"') . '>';
+            echo '<td><strong>' . h($nome) . '</strong>';
+            if (!$roteando) {
+                echo ' <span class="badge text-bg-warning" title="Inativo no roteamento deste time: nao recebe item novo">inativo</span>';
+            }
+            echo '<div class="text-muted small"><code>' . h($addr) . '</code></div></td>';
             echo '<td>' . h((string) ($r['team_name'] ?? '')) . '</td>';
             echo '<td>' . badge_state($online, 'sim', 'não') . '</td>';
             echo '<td class="text-end">' . (int) $r['chats_toa'] . '</td>';
             echo '<td class="text-end">' . (int) $r['forms_toa'] . ($pres ? ' <span class="badge bg-info text-dark">presente</span>' : '') . '</td>';
-            echo '<td class="text-end">' . (int) $r['chats_ledger'] . '</td>';
-            echo '<td class="text-end">' . (int) $r['forms_ledger'] . '</td>';
-            echo '<td class="text-end"><span class="badge ' . ((int) $r['casos_total'] > 0 ? 'bg-secondary' : 'bg-light text-dark') . '">'
-                . (int) $r['casos_total'] . '</span></td>';
+            echo '<td class="text-end"><span class="badge ' . ($fisico > 0 ? 'bg-secondary' : 'bg-light text-dark') . '"'
+                . ' title="Fisico: TOA chat + TOA form (o que o operador tem aberto no TOA)">' . $fisico . '</span>'
+                . ' <span class="text-muted small">(' . $casos . ' casos)</span></td>';
             echo '<td class="text-end">' . (int) $r['reservas'] . '</td>';
             echo '<td class="text-end">' . ($ocioso > 0 ? h(number_format($ocioso, 0) . ' min') : '<span class="text-muted">—</span>') . '</td>';
             echo '<td>' . badge_state($toaOk, 'ok', 'falhou') . '</td>';

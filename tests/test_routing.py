@@ -246,6 +246,48 @@ class DecideTest(unittest.TestCase):
         self.assertEqual(pick["address"], BIA)
         self.assertIn("so_chat=ana", detail)
 
+    def test_só_formulario_nao_recebe_chat(self):
+        pick, detail = routing.decide(
+            [member(ANA), member(BIA)],
+            settings=routing.resolve_settings({}, None, "chat"),
+            kind="chat",
+            online={"ana", "bia"},
+            mrouting={ANA: {"kinds": "form"}},
+        )
+        self.assertEqual(pick["address"], BIA)
+        self.assertIn("so_form=ana", detail)
+
+    def test_kinds_do_membro_vale_para_os_dois_lados(self):
+        """Quem so atende formulario recebe form (e nao chat); quem so atende chat, o inverso."""
+        cfg = {}
+        pick, _ = routing.decide(
+            [member(ANA), member(BIA)],
+            settings=routing.resolve_settings(cfg, None, "form"),
+            kind="form",
+            online={"ana", "bia"},
+            mrouting={ANA: {"kinds": "form"}, BIA: {"kinds": "chat"}},
+        )
+        self.assertEqual(pick["address"], ANA)
+        pick, _ = routing.decide(
+            [member(ANA), member(BIA)],
+            settings=routing.resolve_settings(cfg, None, "chat"),
+            kind="chat",
+            online={"ana", "bia"},
+            mrouting={ANA: {"kinds": "form"}, BIA: {"kinds": "chat"}},
+        )
+        self.assertEqual(pick["address"], BIA)
+
+    def test_tipo_padrao_do_time_vale_para_quem_nao_tem_linha(self):
+        """`member_kinds` do time e herdado pelo operador sem ajuste individual."""
+        s = routing.resolve_settings({}, {"member_kinds": "form"}, "form")
+        self.assertEqual(s["member_kinds"], "form")
+        r = routing.member_rules(None, s, "form")
+        self.assertEqual(r["kinds"], "form")
+        # Sem `member_kinds` no time, o padrao e atender os dois.
+        self.assertEqual(routing.member_rules(None, routing.resolve_settings({}, None, "form"), "form")["kinds"], "both")
+        # `kinds` invalido no banco cai no padrao (ambos), nunca bloqueia o operador.
+        self.assertEqual(routing.member_rules({"kinds": "xpto"}, s, "form")["kinds"], "form")
+
     def test_cascata_prioridade_com_titular_no_cap(self):
         pick, _ = routing.decide(
             [member(ANA), member(BIA)],
@@ -285,9 +327,34 @@ class MigracaoRoutingTest(unittest.TestCase):
             self.assertIn(t, db._table_names(self.conn))
         self.assertIn("weight", db._table_columns(self.conn, "team_member_routing"))
         self.assertIn("last_assigned_form", db._table_columns(self.conn, "team_routing"))
+        self.assertIn("kinds", db._table_columns(self.conn, "team_member_routing"))
+        self.assertIn("member_kinds", db._table_columns(self.conn, "team_routing"))
         cfg = db.settings(self.conn)
         self.assertEqual(cfg["max_open_forms_per_agent"], "3", "ajuste do usuário preservado")
         self.assertEqual(cfg["form_routing_enabled"], "true", "default reposto")
+
+    def test_migracao_converte_forms_enabled_em_kinds(self):
+        """Banco antigo: quem era 'so chat' passa a ter `kinds='chat'`; o resto fica 'both'."""
+        self.conn.execute("INSERT INTO teams (name, active) VALUES ('T1', 1)")
+        self.conn.execute(
+            "INSERT INTO team_member_routing (team_id, address, weight, cap_cases, forms_enabled, kinds)"
+            " VALUES (1, 'u:ana@claro.com', 0, 2, 0, 'both')"
+        )
+        self.conn.execute(
+            "INSERT INTO team_member_routing (team_id, address, weight, cap_cases, forms_enabled, kinds)"
+            " VALUES (1, 'u:bia@claro.com', 0, NULL, 1, 'both')"
+        )
+        db._migrate_kinds(self.conn)
+        linhas = {
+            str(r["address"]): str(r["kinds"])
+            for r in self.conn.execute("SELECT * FROM team_member_routing").fetchall()
+        }
+        self.assertEqual(linhas["u:ana@claro.com"], "chat", "so chat migrado")
+        self.assertEqual(linhas["u:bia@claro.com"], "both", "padrao = atende os dois")
+        cap = self.conn.execute(
+            "SELECT cap_cases FROM team_member_routing WHERE address = 'u:ana@claro.com'"
+        ).fetchone()
+        self.assertEqual(int(cap["cap_cases"]), 2, "a migracao nao mexe em cap nenhum")
 
     def test_ensure_schema_e_idempotente(self):
         self.conn.execute("INSERT INTO teams (name, active) VALUES ('T1', 1)")
@@ -317,12 +384,22 @@ class MigracaoRoutingTest(unittest.TestCase):
 
     def test_due_routes_respeita_o_agendamento(self):
         db.enqueue_route(self.conn, "form", 1, "h:q1", 1, delay_sec=300)
-        self.assertEqual(db.due_routes(self.conn), [])
+        self.assertEqual(db.due_routes(self.conn), {"chat": [], "form": []})
         db.enqueue_route(self.conn, "form", 2, "h:q1", 1, delay_sec=0)
         due = db.due_routes(self.conn)
-        self.assertEqual([int(r["chat_id"]) for r in due], [2])
-        db.retry_route(self.conn, int(due[0]["id"]), 1, 0, "sem analista")
-        self.assertEqual(int(db.due_routes(self.conn)[0]["attempts"]), 1)
+        self.assertEqual([int(r["chat_id"]) for r in due["form"]], [2])
+        self.assertEqual(due["chat"], [], "linha do chat e apartada")
+        db.retry_route(self.conn, int(due["form"][0]["id"]), 1, 0, "sem analista")
+        self.assertEqual(int(db.due_routes(self.conn)["form"][0]["attempts"]), 1)
+
+    def test_due_routes_separa_as_linhas_do_chat_e_do_formulario(self):
+        """Um formulario novo nao entra na fila atras dos chats (linhas apartadas)."""
+        for cid in range(1, 4):
+            db.enqueue_route(self.conn, "chat", cid, "h:q1", 1, delay_sec=0)
+        db.enqueue_route(self.conn, "form", 9, "h:q1", 1, delay_sec=0)
+        due = db.due_routes(self.conn)
+        self.assertEqual([int(r["chat_id"]) for r in due["chat"]], [1, 2, 3])
+        self.assertEqual([int(r["chat_id"]) for r in due["form"]], [9], "form e a cabeca da linha dele")
 
 
 if __name__ == "__main__":

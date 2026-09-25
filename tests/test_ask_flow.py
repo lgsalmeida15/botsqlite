@@ -185,7 +185,9 @@ class AskFlowTest(unittest.IsolatedAsyncioTestCase):
         textos = " | ".join(sock.sent_texts())
         self.assertIn("Registrei", textos)
         self.assertNotIn("transferindo", textos.lower())
-        self.assertIn("Nº 1", textos)
+        # Padrao do painel (`queue_show_pos=false`): avisa que AVANCOU, sem numero.
+        self.assertIn("avan", textos.lower())
+        self.assertNotIn("N\u00ba", textos)
         self.assertNotIn("move_chat", sock.names())
         self.assertFalse(db.chat_moved(conn, 10))
         self.assertIn("queued", events(conn))

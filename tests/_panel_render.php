@@ -12,6 +12,8 @@ declare(strict_types=1);
  */
 $page = preg_replace('/[^a-z_]/', '', (string) ($argv[1] ?? 'dashboard')) ?: 'dashboard';
 $userId = (int) ($argv[2] ?? 1);
+$extraQuery = (string) ($argv[3] ?? '');   // ex.: 'teams[]=1' (filtros da pagina)
+$dumpKey = (string) ($argv[4] ?? '');      // chave de $_SESSION para ecoar no fim
 
 // Nunca rodar contra o banco real: so com SQLITE_PATH explicito (temporario).
 if (getenv('SQLITE_PATH') === false || getenv('SQLITE_PATH') === '') {
@@ -23,14 +25,26 @@ if (getenv('SQLITE_PATH') === false || getenv('SQLITE_PATH') === '') {
 putenv('SQLITE_PATH_OVERRIDE=' . (string) getenv('SQLITE_PATH'));
 
 // Sessao fixa e JA gravada: o session_start() do index.php reabre a mesma
-// sessao (sem warning de "sessao ja ativa") e o usuario chega logado.
-session_id('panelrender' . getmypid());
+// sessao (sem warning de "sessao ja ativa") e o usuario chega logado. O id pode
+// vir do ambiente para o teste simular DUAS requisicoes na mesma sessao.
+$sid = (string) getenv('PANEL_RENDER_SESSION');
+session_id($sid !== '' ? $sid : ('panelrender' . getmypid()));
 session_start();
 $_SESSION['bot_user_id'] = $userId;
 $_SESSION['csrf'] = 'teste-csrf';
 session_write_close();
 
 $_GET = ['page' => $page];
+if ($extraQuery !== '') {
+    $extras = [];
+    parse_str($extraQuery, $extras);
+    $_GET = array_merge($_GET, $extras);
+}
 $_SERVER['REQUEST_METHOD'] = 'GET';
 
 require __DIR__ . '/../php/index.php';
+
+// Eco da sessao (quando pedido): prova que o filtro ficou gravado no servidor.
+if ($dumpKey !== '' && array_key_exists($dumpKey, $_SESSION)) {
+    echo "\n<!-- session:" . $dumpKey . '=' . json_encode($_SESSION[$dumpKey]) . " -->\n";
+}

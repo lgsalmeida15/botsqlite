@@ -215,7 +215,7 @@ class FormRouteTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("form_no_agent", events(conn), "fila ligada: nao e falha")
         espera = [r for r in routes(conn, "waiting") if r["kind"] == "form"]
         self.assertEqual(len(espera), 1)
-        self.assertIsNotNone(espera[0]["expires_at"], "espera com vencimento")
+        self.assertIsNone(espera[0]["expires_at"], "espera sem prazo (nao vence sozinha)")
 
     async def test_form_sem_elegivel_com_fila_desligada_marca_falha(self):
         eng, conn, _sock = self._eng(online=[])
