@@ -143,16 +143,17 @@ def routes(conn, status: str | None = None) -> list[dict]:
 
 
 class FormAwareSchemaTest(unittest.TestCase):
-    def test_schema_tem_vinculo_rota_presa_e_textos(self):
+    """Colunas legadas do vinculo chat<->formulario (a abertura foi REMOVIDA)."""
+
+    def test_schema_mantem_colunas_e_limpa_os_textos(self):
         conn = mem_conn()
         self.assertIn("linked_form_chat_id", db._table_columns(conn, "chats"))
         self.assertIn("expects_owner", db._table_columns(conn, "pending_routes"))
-        pend = db.templates(conn)["form_pending"]
-        self.assertIn("1) Falar sobre o formulário", pend)
-        self.assertIn("2) Abrir o menu", pend)
-        self.assertIn("\n", pend, "quebra de linha de verdade, não \\n literal")
+        textos = db.templates(conn)
+        for slug in ("form_pending", "form_pending_wait", "form_waiting"):
+            self.assertNotIn(slug, textos, "texto da abertura removida nao pode ficar no banco")
 
-    def test_migracao_em_base_antiga(self):
+    def test_migracao_em_base_antiga_remove_textos_e_e_idempotente(self):
         conn = sqlite3.connect(":memory:")
         conn.row_factory = db._dict_factory
         conn.isolation_level = None
@@ -161,12 +162,16 @@ class FormAwareSchemaTest(unittest.TestCase):
             "CREATE TABLE pending_routes (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, chat_id INTEGER);"
             "CREATE TABLE templates (slug TEXT PRIMARY KEY, body TEXT NOT NULL DEFAULT '');"
         )
+        # Banco antigo: os textos da abertura estao gravados (com o literal antigo).
+        conn.execute("INSERT INTO templates (slug, body) VALUES ('form_pending', 'linha1\\nlinha2')")
+        conn.execute("INSERT INTO templates (slug, body) VALUES ('greeting', 'Ola')")
         db._migrate_form_aware(conn)
         self.assertIn("linked_form_chat_id", db._table_columns(conn, "chats"))
         self.assertIn("expects_owner", db._table_columns(conn, "pending_routes"))
-        self.assertEqual(len(conn.execute("SELECT 1 FROM templates").fetchall()), 3)
+        restantes = [r["slug"] for r in conn.execute("SELECT slug FROM templates").fetchall()]
+        self.assertEqual(restantes, ["greeting"], "so os textos da abertura saem do banco")
         db._migrate_form_aware(conn)
-        self.assertEqual(len(conn.execute("SELECT 1 FROM templates").fetchall()), 3)
+        self.assertEqual(len(conn.execute("SELECT 1 FROM templates").fetchall()), 1)
 
 
 class CorrelationTest(unittest.TestCase):
@@ -299,24 +304,6 @@ class FormAwareEngineTest(unittest.IsolatedAsyncioTestCase):
         eng.cfg["form_route_retry_interval_sec"] = "0"
         return eng, conn, sock
 
-    async def test_abertura_oferece_1_ou_2_e_mostra_o_analista(self):
-        eng, conn, sock = self._eng()
-        await eng.consider(form_agente())
-        self.assertEqual(assignment(conn, 99)["assignee"], ANA)
-        await eng.consider(queue_chat())
-        row = chat_row(conn)
-        self.assertEqual(row["status"], "awaiting_form_choice")
-        self.assertEqual(int(row["linked_form_chat_id"]), 99)
-        self.assertIn("form_aware_greeting", events(conn))
-        self.assertIn("case_linked", events(conn))
-        texto = sock.sent_texts()[-1]
-        self.assertIn("1) Falar sobre o formulário", texto)
-        self.assertIn("2) Abrir o menu", texto)
-        self.assertIn("Ana", texto)
-        # caso unico: o ledger do formulario passa a ter a chave do tecnico
-        self.assertEqual(assignment(conn, 99)["case_key"], CASO_TEC)
-        self.assertEqual(assignment(conn, 99)["requester_addr"], TEC)
-
     async def test_sem_formulario_o_menu_normal_continua(self):
         eng, conn, sock = self._eng()
         await eng.consider(queue_chat())
@@ -325,110 +312,6 @@ class FormAwareEngineTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("menu_sent", events(conn))
         self.assertNotIn("form_aware_greeting", events(conn))
         self.assertIn("Digite o número da opção:", sock.sent_texts()[-1])
-
-    async def test_form_vazio_mostra_aguardando_atendimento(self):
-        eng, conn, sock = self._eng()
-        await eng.consider(form_agente())
-        db.assign_close(conn, 99, "teste")  # formulario sem dono agora
-        await eng.consider(queue_chat())
-        texto = sock.sent_texts()[-1]
-        self.assertIn("aguardando atendimento", texto)
-        self.assertNotIn("com Ana", texto)
-
-    async def test_ramo_2_abre_o_menu_normal(self):
-        eng, conn, sock = self._eng()
-        await eng.consider(form_agente())
-        await eng.consider(queue_chat())
-        await eng.handle_reply(10, chat_row(conn), "2")
-        row = chat_row(conn)
-        self.assertEqual(row["status"], "awaiting_reply")
-        self.assertIn("form_aware_choice", events(conn))
-        self.assertIn("Digite o número da opção:", sock.sent_texts()[-1])
-        self.assertNotIn(10, sock.moved_chats())
-
-    async def test_ramo_1_encaminha_para_o_analista_do_formulario(self):
-        eng, conn, sock = self._eng()
-        await eng.consider(form_agente())
-        await eng.consider(queue_chat())
-        await eng.handle_reply(10, chat_row(conn), "1")
-        self.assertEqual(sock.last("move_chat")["chat_id"], 10)
-        self.assertEqual(sock.last("invite_to_chat")["address"], ANA)
-        self.assertEqual(chat_row(conn)["status"], "closed")
-        caso = assignment(conn, 10)
-        self.assertEqual(caso["assignee"], ANA)
-        self.assertEqual(caso["case_key"], CASO_TEC)
-        self.assertIn("transferred", events(conn))
-
-    async def test_autor_das_mensagens_fecha_o_vinculo_e_o_caso(self):
-        """Sem address no payload: o autor das mensagens une chat e formulário.
-
-        O técnico escreve no formulário, então o autor é a identidade que falta no
-        payload do `message_scenario`. Com ela o vínculo deixa de ser palpite
-        (`regra=autor`) e o caso é unificado de verdade.
-        """
-        eng, conn, sock = self._eng()
-        await eng.consider(form_agente())
-        sock.msgs[99] = [
-            {"author": "CREATEDBYMESSAGESCENARIO", "text": "cenario", "time": 1},
-            {"author": TEC, "text": "validando", "time": 2},
-        ]
-        await eng.consider(queue_chat())
-        self.assertEqual(chat_row(conn)["status"], "awaiting_form_choice")
-        detalhe = conn.execute(
-            "SELECT detail FROM bot_events WHERE reason = 'case_linked' ORDER BY id DESC LIMIT 1"
-        ).fetchone()["detail"]
-        self.assertIn("regra=autor", detalhe)
-        self.assertEqual(assignment(conn, 99)["case_key"], CASO_TEC, "caso unico")
-        self.assertNotIn("case_link_unconfirmed", events(conn))
-
-    async def test_form_de_outro_tecnico_nao_e_vinculado(self):
-        """Palpite por fila com identidade de OUTRO técnico: recusa e abre o menu."""
-        eng, conn, _sock = self._eng()
-        outro = "u:outro@claro.com"
-        await eng.consider(
-            form_agente(
-                started_addr=outro,
-                participants={outro: {"address": outro, "name": "Tecnico Outro", "present": True}},
-            )
-        )
-        await eng.consider(queue_chat())
-        self.assertEqual(chat_row(conn)["status"], "awaiting_reply")
-        self.assertNotIn("form_aware_greeting", events(conn))
-        detalhe = conn.execute(
-            "SELECT detail FROM bot_events WHERE reason = 'form_aware_skip' ORDER BY id DESC LIMIT 1"
-        ).fetchone()["detail"]
-        self.assertIn("chat de", detalhe)
-
-    async def test_form_ocioso_nao_e_oferecido(self):
-        """Formulário sem mensagem nova há mais que a janela: não é oferecido."""
-        eng, conn, sock = self._eng()
-        await eng.consider(form_agente())
-        eng.cfg["form_idle_offer_min"] = "30"
-        _envelhece_caso(conn)
-        sock.msgs[99] = [
-            {"author": "CREATEDBYMESSAGESCENARIO", "text": "cenario", "time": _ms_atras(120)},
-            {"author": TEC, "text": "validando", "time": _ms_atras(120)},
-        ]
-        await eng.consider(queue_chat())
-        self.assertEqual(chat_row(conn)["status"], "awaiting_reply")
-        self.assertNotIn("form_aware_greeting", events(conn))
-        detalhe = conn.execute(
-            "SELECT detail FROM bot_events WHERE reason = 'form_aware_skip' ORDER BY id DESC LIMIT 1"
-        ).fetchone()["detail"]
-        self.assertIn("ociosos=1", detalhe)
-
-    async def test_form_com_analista_dentro_nao_e_ocioso(self):
-        """Analista do time dentro mantém o formulário vivo, por mais tempo que passe."""
-        eng, conn, sock = self._eng()
-        await eng.consider(form_agente())
-        eng.cfg["form_idle_offer_min"] = "30"
-        sock.msgs[99] = [
-            {"author": "CREATEDBYMESSAGESCENARIO", "text": "cenario", "time": _ms_atras(180)},
-            {"author": ANA, "system_message": "user_joined", "time": _ms_atras(180)},
-        ]
-        await eng.consider(queue_chat())
-        self.assertEqual(chat_row(conn)["status"], "awaiting_form_choice")
-        self.assertIn("form_aware_greeting", events(conn))
 
     async def test_form_ocioso_fecha_o_caso_no_tick(self):
         """Ocioso além da janela de fechamento: sai do índice e o caso fecha."""
@@ -466,22 +349,6 @@ class FormAwareEngineTest(unittest.IsolatedAsyncioTestCase):
             "SELECT detail FROM bot_events WHERE reason = 'form_closed' ORDER BY id DESC LIMIT 1"
         ).fetchone()["detail"]
         self.assertIn("form_ocioso_analista", detalhe)
-
-    async def test_form_com_analista_recente_continua_vivo(self):
-        """Analista dentro e mensagem recente: não fecha e continua sendo oferecido."""
-        eng, conn, sock = self._eng()
-        await eng.consider(form_agente())
-        eng.cfg["form_idle_owner_close_min"] = "240"
-        eng.cfg["form_idle_offer_min"] = "30"
-        sock.msgs[99] = [
-            {"author": "CREATEDBYMESSAGESCENARIO", "text": "cenario", "time": _ms_atras(60)},
-            {"author": ANA, "system_message": "user_joined", "time": _ms_atras(60)},
-        ]
-        eng._form_checked[99] = 0.0
-        await eng._sweep_form_states()
-        self.assertIn(99, eng._open_forms)
-        await eng.consider(queue_chat())
-        self.assertEqual(chat_row(conn)["status"], "awaiting_form_choice")
 
     async def test_indice_descarta_formulario_de_caso_encerrado(self):
         """Caso encerrado de verdade: sai do índice (a varredura para de ler no TOA)."""
@@ -536,105 +403,6 @@ class FormAwareEngineTest(unittest.IsolatedAsyncioTestCase):
         await eng._sweep_form_states()
         self.assertNotIn(99, eng._open_forms)
 
-    async def test_ramo_1_sem_dono_espera_e_vai_junto_com_o_formulario(self):
-        eng, conn, sock = self._eng(online=())
-        await eng.consider(form_agente())
-        self.assertEqual(assignment(conn, 99), {})
-        self.assertIn("queued", events(conn), "fila ligada: espera a vez (nao e falha)")
-        await eng.consider(queue_chat())
-        await eng.handle_reply(10, chat_row(conn), "1")
-        self.assertIn("form_aware_wait", events(conn))
-        self.assertNotIn(10, sock.moved_chats(), "dono fora da janela: o chat nao e entregue")
-        self.assertEqual(chat_row(conn)["status"], "classified")
-        presa = [r for r in routes(conn, "waiting") if r["kind"] == "chat"]
-        self.assertEqual(len(presa), 1, "chat esperando o dono do caso")
-        self.assertEqual(int(presa[0]["expects_owner"]), 1)
-        self.assertEqual(presa[0]["case_key"], CASO_TEC)
-        self.assertIn("Em breve você será atendido", sock.sent_texts()[-1])
-        # o formulario foi assumido por Ana: o chat vai junto (caso unico)
-        sock.online = ["ana"]
-        await eng.tick_routes()
-        self.assertIn("case_sibling_delivered", events(conn))
-        self.assertEqual(assignment(conn, 10)["assignee"], ANA)
-        self.assertEqual(assignment(conn, 99)["assignee"], ANA)
-        self.assertEqual(routes(conn, "waiting"), [])
-
-    async def test_dono_fora_da_janela_o_chat_espera(self):
-        eng, conn, sock = self._eng()
-        await eng.consider(form_agente())
-        await eng.consider(queue_chat())
-        with mock.patch("python.engine._in_route_window", return_value=False):
-            await eng.handle_reply(10, chat_row(conn), "1")
-        self.assertIn("form_aware_wait", events(conn))
-        self.assertNotIn(10, sock.moved_chats(), "dono fora da janela: o chat nao e entregue")
-        presa = [r for r in routes(conn, "waiting") if r["kind"] == "chat"]
-        self.assertEqual(len(presa), 1)
-        self.assertEqual(int(presa[0]["expects_owner"]), 1)
-
-    async def test_formulario_ja_vinculado_nao_abre_para_outro_chat(self):
-        eng, conn, sock = self._eng()
-        await eng.consider(form_agente())
-        await eng.consider(queue_chat())  # chat 10 vincula o formulario 99
-        outro = "u:outro@claro.com"
-        await eng.consider(
-            queue_chat(chat_id=11, started_addr=outro, participants={outro: {"address": outro, "present": True}})
-        )
-        self.assertEqual(chat_row(conn, 11)["status"], "awaiting_reply")
-        self.assertEqual(chat_row(conn, 11)["linked_form_chat_id"], None)
-        self.assertEqual(events(conn).count("form_aware_greeting"), 1)
-
-    async def test_escolha_invalida_reenvia_as_opcoes(self):
-        eng, conn, sock = self._eng()
-        await eng.consider(form_agente())
-        await eng.consider(queue_chat())
-        eng.cfg["max_invalid_retries"] = "1"
-        await eng.handle_reply(10, chat_row(conn), "9")
-        row = chat_row(conn)
-        self.assertEqual(row["status"], "awaiting_form_choice")
-        self.assertEqual(int(row["retries"]), 1)
-        self.assertIn("ignored_reply", events(conn))
-        self.assertIn("1) Falar sobre o formulário", sock.sent_texts()[-1])
-        await eng.handle_reply(10, chat_row(conn), "9")
-        self.assertEqual(chat_row(conn)["status"], "closed_invalid")
-
-    async def test_chat_transferido_leva_o_formulario_junto(self):
-        """Peça irmã no outro sentido: a folha do menu entrega as duas juntas."""
-        eng, conn, sock = self._eng(online=())
-        await eng.consider(form_agente())  # formulario fica na fila (sem analista)
-        self.assertIn("queued", events(conn))
-        await eng.consider(queue_chat())
-        await eng.handle_reply(10, chat_row(conn), "2")  # abre o menu
-        sock.online = ["ana"]
-        await eng.handle_reply(10, chat_row(conn), "2")  # folha "Infra" = transferir
-        self.assertEqual(assignment(conn, 10)["assignee"], ANA)
-        self.assertEqual(assignment(conn, 99)["assignee"], ANA)
-        self.assertEqual(assignment(conn, 99)["case_key"], CASO_TEC)
-        self.assertIn("case_sibling_delivered", events(conn))
-        self.assertEqual(routes(conn, "waiting"), [])
-
-    async def test_ramo_1_sem_vinculo_nao_prende_o_chat(self):
-        """Estado antigo/limite: sem vinculo gravado, vale a rota normal."""
-        eng, conn, sock = self._eng()
-        await eng.consider(form_agente())
-        await eng.consider(queue_chat())
-        conn.execute("UPDATE chats SET linked_form_chat_id = NULL WHERE chat_id = 10")
-        await eng.handle_reply(10, chat_row(conn), "1")
-        self.assertEqual(chat_row(conn)["status"], "closed")
-        self.assertEqual(assignment(conn, 10)["assignee"], ANA)
-        self.assertNotIn(1, [int(r["expects_owner"] or 0) for r in routes(conn, "waiting")])
-
-    async def test_boot_reidrata_formularios_do_ledger(self):
-        eng, conn, sock = self._eng()
-        await eng.consider(form_agente())
-        eng._open_forms.clear()  # simula restart: o indice vive so em memoria
-        MEM.clear()
-        self.assertEqual(eng._hydrate_open_forms(), 1)
-        self.assertIn(99, eng._open_forms)
-        await eng.consider(queue_chat())
-        self.assertEqual(chat_row(conn)["status"], "awaiting_form_choice")
-        self.assertIn("form_aware_greeting", events(conn))
-
-
 class FormIndexRobustnessTest(unittest.IsolatedAsyncioTestCase):
     """P1/P2: o índice não pode perder (nem nunca receber) formulário vivo."""
 
@@ -683,19 +451,6 @@ class FormIndexRobustnessTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn(99, eng._open_forms, "payload pobre nao pode descartar o formulario")
         self.assertIn("form_ignored_payload", events(conn))
 
-    async def test_helpdesk_chat_removed_mantem_o_formulario(self):
-        """O `move_chat` para o analista gera esse aviso: o formulário segue aberto."""
-        eng, conn, sock = self._eng()
-        await eng.consider(form_agente())
-        await eng.on_note("helpdesk_chat_removed", {"chat_id": 99})
-        self.assertIn(99, eng._open_forms)
-        self.assertIn("form_queue_left", events(conn))
-        # e a abertura continua funcionando depois do aviso de fila
-        await eng.consider(queue_chat())
-        self.assertEqual(chat_row(conn)["status"], "awaiting_form_choice")
-        self.assertIn("form_aware_greeting", events(conn))
-        self.assertNotIn(10, [p["chat_id"] for n, p in sock.cmds if n == "move_chat"])
-
     async def test_chat_removed_tira_do_indice_com_motivo(self):
         eng, conn, _sock = self._eng()
         await eng.consider(form_agente())
@@ -705,32 +460,6 @@ class FormIndexRobustnessTest(unittest.IsolatedAsyncioTestCase):
             "SELECT detail FROM bot_events WHERE reason = 'form_forget' ORDER BY id DESC LIMIT 1"
         ).fetchone()["detail"]
         self.assertIn("chat_removed", detalhe)
-
-    async def test_form_aware_skip_registra_o_diagnostico(self):
-        eng, conn, _sock = self._eng()
-        # formulário de OUTRA fila: existe índice, mas não casa com este chat
-        await eng.consider(form_agente(helpdesk_address="h:outra"))
-        await eng.consider(queue_chat())
-        self.assertEqual(chat_row(conn)["status"], "awaiting_reply")
-        detalhe = conn.execute(
-            "SELECT detail FROM bot_events WHERE reason = 'form_aware_skip' ORDER BY id DESC LIMIT 1"
-        ).fetchone()["detail"]
-        self.assertIn("abertos=1", detalhe)
-        self.assertIn("na_fila=0", detalhe)
-
-    async def test_candidato_encerrado_no_ledger_e_descartado(self):
-        eng, conn, _sock = self._eng()
-        await eng.consider(form_agente())
-        db.assign_close(conn, 99, "form_done")  # formulário encerrado de verdade
-        await eng.consider(queue_chat())
-        self.assertEqual(chat_row(conn)["status"], "awaiting_reply", "sem abertura")
-        # O índice descarta de vez: antes só contava em `encerrados=` e a varredura
-        # continuava lendo no TOA um formulário que a abertura já ignorava.
-        self.assertNotIn(99, eng._open_forms)
-        detalhe = conn.execute(
-            "SELECT detail FROM bot_events WHERE reason = 'form_forget' ORDER BY id DESC LIMIT 1"
-        ).fetchone()["detail"]
-        self.assertIn("caso_encerrado", detalhe)
 
     async def test_varredura_de_boot_nao_fecha_caso_de_formulario(self):
         eng, conn, _sock = self._eng()
@@ -770,40 +499,6 @@ class FormStateTest(unittest.IsolatedAsyncioTestCase):
         return {"chat_id": cid, "author": autor, "text": text, "time": 1700000000}
 
     # --- passos 1 e 2: estados do formulario -----------------------------
-    async def test_analista_saiu_marca_formulario_passado(self):
-        eng, conn, sock = self._eng()
-        await eng.consider(form_agente())
-        sock.msgs[99] = [
-            {"author": "CREATEDBYMESSAGESCENARIO", "text": "cenario", "time": 1},
-            {"author": ANA, "system_message": "user_joined", "time": 2},
-            {"author": ANA, "system_message": "user_left", "time": 3},
-        ]
-        await eng.consider(queue_chat())
-        self.assertEqual(chat_row(conn)["status"], "awaiting_reply", "passado nao abre")
-        self.assertNotIn(99, eng._open_forms)
-        self.assertEqual(db.form_case_state(conn, 99), "done")
-        self.assertIn("form_closed", events(conn))
-        self.assertIn("form_state", events(conn))
-
-    async def test_analista_entrou_ainda_abre(self):
-        eng, conn, sock = self._eng()
-        await eng.consider(form_agente())
-        sock.msgs[99] = [
-            {"author": "CREATEDBYMESSAGESCENARIO", "text": "cenario", "time": 1},
-            {"author": ANA, "system_message": "user_joined", "time": 2},
-        ]
-        await eng.consider(queue_chat())
-        self.assertEqual(chat_row(conn)["status"], "awaiting_form_choice")
-        detalhe = conn.execute(
-            "SELECT detail FROM bot_events WHERE reason = 'form_state' ORDER BY id DESC LIMIT 1"
-        ).fetchone()["detail"]
-        self.assertIn("estado=doing", detalhe)
-
-    async def test_sem_mensagem_no_toa_nao_derruba_o_formulario(self):
-        eng, conn, _sock = self._eng()
-        await eng.consider(form_agente())
-        await eng.consider(queue_chat())  # TOA sem historico: nao decide
-        self.assertEqual(chat_row(conn)["status"], "awaiting_form_choice")
 
     async def test_boot_descarta_formulario_passado(self):
         eng, conn, sock = self._eng()
@@ -824,37 +519,8 @@ class FormStateTest(unittest.IsolatedAsyncioTestCase):
 
 
     # --- passo 3: nunca oferecer duas vezes ------------------------------
-    async def test_formulario_ja_oferecido_nao_repete_em_chat_posterior(self):
-        eng, conn, _sock = self._eng()
-        await eng.consider(form_agente())
-        await eng.consider(queue_chat())  # chat 10 vincula
-        self.assertEqual(chat_row(conn)["status"], "awaiting_form_choice")
-        # tecnico saiu do chat e abriu outro (era o falso positivo de 22/09)
-        db.upsert_chat(conn, 10, status="closed_originator_left")
-        await eng.consider(queue_chat(chat_id=11))
-        self.assertEqual(chat_row(conn, 11)["status"], "awaiting_reply", "segundo chat cai no menu")
-        self.assertEqual(events(conn).count("form_aware_greeting"), 1)
 
     # --- passo 5: a resposta do tecnico chega pelo caminho real ----------
-    async def test_1_pelo_caminho_real_transfere_para_o_analista(self):
-        eng, conn, sock = self._eng()
-        await eng.consider(form_agente())
-        await eng.consider(queue_chat())
-        await eng.on_note("message_received", self._msg("1"))
-        self.assertEqual(sock.last("invite_to_chat")["address"], ANA)
-        self.assertIn(10, sock.moved_chats())
-        self.assertEqual(chat_row(conn)["status"], "closed")
-        self.assertIn("form_aware_choice", events(conn))
-        self.assertIsNotNone(chat_row(conn)["last_reply_at"], "a resposta tem que marcar atividade")
-
-    async def test_2_pelo_caminho_real_abre_o_menu(self):
-        eng, conn, sock = self._eng()
-        await eng.consider(form_agente())
-        await eng.consider(queue_chat())
-        await eng.on_note("message_received", self._msg("2"))
-        self.assertEqual(chat_row(conn)["status"], "awaiting_reply")
-        self.assertIn("Digite o número da opção:", sock.sent_texts()[-1])
-        self.assertIn("form_aware_choice", events(conn))
 
     async def test_mensagem_em_status_nao_tratado_registra_evento(self):
         eng, conn, _sock = self._eng()
@@ -869,18 +535,7 @@ class FormStateTest(unittest.IsolatedAsyncioTestCase):
 
 
 class TemplateRepairTest(unittest.TestCase):
-    """Passo 4: template gravado com barra+n volta a ter quebra de linha."""
-
-    def test_reparo_converte_newline_literal(self):
-        conn = mem_conn()
-        conn.execute(
-            "UPDATE templates SET body = ? WHERE slug = 'form_pending'",
-            ("linha1\\nlinha2\\nlinha3",),
-        )
-        db._migrate_form_aware(conn)
-        corpo = conn.execute("SELECT body FROM templates WHERE slug = 'form_pending'").fetchone()["body"]
-        self.assertNotIn("\\n", corpo)
-        self.assertEqual(corpo, "linha1\nlinha2\nlinha3")
+    """Os textos do fluxo normal nao podem ter barra+n literal (seed com char(10))."""
 
     def test_sementes_nao_tem_newline_literal(self):
         conn = mem_conn()

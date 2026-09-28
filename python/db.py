@@ -57,6 +57,7 @@ def ensure_schema(conn) -> None:
     _migrate_case_keys(conn)
     _migrate_load(conn)
     _migrate_kinds(conn)
+    _migrate_jobs(conn)
 
 
 def _table_columns(conn, table: str) -> set[str]:
@@ -307,6 +308,8 @@ def _migrate_delivery(conn) -> None:
         ("claimed_by", "claimed_by TEXT NOT NULL DEFAULT ''"),
         ("claimed_at", "claimed_at TEXT"),
         ("claim_expires_at", "claim_expires_at TEXT"),
+        # Resgate por analista offline: alvo que nao pode receber o caso de volta.
+        ("exclude_assignee", "exclude_assignee TEXT NOT NULL DEFAULT ''"),
     ):
         if name not in cols:
             conn.execute(f"ALTER TABLE pending_routes ADD COLUMN {ddl}")
@@ -330,28 +333,13 @@ def _migrate_delivery(conn) -> None:
     )
 
 
-# Textos da abertura form-aware. Ficam aqui (e no schema.sql) porque bancos
-# antigos precisam dos slugs novos sem reexecutar o schema inteiro.
-FORM_AWARE_TEMPLATES = (
-    (
-        "form_pending",
-        "Você tem um formulário de validação em andamento com {analista}."
-        + chr(10) + chr(10) + "Digite o número da opção:"
-        + chr(10) + "1) Falar sobre o formulário"
-        + chr(10) + "2) Abrir o menu",
-    ),
-    (
-        "form_pending_wait",
-        "Você tem um formulário de validação aguardando atendimento."
-        + chr(10) + chr(10) + "Digite o número da opção:"
-        + chr(10) + "1) Falar sobre o formulário"
-        + chr(10) + "2) Abrir o menu",
-    ),
-    (
-        "form_waiting",
-        "Assim que um analista assumir a sua validação, eu encaminho este chat para ele."
-        " Em breve você será atendido.",
-    ),
+# Textos da abertura form-aware REMOVIDA (28/09): a migracao apaga estes slugs
+# porque a oferta "1) falar sobre o formulario / 2) abrir o menu" nao existe mais.
+# Sao as mesmas chaves usadas por `db._migrate_form_aware` e `bot_migrate_form_aware`.
+_FORM_AWARE_TEMPLATE_SLUGS = (
+    "form_pending",
+    "form_pending_wait",
+    "form_waiting",
 )
 
 
@@ -414,6 +402,8 @@ def _migrate_kinds(conn) -> None:
     tabelas = _table_names(conn)
     if "team_routing" in tabelas and "member_kinds" not in _table_columns(conn, "team_routing"):
         conn.execute("ALTER TABLE team_routing ADD COLUMN member_kinds TEXT")
+    if "team_routing" in tabelas and "offline_requeue_sec" not in _table_columns(conn, "team_routing"):
+        conn.execute("ALTER TABLE team_routing ADD COLUMN offline_requeue_sec INTEGER")
     if "team_member_routing" in tabelas and "kinds" not in _table_columns(conn, "team_member_routing"):
         conn.execute(
             "ALTER TABLE team_member_routing ADD COLUMN kinds TEXT NOT NULL DEFAULT 'both'"
@@ -479,6 +469,20 @@ def _migrate_load(conn) -> None:
         conn.execute(
             "ALTER TABLE analyst_load ADD COLUMN casos_toa_keys TEXT NOT NULL DEFAULT ''"
         )
+    # Presenca persistida (resgate por analista offline): `online_ok` separa
+    # "leitura falhou" de "esta offline" e `offline_since` carimba o comeco.
+    if "analyst_load" in _table_names(conn):
+        cols = _table_columns(conn, "analyst_load")
+        if "online_ok" not in cols:
+            conn.execute("ALTER TABLE analyst_load ADD COLUMN online_ok INTEGER NOT NULL DEFAULT 0")
+        if "offline_since" not in cols:
+            conn.execute("ALTER TABLE analyst_load ADD COLUMN offline_since TEXT")
+
+
+def _migrate_jobs(conn) -> None:
+    """`bot_jobs.payload`: parametro do pedido do painel (ex.: requeue_offline)."""
+    if "bot_jobs" in _table_names(conn) and "payload" not in _table_columns(conn, "bot_jobs"):
+        conn.execute("ALTER TABLE bot_jobs ADD COLUMN payload TEXT NOT NULL DEFAULT ''")
 
 
 def load_reading(conn, address: str, fresh_sec: float = 90.0) -> dict | None:
@@ -517,7 +521,7 @@ def load_case_keys(row: dict | None) -> set[str]:
 def load_upsert(conn, address: str, **campos) -> None:
     """Grava a leitura atual do analista (uma linha por endereco)."""
     base = {
-        "name": "", "team_id": None, "janela": "", "online": 0, "chats_toa": 0, "forms_toa": 0,
+        "name": "", "team_id": None, "janela": "", "online": 0, "online_ok": 0, "chats_toa": 0, "forms_toa": 0,
         "chats_ledger": 0, "forms_ledger": 0, "reservas": 0, "casos_total": 0,
         "form_ocioso_min": 0.0, "form_presente_toa": 0, "toa_ok": 0, "casos_toa_keys": "",
         "detail": "",
@@ -532,6 +536,54 @@ def load_upsert(conn, address: str, **campos) -> None:
               {', '.join(f'{k} = excluded.{k}' for k in base)}""",
         [str(address)] + list(base.values()),
     )
+
+
+def set_presence(conn, address: str, *, online: bool, online_ok: bool) -> None:
+    """Carimba a presenca do analista (base do resgate por ausencia).
+
+    `online_ok=False` = a leitura do `get_online_users` falhou: nao da para
+    afirmar que o analista esta offline, entao o carimbo nao e criado nem
+    apagado (o resgate exige `online_ok=1`). Com leitura boa, o carimbo nasce na
+    PRIMEIRA vez que ele aparece offline e e limpo quando ele volta.
+    """
+    if not online_ok:
+        conn.execute(
+            "UPDATE analyst_load SET online = 0, online_ok = 0 WHERE address = ?",
+            (str(address),),
+        )
+        return
+    if online:
+        conn.execute(
+            "UPDATE analyst_load SET online = 1, online_ok = 1, offline_since = NULL WHERE address = ?",
+            (str(address),),
+        )
+        return
+    conn.execute(
+        "UPDATE analyst_load SET online = 0, online_ok = 1,"
+        " offline_since = COALESCE(offline_since, datetime('now')) WHERE address = ?",
+        (str(address),),
+    )
+
+
+def offline_open_assignments(conn, min_offline_sec: float) -> list[dict]:
+    """Casos ABERTOS no ledger cujo analista esta offline ha `min_offline_sec`.
+
+    Exige leitura de presenca BOA (`online_ok=1`): queda do TOA nao devolve caso
+    de ninguem. Ordem do ledger (FIFO) para o resgate respeitar a vez.
+    """
+    return conn.execute(
+        """SELECT a.*, l.offline_since, l.at AS load_at
+             FROM route_assignments a
+             JOIN analyst_load l ON l.address = a.assignee
+            WHERE a.closed_at IS NULL
+              AND a.assignee <> ''
+              AND l.online_ok = 1
+              AND l.online = 0
+              AND l.offline_since IS NOT NULL
+              AND datetime(l.offline_since) <= datetime('now', '-' || ? || ' seconds')
+            ORDER BY a.id""",
+        (str(int(max(min_offline_sec, 0))),),
+    ).fetchall()
 
 
 def load_trim_history(conn, keep: int = 200) -> int:
@@ -581,12 +633,12 @@ def load_history(conn, address: str | None = None, limit: int = 60) -> list[dict
 
 
 def _migrate_form_aware(conn) -> None:
-    """Abertura form-aware: vinculo chat<->formulario e rota presa ao dono do caso.
+    """Colunas legadas do vinculo chat<->formulario + limpeza dos textos.
 
-    - `chats.linked_form_chat_id`: o chat do tecnico sabe qual formulario e o dele;
-    - `pending_routes.expects_owner`: a rota do chat do ramo 1 so entrega ao dono
-      do caso (analista que atende o formulario) e, sem dono, apenas espera;
-    - templates novos da abertura (aba Templates).
+    A abertura form-aware foi **removida** (28/09): o chat de fila sempre recebe o
+    menu. As colunas ficam (bancos antigos ja as tem e o painel le
+    `linked_form_chat_id`) e os textos da oferta saem do banco, porque nao tem
+    mais uso.
     """
     if "chats" in _table_names(conn):
         cols = _table_columns(conn, "chats")
@@ -597,21 +649,8 @@ def _migrate_form_aware(conn) -> None:
         if "expects_owner" not in cols:
             conn.execute("ALTER TABLE pending_routes ADD COLUMN expects_owner INTEGER NOT NULL DEFAULT 0")
     if "templates" in _table_names(conn):
-        for slug, body in FORM_AWARE_TEMPLATES:
-            conn.execute(
-                "INSERT OR IGNORE INTO templates (slug, body) VALUES (?, ?)",
-                (slug, body),
-            )
-        # Reparo: a PRIMEIRA versao da semente usava "\n" dentro da string SQL —
-        # e SQLite nao interpreta escape, entao gravou barra+n em vez de quebra
-        # de linha. Como o seed e INSERT OR IGNORE, a linha errada nunca era
-        # corrigida. Aqui convertemos (idempotente: so onde existe o literal).
-        conn.execute(
-            "UPDATE templates SET body = replace(body, ?, char(10))"
-            " WHERE slug IN ('form_pending', 'form_pending_wait', 'form_waiting')"
-            " AND instr(body, ?) > 0",
-            ("\\n", "\\n"),
-        )
+        for slug in _FORM_AWARE_TEMPLATE_SLUGS:
+            conn.execute("DELETE FROM templates WHERE slug = ?", (slug,))
 
 
 @contextmanager
@@ -654,6 +693,36 @@ def menu_option(conn, option_id: int | None) -> dict | None:
     if not option_id:
         return None
     return conn.execute("SELECT * FROM menu_options WHERE id = ?", (int(option_id),)).fetchone()
+
+
+def queue_menu_options(conn, queue_address: str | None) -> list[dict]:
+    """Opções-RAIZ do menu ATIVO da fila — sem os fallbacks globais.
+
+    `menu_options` cai num menu global (opções sem `menu_id`/`queue_address`)
+    quando a fila não tem menu: bom para não deixar o técnico sem opção, mas não
+    serve para responder "esta fila TEM menu ativo?". Este é o teste usado no
+    portão de entrada do bot (fila habilitada sem menu ativo não é assumida) e na
+    trava da aba Filas.
+    """
+    if not queue_address:
+        return []
+    rows = conn.execute(
+        """SELECT o.*
+           FROM menu_options o
+           JOIN menus m ON m.id = o.menu_id
+           JOIN menu_queues mq ON mq.menu_id = m.id
+           WHERE mq.queue_address = ? AND m.active = 1 AND o.parent_id IS NULL
+           ORDER BY o.sort_order""",
+        (queue_address,),
+    ).fetchall()
+    if rows:
+        return rows
+    return conn.execute(
+        """SELECT * FROM menu_options
+           WHERE queue_address = ? AND parent_id IS NULL
+           ORDER BY sort_order""",
+        (queue_address,),
+    ).fetchall()
 
 
 def menu_options(conn, queue_address: str | None, parent_id: int | None = None) -> list[dict]:
@@ -884,7 +953,7 @@ def awaiting_timeouts(conn, seconds: int | None = None) -> list[dict]:
     """
     sql = """SELECT * FROM chats
              WHERE status IN ('awaiting_reply', 'awaiting_script_answer',
-                              'awaiting_script_confirm', 'awaiting_form_choice')
+                              'awaiting_script_confirm')
                AND last_prompt_at IS NOT NULL"""
     args: list = []
     if seconds is not None:
@@ -895,7 +964,7 @@ def awaiting_timeouts(conn, seconds: int | None = None) -> list[dict]:
 
 def resume_chats(conn) -> list[dict]:
     return conn.execute(
-        "SELECT * FROM chats WHERE status IN ('joined', 'menu_sent', 'awaiting_reply', 'classified', 'monitoring', 'awaiting_script_answer', 'awaiting_script_confirm', 'awaiting_script_run', 'awaiting_form_choice')"
+        "SELECT * FROM chats WHERE status IN ('joined', 'menu_sent', 'awaiting_reply', 'classified', 'monitoring', 'awaiting_script_answer', 'awaiting_script_confirm', 'awaiting_script_run')"
     ).fetchall()
 
 
@@ -992,15 +1061,18 @@ def enqueue_route(
     delay_sec: float = 60.0,
     expires_at: str | None = None,
     expects_owner: bool = False,
+    exclude_assignee: str = "",
 ) -> int:
     cur = conn.execute(
         """INSERT INTO pending_routes
-             (kind, chat_id, queue_address, team_id, next_try_at, detail, expires_at, expects_owner)
-           VALUES (?, ?, ?, ?, datetime('now', '+' || ? || ' seconds'), ?, ?, ?)""",
+             (kind, chat_id, queue_address, team_id, next_try_at, detail, expires_at, expects_owner,
+              exclude_assignee)
+           VALUES (?, ?, ?, ?, datetime('now', '+' || ? || ' seconds'), ?, ?, ?, ?)""",
         (
             str(kind), int(chat_id), queue_address, team_id,
             str(max(int(delay_sec), 0)), detail or "", (expires_at or None),
             1 if expects_owner else 0,
+            str(exclude_assignee or ""),
         ),
     )
     return int(cur.lastrowid)
@@ -1310,6 +1382,7 @@ def set_delivery_marks(
     case_key: str | None = None,
     requester_addr: str | None = None,
     team_id: int | None = None,
+    exclude_assignee: str | None = None,
 ) -> None:
     """Grava a intencao da entrega (alvo/caso) e a marca do move ja enviado."""
     if not route_id:
@@ -1330,6 +1403,9 @@ def set_delivery_marks(
     if team_id is not None:
         sets.append("team_id = ?")
         args.append(int(team_id))
+    if exclude_assignee is not None:
+        sets.append("exclude_assignee = ?")
+        args.append(str(exclude_assignee or ""))
     if not sets:
         return
     args.append(int(route_id))

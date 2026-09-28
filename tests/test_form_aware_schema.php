@@ -36,14 +36,11 @@ $tpl = [];
 foreach ($pdo->query('SELECT slug, body FROM templates') as $r) {
     $tpl[$r['slug']] = $r['body'];
 }
-ok(isset($tpl['form_pending']), 'template form_pending');
-ok(isset($tpl['form_pending_wait']), 'template form_pending_wait');
-ok(isset($tpl['form_waiting']), 'template form_waiting');
-ok(strpos($tpl['form_pending'], '1) Falar sobre o formulário') !== false, 'form_pending traz a opcao 1');
-ok(strpos($tpl['form_pending'], '2) Abrir o menu') !== false, 'form_pending traz a opcao 2');
-ok(strpos($tpl['form_pending'], "\n") !== false, 'form_pending tem quebra de linha de verdade');
-ok(strpos($tpl['form_pending'], '{analista}') !== false, 'form_pending aceita {analista}');
-ok(strpos($tpl['form_pending_wait'], '{analista}') === false, 'form_pending_wait nao usa {analista}');
+// A abertura form-aware foi REMOVIDA: as colunas legadas ficam, os textos saem.
+ok(!isset($tpl['form_pending']), 'template form_pending removido do banco');
+ok(!isset($tpl['form_pending_wait']), 'template form_pending_wait removido do banco');
+ok(!isset($tpl['form_waiting']), 'template form_waiting removido do banco');
+ok(isset($tpl['greeting']) && isset($tpl['menu']), 'templates do fluxo normal seguem no banco');
 
 // O vinculo do chat aceita NULL (chat sem formulario) e o valor do formulario.
 $pdo->exec("INSERT INTO chats (chat_id, status) VALUES (10, 'awaiting_form_choice')");
@@ -67,11 +64,11 @@ ok(
     'expects_owner nasce 0'
 );
 
-// Idempotencia: a migracao roda de novo sem duplicar template nem coluna.
+// Idempotencia: a migracao roda de novo sem recriar texto nenhum da abertura.
 bot_migrate_form_aware($pdo);
 ok(
-    (int) $pdo->query("SELECT COUNT(*) FROM templates WHERE slug = 'form_pending'")->fetchColumn() === 1,
-    'migracao idempotente (nao duplica template)'
+    (int) $pdo->query("SELECT COUNT(*) FROM templates WHERE slug = 'form_pending'")->fetchColumn() === 0,
+    'migracao idempotente (texto da abertura nao volta)'
 );
 
 // Janela de vida do formulario (o TOA nao avisa a saida do analista): as duas
@@ -87,13 +84,12 @@ ok(
     'form_idle_owner_close_min nasce 240 (formulario parado COM analista dentro)'
 );
 
-// Reparo do literal barra+n: a primeira versao da semente gravou assim (SQLite
-// nao interpreta escape) e o INSERT OR IGNORE nunca corrigia.
-$pdo->prepare("UPDATE templates SET body = ? WHERE slug = 'form_pending'")->execute(['linha1\nlinha2']);
+// Banco antigo: o texto da abertura volta a ser gravado e a migracao o remove.
+$pdo->prepare("INSERT OR REPLACE INTO templates (slug, body) VALUES ('form_pending', ?)")
+    ->execute(['linha1' . "\n" . 'linha2']);
 bot_migrate_form_aware($pdo);
-$corpo = (string) $pdo->query("SELECT body FROM templates WHERE slug = 'form_pending'")->fetchColumn();
-ok(strpos($corpo, "\n") !== false, 'reparo: grava quebra de linha real');
-ok(strpos($corpo, '\\' . 'n') === false, 'reparo: nao sobra barra+n literal');
+$sobraram = (int) $pdo->query("SELECT COUNT(*) FROM templates WHERE slug = 'form_pending'")->fetchColumn();
+ok($sobraram === 0, 'migracao remove o texto da abertura de banco antigo');
 
 // Reparo do dialeto legado da chave de caso: `u:...` (address sem prefixo `a:`)
 // passa a casar na afinidade — antes o caso aberto no dialeto antigo ficava

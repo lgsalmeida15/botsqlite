@@ -29,7 +29,7 @@ $pdo->exec('PRAGMA foreign_keys = ON');
 bot_ensure_schema($pdo);
 
 $cols = bot_table_columns($pdo, 'pending_routes');
-foreach (['case_key', 'requester_addr', 'invite_target', 'move_sent_at', 'move_fails', 'claimed_by', 'claim_expires_at'] as $c) {
+foreach (['case_key', 'requester_addr', 'invite_target', 'move_sent_at', 'move_fails', 'claimed_by', 'claim_expires_at', 'exclude_assignee'] as $c) {
     ok(isset($cols[$c]), "pending_routes.$c criada");
 }
 ok((int) $pdo->query('SELECT move_fails FROM pending_routes LIMIT 1')->fetchColumn() === 0, 'move_fails nasce 0');
@@ -37,6 +37,10 @@ $pdo->exec("INSERT INTO pending_routes (kind, chat_id) VALUES ('form', 991)");
 ok(
     (int) $pdo->query('SELECT move_fails FROM pending_routes WHERE chat_id = 991')->fetchColumn() === 0,
     'move_fails nasce 0 na rota nova'
+);
+ok(
+    (string) $pdo->query('SELECT exclude_assignee FROM pending_routes WHERE chat_id = 991')->fetchColumn() === '',
+    'exclude_assignee nasce vazio (rota normal entrega para qualquer elegivel)'
 );
 ok(isset(bot_table_columns($pdo, 'route_assignments')['close_reason']), 'route_assignments.close_reason criada');
 ok(bot_table_exists($pdo, 'delivery_attempts'), 'delivery_attempts criada');

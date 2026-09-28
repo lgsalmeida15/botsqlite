@@ -216,6 +216,13 @@ def resolve_settings(cfg: dict, routing_row: dict | None, kind: str) -> dict:
         "affinity": _to_bool(cfg.get("affinity_enabled"), True),
         "affinity_require_online": _to_bool(cfg.get("affinity_require_online"), False),
         "affinity_match_name": _to_bool(cfg.get("affinity_match_name"), False),
+        # Resgate por ausencia do operador: o time sobrescreve os segundos
+        # (NULL = herda o global; 0 = este time nao devolve caso de analista
+        # offline para a fila). O liga/desliga e global.
+        "offline_requeue_sec": max(
+            _to_int(row.get("offline_requeue_sec"), _to_int(cfg.get("offline_requeue_sec"), 120)), 0
+        ),
+        "offline_requeue_enabled": _to_bool(cfg.get("offline_requeue_enabled"), True),
     }
 
 

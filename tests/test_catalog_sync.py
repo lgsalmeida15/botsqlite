@@ -61,6 +61,53 @@ class CatalogSyncTest(unittest.IsolatedAsyncioTestCase):
         reasons = [e["reason"] for e in conn.execute("SELECT reason FROM bot_events").fetchall()]
         self.assertIn("queue_off", reasons)
 
+    async def test_consider_fila_sem_time_ativo_nao_assume(self):
+        """Fila habilitada sem time ATIVO: nao entra (era o closed_no_agent).
+
+        Antes o bot assumia, mandava o menu e so descobria na entrega que nao
+        havia time elegivel — o chat acabava encerrado sem transferir ninguem.
+        """
+        conn = mem_conn()
+        seed_queue_menu(conn, with_team=False)  # fila habilitada + menu, sem time
+        conn.execute(
+            "INSERT INTO menu_options (menu_id, sort_order, label, classification, action)"
+            " VALUES (1, 1, 'A', 'a', 'reply_and_close')"
+        )
+        sock = FakeSock()
+        eng = Engine(conn, sock)
+        await eng.consider({"chat_id": 501, "helpdesk_address": "h:q1", "participants": []})
+        reasons = [e["reason"] for e in conn.execute("SELECT reason FROM bot_events").fetchall()]
+        self.assertIn("queue_no_team", reasons)
+        self.assertNotIn("assumed", reasons)
+        self.assertNotIn("menu_sent", reasons)
+
+    async def test_consider_fila_sem_menu_ativo_nao_assume(self):
+        """Menu desativado no painel = fila habilitada sem opcoes: nao entra."""
+        conn = mem_conn()
+        seed_queue_menu(conn, with_team=True)
+        conn.execute("UPDATE menus SET active = 0")
+        conn.execute(
+            "INSERT INTO menu_options (menu_id, sort_order, label, classification, action)"
+            " VALUES (1, 1, 'A', 'a', 'reply_and_close')"
+        )
+        sock = FakeSock()
+        eng = Engine(conn, sock)
+        await eng.consider({"chat_id": 502, "helpdesk_address": "h:q1", "participants": []})
+        reasons = [e["reason"] for e in conn.execute("SELECT reason FROM bot_events").fetchall()]
+        self.assertIn("queue_no_menu", reasons)
+        self.assertNotIn("assumed", reasons)
+
+    async def test_consider_menu_sem_opcoes_nao_assume(self):
+        """Menu ativo porem sem nenhuma opcao: mesmo portao (nao entra)."""
+        conn = mem_conn()
+        seed_queue_menu(conn, with_team=True)  # sem menu_options
+        sock = FakeSock()
+        eng = Engine(conn, sock)
+        await eng.consider({"chat_id": 503, "helpdesk_address": "h:q1", "participants": []})
+        reasons = [e["reason"] for e in conn.execute("SELECT reason FROM bot_events").fetchall()]
+        self.assertIn("queue_no_menu", reasons)
+        self.assertNotIn("assumed", reasons)
+
     def test_upsert_preserva_origem_manual(self):
         conn = mem_conn()
         db.upsert_queue(conn, "h:q1", "Q1")

@@ -151,6 +151,69 @@ function bot_open_chat_statuses(): array
     ];
 }
 
+/**
+ * Uma fila so pode ser HABILITADA no painel com Menu ATIVO e Time ATIVO vinculados.
+ *
+ * Sao as mesmas premissas que o bot usa ao atender: sem menu o chat morre em
+ * "menu vazio" (join_failed) e sem time ativo o caso acaba encerrado
+ * (closed_no_agent). Habilitar a fila sem os dois deixava o bot assumir o chat,
+ * mandar o menu e fechar depois, sem transferir ninguem.
+ * Devolve '' quando pode habilitar, ou o motivo do bloqueio (texto para a tela).
+ */
+function queue_enable_block(PDO $pdo, string $address): string
+{
+    $st = $pdo->prepare(
+        'SELECT'
+        . ' (SELECT COUNT(*) FROM menu_queues mq JOIN menus m ON m.id = mq.menu_id'
+        . '   WHERE mq.queue_address = q.address AND m.active = 1) AS menus,'
+        . ' (SELECT COUNT(*) FROM menu_options o JOIN menus m ON m.id = o.menu_id'
+        . '    JOIN menu_queues mq ON mq.menu_id = m.id'
+        . '   WHERE mq.queue_address = q.address AND m.active = 1 AND o.parent_id IS NULL) AS opcoes,'
+        . ' (SELECT COUNT(*) FROM team_queues tq JOIN teams t ON t.id = tq.team_id'
+        . '   WHERE tq.queue_address = q.address AND t.active = 1) AS times'
+        . ' FROM queues q WHERE q.address = ?'
+    );
+    $st->execute([$address]);
+    $row = $st->fetch();
+    if (!$row) {
+        return 'fila não encontrada';
+    }
+    $faltas = [];
+    if ((int) ($row['menus'] ?? 0) < 1) {
+        $faltas[] = 'nenhum Menu ativo vinculado (aba Menus)';
+    } elseif ((int) ($row['opcoes'] ?? 0) < 1) {
+        $faltas[] = 'menu ativo sem nenhuma opção cadastrada (aba Menus)';
+    }
+    if ((int) ($row['times'] ?? 0) < 1) {
+        $faltas[] = 'nenhum Time ativo vinculado (aba Times)';
+    }
+    return $faltas ? implode(' e ', $faltas) : '';
+}
+
+/**
+ * Filas HABILITADAS vinculadas a um menu ou time.
+ *
+ * `$ownerTable` e `menu_queues` (coluna `menu_id`) ou `team_queues` (`team_id`).
+ * A trava de habilitacao da fila so vale se o vinculo nao puder sumir depois:
+ * desativar/excluir o menu ou o time — ou desvincular a fila — deixaria a fila
+ * ligada sem dono e o chat cairia em "menu vazio"/closed_no_agent.
+ * Devolve a lista de addresses (ordenada).
+ */
+function bot_enabled_queues_linked(PDO $pdo, string $ownerTable, int $ownerId): array
+{
+    $coluna = ['menu_queues' => 'menu_id', 'team_queues' => 'team_id'][$ownerTable] ?? null;
+    if ($coluna === null) {
+        return [];
+    }
+    $st = $pdo->prepare(
+        'SELECT l.queue_address FROM ' . $ownerTable . ' l'
+        . ' JOIN queues q ON q.address = l.queue_address'
+        . ' WHERE l.' . $coluna . ' = ? AND q.enabled = 1 ORDER BY l.queue_address'
+    );
+    $st->execute([$ownerId]);
+    return array_map(static fn($r) => (string) $r['queue_address'], $st->fetchAll());
+}
+
 function bot_migrate_load(PDO $pdo): void
 {
     if (!bot_table_exists($pdo, 'analyst_load')) {
@@ -177,6 +240,23 @@ function bot_migrate_load(PDO $pdo): void
     }
     if (bot_table_exists($pdo, 'analyst_load') && !isset(bot_table_columns($pdo, 'analyst_load')['casos_toa_keys'])) {
         $pdo->exec("ALTER TABLE analyst_load ADD COLUMN casos_toa_keys TEXT NOT NULL DEFAULT ''");
+    }
+    // Presenca persistida (resgate por analista offline): `online_ok` separa
+    // "leitura falhou" de "esta offline"; `offline_since` carimba o comeco.
+    if (bot_table_exists($pdo, 'analyst_load')) {
+        $loadCols = bot_table_columns($pdo, 'analyst_load');
+        if (!isset($loadCols['online_ok'])) {
+            $pdo->exec('ALTER TABLE analyst_load ADD COLUMN online_ok INTEGER NOT NULL DEFAULT 0');
+        }
+        if (!isset($loadCols['offline_since'])) {
+            $pdo->exec('ALTER TABLE analyst_load ADD COLUMN offline_since TEXT');
+        }
+    }
+    if (bot_table_exists($pdo, 'bot_jobs') && !isset(bot_table_columns($pdo, 'bot_jobs')['payload'])) {
+        $pdo->exec("ALTER TABLE bot_jobs ADD COLUMN payload TEXT NOT NULL DEFAULT ''");
+    }
+    if (bot_table_exists($pdo, 'team_routing') && !isset(bot_table_columns($pdo, 'team_routing')['offline_requeue_sec'])) {
+        $pdo->exec('ALTER TABLE team_routing ADD COLUMN offline_requeue_sec INTEGER');
     }
     if (!bot_table_exists($pdo, 'analyst_load_history')) {
         $pdo->exec(
@@ -210,24 +290,13 @@ function bot_migrate_form_aware(PDO $pdo): void
     if (bot_table_exists($pdo, 'pending_routes') && !isset(bot_table_columns($pdo, 'pending_routes')['expects_owner'])) {
         $pdo->exec('ALTER TABLE pending_routes ADD COLUMN expects_owner INTEGER NOT NULL DEFAULT 0');
     }
-    $opcoes = implode("\n", ['Digite o número da opção:', '1) Falar sobre o formulário', '2) Abrir o menu']);
-    $textos = [
-        'form_pending' => "Você tem um formulário de validação em andamento com {analista}.\n\n" . $opcoes,
-        'form_pending_wait' => "Você tem um formulário de validação aguardando atendimento.\n\n" . $opcoes,
-        'form_waiting' => 'Assim que um analista assumir a sua validação, eu encaminho este chat para ele.'
-            . ' Em breve você será atendido.',
-    ];
-    $st = $pdo->prepare('INSERT OR IGNORE INTO templates (slug, body) VALUES (?, ?)');
-    foreach ($textos as $slug => $body) {
-        $st->execute([$slug, $body]);
+    // A abertura form-aware foi REMOVIDA (28/09): a oferta "1) falar sobre o
+    // formulario / 2) abrir o menu" nao existe mais, entao os textos dela saem
+    // do banco (o chat de fila sempre recebe o menu da fila).
+    $delTpl = $pdo->prepare('DELETE FROM templates WHERE slug = ?');
+    foreach (['form_pending', 'form_pending_wait', 'form_waiting'] as $slugTpl) {
+        $delTpl->execute([$slugTpl]);
     }
-    // Reparo: a primeira versao da semente gravou "\n" literal (SQLite nao
-    // interpreta escape) e o INSERT OR IGNORE nunca corrigia depois.
-    $pdo->prepare(
-        'UPDATE templates SET body = replace(body, ?, char(10))'
-        . " WHERE slug IN ('form_pending', 'form_pending_wait', 'form_waiting')"
-        . ' AND instr(body, ?) > 0'
-    )->execute(['\n', '\n']);
 
     // Reparo do "balde" de identidade: chave generica do agente (ou vazia) vira
     // caso POR FORMULARIO (`chat:<id>`) — assim a afinidade nao junta tecnicos
@@ -298,6 +367,8 @@ function bot_migrate_delivery(PDO $pdo): void
         'claimed_by' => "claimed_by TEXT NOT NULL DEFAULT ''",
         'claimed_at' => 'claimed_at TEXT',
         'claim_expires_at' => 'claim_expires_at TEXT',
+        // Resgate por analista offline: alvo que nao pode receber de volta.
+        'exclude_assignee' => "exclude_assignee TEXT NOT NULL DEFAULT ''",
     ];
     foreach ($novas as $nome => $ddl) {
         if (!isset($cols[$nome])) {

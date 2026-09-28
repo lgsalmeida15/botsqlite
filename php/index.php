@@ -668,11 +668,11 @@ function event_badge(string $reason, string $label): string
         'queue_position' => 'bg-info text-dark',
         'queued_assigned' => 'bg-success',
         'queue_expired' => 'bg-danger',
-        'form_aware_greeting' => 'bg-info text-dark',
-        'form_aware_choice' => 'bg-info text-dark',
-        'form_aware_wait' => 'bg-info text-dark',
+        'form_aware_greeting' => 'bg-secondary',
+        'form_aware_choice' => 'bg-secondary',
+        'form_aware_wait' => 'bg-secondary',
         'form_aware_skip' => 'bg-secondary',
-        'case_linked' => 'bg-primary',
+        'case_linked' => 'bg-secondary',
         'case_sibling_delivered' => 'bg-success',
         'form_indexed' => 'bg-info text-dark',
         'form_not_open' => 'bg-warning text-dark',
@@ -688,6 +688,14 @@ function event_badge(string $reason, string $label): string
         'closed_timeout' => 'bg-danger',
         'bot_off' => 'bg-danger',
         'queue_off' => 'bg-secondary',
+        'queue_no_menu' => 'bg-danger',
+        'queue_no_team' => 'bg-danger',
+        'form_queue_off' => 'bg-secondary',
+        'case_reclaimed' => 'bg-warning text-dark',
+        'chat_adopted' => 'bg-success',
+        'reclaim_invite_only' => 'bg-warning text-dark',
+        'reclaim_no_queue' => 'bg-danger',
+        'reclaim_empty' => 'bg-secondary',
     ];
     return '<span class="badge ' . ($map[$reason] ?? 'bg-secondary') . '">' . h($label) . '</span>';
 }
@@ -870,8 +878,25 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && $page !== 'login') {
             }
         }
         if ($page === 'queues' && $action === 'toggle') {
-            $st = $pdo->prepare('UPDATE queues SET enabled = NOT enabled WHERE address = ?');
-            $st->execute([(string) $_POST['address']]);
+            // Habilitar exige Menu ativo + Time ativo vinculados (as mesmas
+            // regras do bot); DESABILITAR e sempre permitido.
+            $qaToggle = (string) ($_POST['address'] ?? '');
+            $st = $pdo->prepare('SELECT enabled FROM queues WHERE address = ?');
+            $st->execute([$qaToggle]);
+            $atual = $st->fetchColumn();
+            if ($atual === false) {
+                $formError = 'Fila não encontrada.';
+            } elseif (bool_on($atual)) {
+                $pdo->prepare('UPDATE queues SET enabled = 0 WHERE address = ?')->execute([$qaToggle]);
+            } else {
+                $bloqueio = queue_enable_block($pdo, $qaToggle);
+                if ($bloqueio !== '') {
+                    $formError = 'Não é possível habilitar a fila ' . $qaToggle . ': ' . $bloqueio
+                        . '. Vincule na aba Menus/Times e tente de novo.';
+                } else {
+                    $pdo->prepare('UPDATE queues SET enabled = 1 WHERE address = ?')->execute([$qaToggle]);
+                }
+            }
         }
         if (($page === 'queues' || $page === 'operators') && $action === 'sync_catalog') {
             $pdo->exec("INSERT INTO bot_jobs (kind) VALUES ('catalog_sync')");
@@ -880,6 +905,13 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && $page !== 'login') {
         if ($page === 'load' && $action === 'load_now') {
             // Botao "Atualizar agora": o bot le as listas do TOA na hora e grava.
             $pdo->exec("INSERT INTO bot_jobs (kind) VALUES ('load_snapshot')");
+            $postSynced = true;
+        }
+        if ($page === 'load' && $action === 'requeue_offline') {
+            // Botao "Devolver a fila agora": o bot devolve os casos daquele
+            // analista offline pelo MESMO caminho do resgate automatico.
+            $stJob = $pdo->prepare("INSERT INTO bot_jobs (kind, payload) VALUES ('requeue_offline', ?)");
+            $stJob->execute([trim((string) ($_POST['address'] ?? ''))]);
             $postSynced = true;
         }
         if ($page === 'operators' && $action === 'add_operator') {
@@ -943,9 +975,30 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && $page !== 'login') {
                     $pdo->prepare('UPDATE menus SET name = ? WHERE id = ?')->execute([$name, $mid]);
                 }
             } elseif ($action === 'toggle' && $mid > 0) {
-                $pdo->prepare('UPDATE menus SET active = NOT active WHERE id = ?')->execute([$mid]);
+                // Desativar menu com fila HABILITADA vinculada deixaria a fila
+                // atendendo sem opcoes (chat cairia em "menu vazio").
+                $stMenu = $pdo->prepare('SELECT active FROM menus WHERE id = ?');
+                $stMenu->execute([$mid]);
+                $menuAtivo = $stMenu->fetchColumn();
+                if ($menuAtivo !== false && bool_on($menuAtivo)) {
+                    $ligadas = bot_enabled_queues_linked($pdo, 'menu_queues', $mid);
+                    if ($ligadas) {
+                        $formError = 'Não é possível desativar o menu: a(s) fila(s) ' . implode(', ', $ligadas)
+                            . ' está(ão) habilitada(s) com ele. Desabilite a(s) fila(s) primeiro.';
+                    } else {
+                        $pdo->prepare('UPDATE menus SET active = 0 WHERE id = ?')->execute([$mid]);
+                    }
+                } else {
+                    $pdo->prepare('UPDATE menus SET active = 1 WHERE id = ?')->execute([$mid]);
+                }
             } elseif ($action === 'delete' && $mid > 0) {
-                $pdo->prepare('DELETE FROM menus WHERE id = ?')->execute([$mid]);
+                $ligadas = bot_enabled_queues_linked($pdo, 'menu_queues', $mid);
+                if ($ligadas) {
+                    $formError = 'Não é possível excluir o menu: a(s) fila(s) ' . implode(', ', $ligadas)
+                        . ' está(ão) habilitada(s) com ele. Desabilite a(s) fila(s) primeiro.';
+                } else {
+                    $pdo->prepare('DELETE FROM menus WHERE id = ?')->execute([$mid]);
+                }
             } elseif ($action === 'save_queues' && $mid > 0) {
                 $wanted = posted_queue_addresses();
                 $st = $pdo->prepare('SELECT queue_address, menu_id FROM menu_queues WHERE queue_address = ?');
@@ -955,6 +1008,16 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && $page !== 'login') {
                     if ($row && (int) $row['menu_id'] !== $mid) {
                         $formError = 'A fila ' . $qa . ' já está em outro menu.';
                         break;
+                    }
+                }
+                if (empty($formError)) {
+                    $saemMenu = array_values(array_diff(
+                        bot_enabled_queues_linked($pdo, 'menu_queues', $mid),
+                        array_map('strval', $wanted)
+                    ));
+                    if ($saemMenu) {
+                        $formError = 'Não é possível desvincular do menu a(s) fila(s) habilitada(s): '
+                            . implode(', ', $saemMenu) . '. Desabilite a(s) fila(s) antes de tirar o menu.';
                     }
                 }
                 if (empty($formError)) {
@@ -1064,9 +1127,30 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && $page !== 'login') {
                     $pdo->prepare('UPDATE teams SET name = ? WHERE id = ?')->execute([$name, $tid]);
                 }
             } elseif ($action === 'toggle' && $tid > 0) {
-                $pdo->prepare('UPDATE teams SET active = NOT active WHERE id = ?')->execute([$tid]);
+                // Desativar time com fila HABILITADA vinculada deixaria o chat
+                // sem ninguem elegivel: o caso acabaria em closed_no_agent.
+                $stTime = $pdo->prepare('SELECT active FROM teams WHERE id = ?');
+                $stTime->execute([$tid]);
+                $timeAtivo = $stTime->fetchColumn();
+                if ($timeAtivo !== false && bool_on($timeAtivo)) {
+                    $ligadas = bot_enabled_queues_linked($pdo, 'team_queues', $tid);
+                    if ($ligadas) {
+                        $formError = 'Não é possível desativar o time: a(s) fila(s) ' . implode(', ', $ligadas)
+                            . ' está(ão) habilitada(s) com ele. Desabilite a(s) fila(s) primeiro.';
+                    } else {
+                        $pdo->prepare('UPDATE teams SET active = 0 WHERE id = ?')->execute([$tid]);
+                    }
+                } else {
+                    $pdo->prepare('UPDATE teams SET active = 1 WHERE id = ?')->execute([$tid]);
+                }
             } elseif ($action === 'delete' && $tid > 0) {
-                $pdo->prepare('DELETE FROM teams WHERE id = ?')->execute([$tid]);
+                $ligadas = bot_enabled_queues_linked($pdo, 'team_queues', $tid);
+                if ($ligadas) {
+                    $formError = 'Não é possível excluir o time: a(s) fila(s) ' . implode(', ', $ligadas)
+                        . ' está(ão) habilitada(s) com ele. Desabilite a(s) fila(s) primeiro.';
+                } else {
+                    $pdo->prepare('DELETE FROM teams WHERE id = ?')->execute([$tid]);
+                }
             } elseif ($action === 'save_queues' && $tid > 0) {
                 $wanted = posted_queue_addresses();
                 $st = $pdo->prepare('SELECT queue_address, team_id FROM team_queues WHERE queue_address = ?');
@@ -1076,6 +1160,16 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && $page !== 'login') {
                     if ($row && (int) $row['team_id'] !== $tid) {
                         $formError = 'A fila ' . $qa . ' já está em outro time.';
                         break;
+                    }
+                }
+                if (empty($formError)) {
+                    $saemTime = array_values(array_diff(
+                        bot_enabled_queues_linked($pdo, 'team_queues', $tid),
+                        array_map('strval', $wanted)
+                    ));
+                    if ($saemTime) {
+                        $formError = 'Não é possível desvincular do time a(s) fila(s) habilitada(s): '
+                            . implode(', ', $saemTime) . '. Desabilite a(s) fila(s) antes de tirar o time.';
                     }
                 }
                 if (empty($formError)) {
@@ -1168,13 +1262,18 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && $page !== 'login') {
                         'transfer_retry_interval_sec',
                         'max_open_forms_per_agent', 'form_route_attempts', 'form_route_retry_interval_sec',
                         'queue_top_pos',
+                        // Resgate por analista offline (0 = desligado).
+                        'offline_requeue_sec',
                     ] as $k
                 ) {
                     if (isset($_POST[$k])) {
                         $st->execute([$k, trim((string) $_POST[$k])]);
                     }
                 }
-                foreach (['bot_enabled', 'form_routing_enabled', 'queue_wait_enabled', 'queue_show_pos'] as $k) {
+                foreach (
+                    ['bot_enabled', 'form_routing_enabled', 'queue_wait_enabled', 'queue_show_pos',
+                     'offline_requeue_enabled'] as $k
+                ) {
                     $st->execute([$k, ((string) ($_POST[$k] ?? 'false')) === 'true' ? 'true' : 'false']);
                 }
                 $strategy = (string) ($_POST['routing_strategy'] ?? 'round_robin');
@@ -1278,8 +1377,8 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && $page !== 'login') {
                     $pdo->prepare(
                         "INSERT INTO team_routing
                            (team_id, strategy, cap_chat, cap_form, cap_cases, require_online, respect_window,
-                            attempts, retry_interval_sec, fallback, form_enabled, member_kinds)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            attempts, retry_interval_sec, fallback, form_enabled, member_kinds, offline_requeue_sec)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                          ON CONFLICT (team_id) DO UPDATE SET
                            strategy = excluded.strategy, cap_chat = excluded.cap_chat,
                            cap_form = excluded.cap_form, cap_cases = excluded.cap_cases,
@@ -1287,6 +1386,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && $page !== 'login') {
                            respect_window = excluded.respect_window, attempts = excluded.attempts,
                            retry_interval_sec = excluded.retry_interval_sec, fallback = excluded.fallback,
                            form_enabled = excluded.form_enabled, member_kinds = excluded.member_kinds,
+                           offline_requeue_sec = excluded.offline_requeue_sec,
                            updated_at = datetime('now')"
                     )->execute([
                         $rid,
@@ -1301,6 +1401,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && $page !== 'login') {
                         $fallback === '' ? null : $fallback,
                         ((string) ($_POST['form_enabled'] ?? '1')) === '1' ? 1 : 0,
                         $memberKinds,
+                        $int_or_null('offline_requeue_sec'),
                     ]);
                     // "Replicar para todos os operadores": limpa o ajuste individual
                     // (NULL = herda o time) e, se pedido, o tipo individual tambem.
@@ -1552,18 +1653,30 @@ if ($page === 'queues') {
     if (($_GET['synced'] ?? '') === '1') {
         echo '<div class="alert alert-success py-2 mt-2 mb-2">Sincronização solicitada — o bot processa em até ~5 s (novas filas e operadores entram no catálogo).</div>';
     }
-    echo '<p class="text-muted">Novas filas entram desabilitadas. O bot só atende as habilitadas.</p>';
+    echo '<p class="text-muted">Novas filas entram desabilitadas. O bot só atende as habilitadas — e só é possível <strong>habilitar</strong> uma fila com <strong>Menu</strong> e <strong>Time</strong> ativos vinculados.</p>';
+    if (!empty($formError)) {
+        echo '<div class="alert alert-danger py-2 mt-2 mb-2">' . h($formError) . '</div>';
+    }
     $listParams = [];
     $listWhere = bot_scope_queue_where($pdo, 'q.address', $listParams);
+    // Menu e Time vem por SUBQUERY (uma linha por fila, sem risco de
+    // duplicacao) e mostram apenas o vinculo ATIVO — o que o bot enxerga. Os
+    // contadores `menus_ativos`/`times_ativos` alimentam a trava de habilitacao
+    // sem consulta extra por linha.
     $stList = $pdo->prepare(
-        'SELECT q.*, m.name AS menu_name, t.name AS team_name
-         FROM queues q
-         LEFT JOIN menu_queues mq ON mq.queue_address = q.address
-         LEFT JOIN menus m ON m.id = mq.menu_id
-         LEFT JOIN team_queues tq ON tq.queue_address = q.address
-         LEFT JOIN teams t ON t.id = tq.team_id
-         WHERE 1 = 1' . $listWhere . '
-         ORDER BY q.name, q.address'
+        'SELECT q.*,'
+        . ' (SELECT m.name FROM menu_queues mq JOIN menus m ON m.id = mq.menu_id'
+        . '   WHERE mq.queue_address = q.address AND m.active = 1'
+        . '   ORDER BY m.name LIMIT 1) AS menu_name,'
+        . ' (SELECT t.name FROM team_queues tq JOIN teams t ON t.id = tq.team_id'
+        . '   WHERE tq.queue_address = q.address AND t.active = 1'
+        . '   ORDER BY t.name LIMIT 1) AS team_name,'
+        . ' (SELECT COUNT(*) FROM menu_queues mq2 JOIN menus m2 ON m2.id = mq2.menu_id'
+        . '   WHERE mq2.queue_address = q.address AND m2.active = 1) AS menus_ativos,'
+        . ' (SELECT COUNT(*) FROM team_queues tq2 JOIN teams t2 ON t2.id = tq2.team_id'
+        . '   WHERE tq2.queue_address = q.address AND t2.active = 1) AS times_ativos'
+        . ' FROM queues q WHERE 1 = 1' . $listWhere
+        . ' ORDER BY q.name, q.address'
     );
     $stList->execute($listParams);
     $rows = $stList->fetchAll();
@@ -1572,13 +1685,33 @@ if ($page === 'queues') {
     echo '<thead><tr><th>Nome</th><th>Address</th><th>Menu</th><th>Time</th><th>Habilitada</th><th></th></tr></thead><tbody>';
     foreach ($rows as $r) {
         $on = bool_on($r['enabled']);
+        $semMenu = (int) ($r['menus_ativos'] ?? 0) < 1;
+        $semTime = (int) ($r['times_ativos'] ?? 0) < 1;
+        $pendencia = '';
+        if ($semMenu && $semTime) {
+            $pendencia = 'Vincule um Menu e um Time ativos antes de habilitar';
+        } elseif ($semMenu) {
+            $pendencia = 'Vincule um Menu ativo antes de habilitar';
+        } elseif ($semTime) {
+            $pendencia = 'Vincule um Time ativo antes de habilitar';
+        }
         echo '<tr><td>' . h($r['name']) . '</td><td><code>' . h($r['address']) . '</code></td>';
-        echo '<td>' . ($r['menu_name'] ? '<span class="badge text-bg-light">' . h($r['menu_name']) . '</span>' : '<span class="text-muted">—</span>') . '</td>';
-        echo '<td>' . ($r['team_name'] ? '<span class="badge text-bg-light">' . h($r['team_name']) . '</span>' : '<span class="text-muted">—</span>') . '</td>';
+        echo '<td>' . ($r['menu_name'] ? '<span class="badge text-bg-light">' . h($r['menu_name']) . '</span>' : '<span class="text-muted">—</span>')
+            . ($semMenu ? ' <span class="badge bg-warning text-dark">sem menu ativo</span>' : '') . '</td>';
+        echo '<td>' . ($r['team_name'] ? '<span class="badge text-bg-light">' . h($r['team_name']) . '</span>' : '<span class="text-muted">—</span>')
+            . ($semTime ? ' <span class="badge bg-warning text-dark">sem time ativo</span>' : '') . '</td>';
         echo '<td>' . badge_state($on, 'sim', 'não') . '</td>';
         echo '<td><form class="d-inline" method="post"><input type="hidden" name="csrf" value="' . h($csrf) . '">';
         echo '<input type="hidden" name="action" value="toggle"><input type="hidden" name="address" value="' . h($r['address']) . '">';
-        echo '<button class="btn btn-sm ' . ($on ? 'btn-outline-secondary' : 'btn-success') . '">' . ($on ? 'Desabilitar' : 'Habilitar') . '</button></form></td></tr>';
+        if ($on) {
+            echo '<button class="btn btn-sm btn-outline-secondary">Desabilitar</button>';
+        } elseif ($pendencia !== '') {
+            echo '<button class="btn btn-sm btn-success" disabled title="' . h($pendencia) . '">Habilitar</button>'
+                . '<div class="form-text">' . h($pendencia) . '</div>';
+        } else {
+            echo '<button class="btn btn-sm btn-success">Habilitar</button>';
+        }
+        echo '</form></td></tr>';
     }
     echo '</tbody></table></div></div>';
     if (!$rows) {
@@ -2049,6 +2182,10 @@ if ($page === 'routing') {
     echo '<div class="col-md-3"><label class="form-label">Formulário roteado</label><select class="form-select" name="form_routing_enabled">';
     echo '<option value="true"' . (($map['form_routing_enabled'] ?? 'true') === 'true' ? ' selected' : '') . '>Ligado</option>';
     echo '<option value="false"' . (($map['form_routing_enabled'] ?? '') === 'false' ? ' selected' : '') . '>Desligado (só registra o evento)</option></select></div>';
+    echo '<div class="col-md-3"><label class="form-label">Devolver caso de analista offline</label><select class="form-select" name="offline_requeue_enabled">';
+    echo '<option value="true"' . (($map['offline_requeue_enabled'] ?? 'true') === 'true' ? ' selected' : '') . '>Ligado</option>';
+    echo '<option value="false"' . (($map['offline_requeue_enabled'] ?? '') === 'false' ? ' selected' : '') . '>Desligado</option></select></div>';
+    echo '<div class="col-md-3"><label class="form-label">Offline para devolver (s)</label><input class="form-control" name="offline_requeue_sec" value="' . h((string) ($map['offline_requeue_sec'] ?? '120')) . '"></div>';
     echo '<div class="col-md-3"><label class="form-label">Estratégia</label><select class="form-select" name="routing_strategy">';
     foreach (['round_robin' => 'Rodízio (como hoje)', 'priority' => 'Prioridade (peso)', 'least_load' => 'Menor carga'] as $sk => $sl) {
         echo '<option value="' . h($sk) . '"' . (($map['routing_strategy'] ?? 'round_robin') === $sk ? ' selected' : '') . '>' . h($sl) . '</option>';
@@ -2342,6 +2479,7 @@ if ($page === 'routing') {
             echo '<option value="' . h((string) $k) . '"' . ((string) (int) ($tr['form_enabled'] ?? 1) === $k ? ' selected' : '') . '>' . h($l) . '</option>';
         }
         echo '</select></div>';
+        echo '<div class="col-md-1"><label class="form-label">Offline</label><input class="form-control form-control-sm" type="number" min="0" name="offline_requeue_sec" value="' . h($numOrNull($tr['offline_requeue_sec'] ?? null)) . '" placeholder="' . h($map['offline_requeue_sec'] ?? '120') . '" title="Segundos offline antes de devolver o caso do operador para a fila (0 = este time nao devolve)"></div>';
         echo '<div class="col-md-2"><label class="form-label">Padrão dos operadores</label><select class="form-select form-select-sm" name="member_kinds">';
         foreach (['both' => 'atende os dois', 'chat' => 'só chat', 'form' => 'só formulário'] as $k => $l) {
             $atualMK = (string) ($tr['member_kinds'] ?? 'both');
@@ -2487,11 +2625,19 @@ if ($page === 'activity') {
         'queue_position' => 'mudou de posição',
         'queued_assigned' => 'saiu da fila (atribuído)',
         'queue_expired' => 'espera expirou',
-        'form_aware_greeting' => 'abertura: formulário em andamento',
-        'form_aware_choice' => 'abertura: escolha do técnico',
-        'form_aware_wait' => 'abertura: aguarda o analista do formulário',
-        'form_aware_skip' => 'abertura: sem formulário para vincular',
-        'case_linked' => 'chat e formulário no mesmo caso',
+        'queue_no_menu' => 'fila habilitada sem menu ativo',
+        'queue_no_team' => 'fila habilitada sem time ativo',
+        'form_queue_off' => 'formulário com a fila desabilitada (só indexado)',
+        'case_reclaimed' => 'caso devolvido à fila (analista offline)',
+        'chat_adopted' => 'analista entrou no chat da fila (caso adotado)',
+        'reclaim_invite_only' => 'resgate: convite sem novo move',
+        'reclaim_no_queue' => 'resgate: caso sem fila para devolver',
+        'reclaim_empty' => 'resgate: nenhum caso aberto para devolver',
+        'form_aware_greeting' => '(removida) abertura: formulário em andamento',
+        'form_aware_choice' => '(removida) abertura: escolha do técnico',
+        'form_aware_wait' => '(removida) abertura: aguardava o analista do formulário',
+        'form_aware_skip' => '(removida) abertura: sem formulário para vincular',
+        'case_linked' => '(removida) chat e formulário no mesmo caso',
         'case_sibling_delivered' => 'caso entregue junto (chat + formulário)',
         'form_indexed' => 'formulário em acompanhamento',
         'form_not_open' => 'formulário com fim explícito (não indexado)',
@@ -2789,6 +2935,7 @@ if ($page === 'chats') {
 if ($page === 'load') {
     $loadPoll = 30;
     $loadAbsent = 2;
+    $loadOfflineSec = 120;
     try {
         foreach ($pdo->query('SELECT key, value FROM bot_settings') as $rCfg) {
             $kCfg = (string) $rCfg['key'];
@@ -2796,6 +2943,8 @@ if ($page === 'load') {
                 $loadPoll = max(5, (int) $rCfg['value']);
             } elseif ($kCfg === 'form_absent_readings') {
                 $loadAbsent = max(1, (int) $rCfg['value']);
+            } elseif ($kCfg === 'offline_requeue_sec') {
+                $loadOfflineSec = max(0, (int) $rCfg['value']);
             }
         }
     } catch (Throwable $e) {
@@ -2985,6 +3134,26 @@ if ($page === 'load') {
             $divergentes++;
         }
     }
+    // Analista OFFLINE com caso aberto no ledger: e o que o robo devolve para a
+    // fila depois de `offline_requeue_sec` (evento `case_reclaimed`).
+    $offlineComCaso = 0;
+    $chatsOffline = 0;
+    $formsOffline = 0;
+    $offlineSemLedger = 0;
+    foreach ($loadRows as $rOff) {
+        $semOnline = (int) ($rOff['online_ok'] ?? 0) === 1 && (int) $rOff['online'] === 0;
+        if (!$semOnline) {
+            continue;
+        }
+        $casosOff = (int) $rOff['chats_ledger'] + (int) $rOff['forms_ledger'];
+        if ($casosOff > 0) {
+            $offlineComCaso++;
+            $chatsOffline += (int) $rOff['chats_ledger'];
+            $formsOffline += (int) $rOff['forms_ledger'];
+        } else {
+            $offlineSemLedger++;
+        }
+    }
     if (!$loadRows) {
         echo '<p class="text-muted">Nenhuma leitura ainda. Confira se ha time ativo com membros e filas; a primeira leitura sai em ate '
             . (int) $loadPoll . ' s (ou clique em <strong>Atualizar agora</strong>).</p>';
@@ -2992,10 +3161,16 @@ if ($page === 'load') {
         if ($divergentes > 0) {
             echo '<div class="alert alert-warning py-2">' . (int) $divergentes . ' analista(s) com formulario no bot e <strong>ausente das listas do TOA</strong> — devem ser fechados por ausencia na proxima leitura.</div>';
         }
+        if ($offlineComCaso > 0) {
+            echo '<div class="alert alert-warning py-2">' . (int) $offlineComCaso . ' analista(s) <strong>offline</strong> com caso aberto no bot (chats '
+                . (int) $chatsOffline . ', formulários ' . (int) $formsOffline . ') — o robô devolve para a fila depois de <strong>'
+                . (int) $loadOfflineSec . ' s</strong> (' . ($loadOfflineSec > 0 ? 'evento <code>case_reclaimed</code>' : 'resgate desligado')
+                . '). Use <strong>Devolver à fila</strong> para forçar agora.</div>';
+        }
         echo '<div class="table-responsive sticky-head"><table class="table table-slim table-hover align-middle bg-white mb-0">';
-        echo '<thead><tr><th>Analista</th><th>Time</th><th>Online</th><th class="text-end">TOA chat</th><th class="text-end">TOA form</th>'
+        echo '<thead><tr><th>Analista</th><th>Time</th><th>Online</th><th>Offline há</th><th class="text-end">TOA chat</th><th class="text-end">TOA form</th>'
             . '<th class="text-end">Casos</th><th class="text-end">Reservas</th>'
-            . '<th class="text-end">Form + velho</th><th>TOA</th><th>Leitura</th></tr></thead><tbody>';
+            . '<th class="text-end">Form + velho</th><th>TOA</th><th>Leitura</th><th></th></tr></thead><tbody>';
         foreach ($loadRows as $r) {
             $addr = (string) $r['address'];
             $nome = (string) ($r['name'] !== '' ? $r['name'] : $addr);
@@ -3016,6 +3191,19 @@ if ($page === 'load') {
             echo '<div class="text-muted small"><code>' . h($addr) . '</code></div></td>';
             echo '<td>' . h((string) ($r['team_name'] ?? '')) . '</td>';
             echo '<td>' . badge_state($online, 'sim', 'não') . '</td>';
+            // Carimbo do offline: e o que o resgate usa para devolver o caso.
+            $desdeOff = substr((string) ($r['offline_since'] ?? ''), 0, 19);
+            $minOff = 0;
+            if ($desdeOff !== '') {
+                $tsOff = strtotime($desdeOff . ' UTC');
+                $minOff = $tsOff ? max(0, (int) floor((time() - $tsOff) / 60)) : 0;
+            }
+            if (!$online && $desdeOff !== '') {
+                $corOff = $minOff >= max(1, intdiv((int) $loadOfflineSec, 60)) ? 'bg-danger' : 'bg-secondary';
+                echo '<td><span class="badge ' . h($corOff) . '">' . (int) $minOff . ' min</span></td>';
+            } else {
+                echo '<td><span class="text-muted">—</span></td>';
+            }
             echo '<td class="text-end">' . (int) $r['chats_toa'] . '</td>';
             echo '<td class="text-end">' . (int) $r['forms_toa'] . ($pres ? ' <span class="badge bg-info text-dark">presente</span>' : '') . '</td>';
             echo '<td class="text-end"><span class="badge ' . ($fisico > 0 ? 'bg-secondary' : 'bg-light text-dark') . '"'
@@ -3025,7 +3213,16 @@ if ($page === 'load') {
             echo '<td class="text-end">' . ($ocioso > 0 ? h(number_format($ocioso, 0) . ' min') : '<span class="text-muted">—</span>') . '</td>';
             echo '<td>' . badge_state($toaOk, 'ok', 'falhou') . '</td>';
             echo '<td>' . h(fmt_dt($r['at'])) . '</td>';
-            echo '</tr>';
+            // Botao manual: devolve agora os casos deste analista (robo: mesmo caminho).
+            $casosLedger = (int) $r['chats_ledger'] + (int) $r['forms_ledger'];
+            echo '<td class="text-end">';
+            if (!$online && $casosLedger > 0) {
+                echo '<form method="post" class="d-inline"><input type="hidden" name="csrf" value="' . h($csrf) . '">'
+                    . '<input type="hidden" name="action" value="requeue_offline">'
+                    . '<input type="hidden" name="address" value="' . h($addr) . '">'
+                    . '<button class="btn btn-sm btn-outline-danger" title="Devolver os casos deste analista para a fila agora">Devolver à fila</button></form>';
+            }
+            echo '</td></tr>';
         }
         echo '</tbody></table></div>';
     }

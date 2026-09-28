@@ -1,6 +1,6 @@
 # HELPTOA Bot — desenho do fluxo atual
 
-> Retrato do codigo em 22/09/2026. Cobre **atendimento**, **menu**, **abertura form-aware**, **roteamento por caso**, **formulario de validacao**, **timers**, **banco** e **painel**.
+> Retrato do codigo em 22/09/2026. Cobre **atendimento**, **menu**, **roteamento por caso**, **formulario de validacao**, **timers**, **banco** e **painel**.
 > Diagramas em Mermaid — renderizam no VS Code, GitHub e na maioria dos visualizadores de Markdown.
 
 ## 1. Visao de contexto
@@ -88,137 +88,22 @@ flowchart TD
   processa a resposta que chegou com o bot fora (evento `reply_replayed`), antes de qualquer timeout.
 - Retries sao contados em `chats.retries`; template `retry` e configuravel na aba Templates.
 
-### 4.1 Abertura form-aware: o tecnico ja tem formulario em andamento
+### Abertura form-aware (chat com formulário aberto) — **REMOVIDA em 28/09/2026**
 
-Quando o bot assume um chat de menu e o **mesmo tecnico** tem um formulario de
-validacao aberto, em vez do menu ele oferece `1) Falar sobre o formulario` /
-`2) Abrir o menu`. Chat e formulario passam a ser **um caso so** (`case_key`
-unico no ledger): encaminhado um, o outro vai junto.
+O bot **não** verifica mais se o técnico tem formulário de validação em andamento: assumiu o
+chat da fila, ele **sempre** recebe o menu da fila (`greeting` + `menu`).
 
-```mermaid
-flowchart TD
-  A[assumed] --> B{Tem formulario aberto do mesmo tecnico?}
-  B -->|nao| M[menu normal - fluxo da secao 4]
-  B -->|identidade: address, AUTOR ou nome| L[case_linked: chat e formulario no MESMO caso]
-  B -->|palpite por fila: 1 candidato SEM responsavel| L
-  B -->|unico candidato ja em atendimento| L
-  B -->|ambiguo, em atendimento ou ocioso| S[form_aware_skip: menu normal]
-  L --> G[form_aware_greeting: 1 falar sobre o formulario / 2 abrir o menu]
-  G -->|1| D{Ja tem analista no formulario?}
-  G -->|2| M
-  D -->|sim e na janela| T[move_chat + invite_to_chat para ele: o chat vai com o historico]
-  D -->|nao, ou fora da janela| W[form_waiting: o chat espera preso ao caso] --> T
-  T --> I[transferred + ledger do caso]
-```
+Motivo: a correlação acertava pouco (`form_aware_skip` na maioria) e, quando errada, misturava
+formulário de outro técnico no caso. Saíram junto: o status `awaiting_form_choice`, os textos
+`form_pending`, `form_pending_wait` e `form_waiting` (apagados da tabela `templates` pela
+migração), os eventos `form_aware_greeting`, `form_aware_choice`, `form_aware_wait`,
+`form_aware_skip` e `case_linked`, e a rota presa ao dono (`pending_routes.expects_owner`, que
+fica só como coluna legada).
 
-- **Correlacao** (`form_open.form_by_technician`), nesta ordem:
-  1. **address** do payload do formulario contra quem abriu o chat;
-  2. **AUTOR das mensagens do formulario** — a identidade que sobra quando o
-     `message_scenario` chega sem o address do tecnico: ele responde no
-     formulario, entao aparece como autor (staff, o bot, a fila `h:` e os
-     analistas do time ficam de fora). A leitura das mensagens ja acontece para o
-     estado, entao a identidade sai **sem chamada extra** (`regra=autor`);
-  3. **nome**, quando `affinity_match_name` = true;
-  4. **fila + recencia**, agora **so com um unico candidato SEM responsavel**
-     (sem caso aberto no ledger e sem analista do time dentro pelas mensagens).
-     Com dois ou mais candidatos sem identidade o vinculo e recusado
-     (`form_aware_skip` com `ambiguo:<n>` ou `em_atendimento:<n>`) — adivinhar por
-     recencia era o que juntava tecnicos diferentes no mesmo caso. Um unico
-     candidato **ja em atendimento** ainda casa: e o tecnico abrindo o chat para
-     falar do proprio formulario.
-- **Janela de vida (`form_ocioso`):** o TOA **nao avisa a saida do analista**
-  (`user_left` nao chega), entao formulario morto ficava no indice e no ledger
-  ate o TTL de 12 h — enchia a fila (ambiguidade na abertura) e segurava a vaga
-  do analista. Regras:
-  - **Oferta:** sem mensagem nova por `form_idle_offer_min` (30 min) **e sem
-    analista do time dentro**, ele deixa de ser oferecido
-    (`form_aware_skip … ociosos=1`). Com analista dentro a oferta continua — o
-    texto diz com quem ele esta.
-  - **Fechamento:** sem sinal de vida por `form_idle_close_min` (120 min) fecha o
-    caso (`motivo=form_ocioso`); **com analista do time dentro** vale a regua
-    maior `form_idle_owner_close_min` (240 min) e o motivo e
-    `form_ocioso_analista` — era exatamente o estado dos casos que travavam os
-    caps: o analista entrou no formulario e o TOA nunca mostra a saida dele.
-  - Fechar cancela as rotas presas (`form_route_cancelled`) e libera a vaga. O
-    relogio de vida e o sinal **mais recente**: ultima mensagem -> `started_time`
-    do closure -> `assigned_at` do caso no ledger -> relogio do indice (boot,
-    ultimo recurso). Sem as duas referencias do meio, um formulario de horas
-    atras parecia novo a cada restart e a janela de vida nunca fechava nada.
-- **Indice enxuto:** a poda tira do indice o formulario cujo caso no ledger ja foi
-  encerrado de verdade (`form_done`/`chat_removed` → `form_forget
-  motivo=caso_encerrado`). Caso expirado por TTL/`stale_boot` **nao** descarta: o
-  formulario pode estar aberto no TOA. Antes o indice so crescia (14 → 32 em 15
-  min em producao) e a varredura seguia lendo no TOA o que a abertura ja ignorava.
-- **Trava de identidade:** mesmo no palpite por fila, se a chave do caso do
-  formulario aponta para **outro** address (`a:u:<outro>`), o vinculo e recusado.
-  Sem isso o chat de um tecnico entrava no caso de outro (o caso que "trocava de
-  analista" no painel). Vinculo vindo de palpite fica registrado em
-  `case_link_unconfirmed`, com a regra usada.
-- **Caso unico:** ao vincular, o ledger do formulario (`route_assignments`) e a rota
-  dele passam a usar a chave do tecnico (`db.relink_case`, sem mexer em `assigned_at`).
-  E isso que faz a afinidade (secao 8.2) entregar os dois ao mesmo analista.
-- **Ramo 1 sem dono:** o chat entra na fila com `pending_routes.expects_owner = 1`
-  (aviso `form_waiting`, sem posicao de fila) e **nao gasta tentativa nem cai no
-  fallback**: o tick entrega assim que o formulario ganhar um analista elegivel.
-- **Peca irma** (`_deliver_sibling`): quando um dos itens do caso e entregue, o outro
-  (se ainda estiver esperando) vai junto para o mesmo analista (`case_sibling_delivered`).
-- **Formulario encerrado:** as rotas presas ao dono voltam a ser rota normal
-  (`expects_owner = 0`), para o chat nao ficar preso a um caso que acabou.
-- **Estados do formulario** (espelham o `closureState` da extensao do TOA):
-  **pendente** (ninguem pegou), **em atendimento** (o analista entrou) e **passado**
-  (o analista saiu / atendimento concluido). O estado e lido das **mensagens do
-  formulario** (`get_chat_messages`, so leitura: `system_message` de entrada/saida
-  de quem nao e o tecnico nem o bot). So pendente e em atendimento interessam para
-  a abertura; **passado sai de cena** (`form_closed`: sai do indice, o caso fecha e
-  quem esperava por ele volta a rota normal). A leitura e feita no boot (para cada
-  formulario reidratado), na abertura com leitura forcada (a resposta ao tecnico nunca sai de cache), antes de cada entrega (formulario passado nao entra na fila: form_skip_past) e numa varredura que revalida UM formulario
-  por tick — a mesma "visao viva" que a extensao mantem. Se o TOA nao responder
-  nada, **nao se decide**: formulario vivo nao cai por falha de leitura.
-- **Vinculo definitivo:** um formulario ja oferecido a **qualquer** chat (mesmo
-  encerrado) nao e oferecido de novo. Era o falso positivo do teste de 22/09: o
-  chat do tecnico fechava, o formulario voltava a ficar "livre" e a abertura
-  aparecia em um chat posterior, de outro assunto.
-- **Identidade do caso (sem "balde"):** chave de caso **nunca** sai de nome
-  generico. Sem o address do tecnico, a chave do formulario e **por item**
-  (`chat:<id>`), entao cada formulario e um caso proprio e a afinidade nao junta
-  solicitantes diferentes. Na entrega, a **identidade do payload manda** sobre a
-  chave que ja estava na rota (a divergencia vira evento `case_key_divergente`).
-  A migracao repara as chaves genericas antigas (`n:message scenario agent` →
-  `chat:<id>`), sem fechar caso nenhum.
-- **Afinidade entrega direto ao dono** — inclusive com o cap cheio (é o "um caso
-  so" do desenho). O cap vale para o **rodizio**: quem esta no limite nao recebe
-  item novo, que **espera na fila** (a mesma do chat) e vai sendo liberado
-  conforme a carga dos analistas diminui.
-- **Duas linhas na fila:** chat e formulario esperam em **linhas apartadas** — chat na
-  linha do chat, formulario na linha do formulario. Um formulario enviado depois de 10
-  chats e o **1o da linha dele** (nao o 11o), e o tick tenta a cabeca das duas na mesma
-  passada, alternando por qual comeca. Com a fila ligada o formulario **espera sem
-  limite**, como o chat; `form_route_attempts`/fallback valem com a fila **desligada**.
-  O formulario continua **sem anunciar posicao** (ninguem recebe mensagem nele).
-- **Restart:** o bot nao e participante do formulario, entao `_open_forms` (memoria)
-  e reidratado no boot a partir do ledger (`bootstrap` -> `_hydrate_open_forms`) e
-  os reidratados passam pela leitura de estado (`_validate_open_forms`).
-- **Textos (aba Templates):** `form_pending` (com `{analista}`), `form_pending_wait`
-  (formulario ainda sem analista) e `form_waiting` (ramo 1 aguardando o dono). A
-  migracao converte `\n` **literal** em quebra de linha real (a primeira versao da
-  semente gravou barra+n, e o `INSERT OR IGNORE` nunca corrigia).
-- **Indice do formulario:** o bot acompanha os formularios abertos em memoria
-  (`_open_forms`). Ele **so sai** com fim explicito (payload com `lifecycle`
-  removido/finalizado ou `ended_time` que seja data de verdade), com `chat_removed`,
-  pelo TTL de 12 h ou quando o caso no ledger ja esta encerrado (`form_done`/
-  `chat_removed`). Um `helpdesk_chat_removed` **nao** tira: e aviso de fila (o
-  `move_chat` para o analista gera um destes) e o formulario continua aberto.
-  Payload pobre (sem `mode`/`first_message`) tambem nao tira mais.
-- **Diagnostico:** `form_indexed`, `form_not_open`, `form_dropped`,
-  `form_ignored_payload`, `form_queue_left`, `form_forget` e `form_aware_skip`
-  (com `abertos=`, `na_fila=`, `vinculados=`, `encerrados=`) deixam a decisao
-  auditavel — antes, cada um desses caminhos falhava em silencio.
-- **Boot:** `_hydrate_open_forms` roda **antes** do resume e a varredura de boot
-  **nao** fecha caso de formulario (o bot nao e participante dele, entao ele nunca
-  aparece em `get_active_chats` — a varredura fechava formulario vivo como
-  `stale_boot`). O TTL (`route_assign_ttl_sec`) segue fechando caso orfao.
-- Sem formulario vinculavel, **nada muda**: o menu normal continua igual.
-
+**O que continua:** o formulário de validação segue roteado para o time da fila (fila habilitada
++ time ativo + `team_routing.form_enabled`), com afinidade pelo caso (`case_key`), peça irmã
+(`case_sibling_delivered`) e fechamento por ausência no TOA / ociosidade. A coluna
+`chats.linked_form_chat_id` também fica (legado, sem uso).
 ## 5. Folha escolhida: onde a demanda e decidida
 
 ```mermaid
@@ -514,6 +399,61 @@ depois do ACK, e um `route_seen` sem atomicidade).
   (com *Liberar*), alem do `close_reason` visivel.
 
 
+### 8.9 Analista offline: o caso volta para a fila (resgate em 28/09)
+
+```mermaid
+flowchart TD
+  P[get_online_users a cada load_poll_sec] --> C{leitura boa?}
+  C -->|nao| C1[online_ok = 0: nao afirma ausencia]
+  C -->|sim| S{esta online?}
+  S -->|sim| S1[offline_since = NULL]
+  S -->|nao| S2[offline_since = COALESCE antigo, now]
+  S2 --> R[analyst_load.online_ok=1, online=0, offline_since > offline_requeue_sec]
+  R --> T{tick_timeouts: ate 5 casos}
+  T --> F[fecha a rota aberta - failed]
+  F --> L[_close_case analista_offline: solta cap, reserva e afinidade]
+  L --> CH{kind}
+  CH -->|chat| M[status classified + moved_at NULL + rejoin + requeue_notice]
+  CH -->|form| FS[volta em silencio]
+  M --> N[rota nova kind=chat com exclude_assignee = antigo dono]
+  FS --> N2[rota nova kind=form com exclude_assignee]
+  N --> E[evento case_reclaimed; tick entrega para outro elegivel]
+  N2 --> E
+```
+
+- **Regua:** `offline_requeue_sec` (global, padrao **120 s**) — o time sobrescreve em `team_routing.offline_requeue_sec` e **`0` desliga** naquele time; `offline_requeue_enabled` (global) desliga em tudo.
+- **Como o "offline" e medido:** `snapshot_load` ja consulta `get_online_users` para todo mundo a cada `load_poll_sec`; agora grava `analyst_load.online_ok` (a leitura respondeu?) e `offline_since` (carimbo da **primeira** leitura que viu o analista offline). **Leitura falha nunca devolve caso de ninguem** — o resgate exige `online_ok=1`.
+- **O que o robo faz (por caso, ate 5 por tick):** encerra a rota aberta, fecha o caso no ledger (`close_reason=analista_offline`, liberando cap/reserva/afinidade), e cria **rota nova** com `pending_routes.exclude_assignee` = o antigo dono (a rota socorrida nao pode voltar para ele — nem pela afinidade, nem com `require_online=false`). No **chat**: volta a `classified`, limpa `moved_at`, entra no chat e avisa `requeue_notice` (“Operador ficou offline, transferindo para outro operador”); na fila ele segue recebendo posicao. No **formulario**: devolucao silenciosa (nao ha conversa).
+- **Guardas do TOA:** formulario que ainda aparece com o dono offline dentro recusa o `move_chat` (`e=10`): o bot **nao adota** esse dono e **nao consome** o teto de `move_fails` (a rota espera ele sair); no chat, se o novo move for recusado, o bot **convida mesmo assim** (`reclaim_invite_only`).
+- **Manual:** o botao **Devolver a fila** (aba Carga) grava `bot_jobs(kind='requeue_offline', payload=<address>)` e o bot roda o MESMO caminho, ignorando o limite do tick (decisao humana).
+- **Configuracao:** Roteamento (liga/desliga + segundos; por time na linha do time), Templates (`requeue_notice`), Atividade (`case_reclaimed`, `reclaim_invite_only`, `reclaim_no_queue`, `reclaim_empty`) e a coluna **Offline ha** + alerta na aba Carga.
+
+### 8.10 Analista entra no chat da fila: o caso e dele e o bot sai
+
+A fila nao bloqueia o chat — o tecnico continua falando com o bot enquanto espera, e um analista pode
+entrar por conta propria. Quando isso acontece:
+
+```mermaid
+flowchart TD
+  A[Analista entra no chat] --> B{chat esta classified com rota waiting?}
+  B -->|nao| B1[ignora]
+  B -->|sim| C{quem entrou e do time da fila?}
+  C -->|nao| C1[ignora: tecnico, supervisor, terceiro]
+  C -->|sim| D[fecha a rota - done: adotado]
+  D --> E[assign_open com identity_source=adocao]
+  E --> F[peca irma: o formulario do mesmo caso vai junto]
+  F --> G[evento chat_adopted + bot sai - closed]
+```
+
+- **Dois ganchos** (o caso e o mesmo): a nota `user_joined` de um membro do time (`_note_join_analista`)
+  e a checagem **antes de falar de fila** (`_queue_notify` → `_analista_presente`, lendo os
+  `participants` presentes do payload mais recente do chat). O segundo cobre nota perdida (restart,
+  janela de WS cego) e e o que evita o aviso "voce avancou na fila" para um chat que ja tem dono.
+- **Por que importa:** sem isso o bot nao registrava o dono (o caso nao contava no cap/afinidade dele) e
+  o tick seguinte podia **entregar o mesmo chat para outro analista** (dupla atribuicao).
+- Ignorados de proposito: o proprio bot, o tecnico que abriu o chat (`started_addr`) e quem nao e do
+  time da fila — `user_joined` de terceiro nao muda nada.
+
 ## 9. Timers e saude do processo
 
 ```mermaid
@@ -634,7 +574,7 @@ flowchart TD
 | `menu_queues` | menu ligado a 1 fila |
 | `menu_options` | opcoes raiz e filhas: `label`, `classification`, `action`, `reply_text`, `script_slug` (`action_if_form`/`reply_text_if_form` ficaram como **legado sem uso**) |
 | `menu_option_targets` | alvos por opcao — **hoje o motor nao usa** |
-| `templates` | textos: `greeting`, `menu`, `retry`, `closing`, `ask_received`, `ask_transferring`, `queue_position`, `form_pending`, `form_pending_wait`, `form_waiting` |
+| `templates` | textos: `greeting`, `menu`, `retry`, `closing`, `ask_received`, `ask_transferring`, `queue_position`, `queue_progress`, `queue_expired` (os da abertura form-aware sairam em 28/09) |
 | `menu_option_questions` | perguntas da opcao `ask_and_transfer`, coletadas no chat antes de transferir |
 
 ### Times e roteamento
@@ -686,9 +626,9 @@ de atendimento **nao le** nenhuma dessas tabelas; `bot_migrate_rbac` (PHP) e
 | **Filas** | liga/desliga a fila para o bot e dispara a sincronizacao do catalogo |
 | **Operadores** | operadores por fila, vindos do TOA ou cadastro manual |
 | **Times** | time, membros, **Ordem**, **janela de plantao** e as filas do time |
-| **Roteamento** | **globais** - bot ligado, formulario roteado, estrategia, fallback, caps, **fila de espera** (ligada/desligada e espera maxima) - **por time** - estrategia, caps, online, plantao, tentativas, fallback, recebe formulario - **por membro** - peso, cap chat, cap form, casos e recebe formulario |
+| **Roteamento** | **globais** - bot ligado, formulario roteado, estrategia, fallback, caps, **fila de espera** (ligada/desligada e espera maxima), **resgate de analista offline** (`offline_requeue_enabled` + `offline_requeue_sec`) - **por time** - estrategia, caps, online, plantao, tentativas, fallback, recebe formulario, `offline_requeue_sec` (0 = o time nao devolve) - **por membro** - peso, cap chat, cap form, casos e recebe formulario |
 | **Menus** | menus, opcoes, submenus, acao/texto normais, **acao/texto se formulario aberto** e scripts |
-| **Templates** | textos `greeting`, `menu`, `retry`, `closing`, `ask_received`, `ask_transferring`, `queue_position` (posicao na fila de espera) e a abertura form-aware: `form_pending` (`{analista}`), `form_pending_wait` e `form_waiting` |
+| **Templates** | textos `greeting`, `menu`, `retry`, `closing`, `ask_received`, `ask_transferring`, `queue_position` (posicao na fila de espera), `queue_progress`, `queue_expired` e `requeue_notice` (operador offline) |
 | **Atividade** | log de eventos com filtro por tipo e atualizacao automatica na primeira pagina |
 | **Carga** | leitura das listas do TOA por analista (`analyst_load`): TOA x bot, casos, reservas, formulario mais antigo e a hora da leitura; **Atualizar agora** forca a leitura (job `load_snapshot`) |
 | **Chats** | estado dos chats, sem conteudo de conversa |
@@ -704,7 +644,7 @@ de atendimento **nao le** nenhuma dessas tabelas; `bot_migrate_rbac` (PHP) e
 | Conversa e desfecho | `ignored_reply`, `reply_replayed`, `send_failed`, `classified`, `transferred`, `no_agent`, `closed_invalid`, `closed_timeout`, `closed_no_agent`, `left`, `resume_stale` |
 | Scripts | `script_ok`, `script_error`, `script_denied` |
 | Formulario de validacao | `closure`, `form_routed`, `form_no_agent`, `form_route_retry`, `form_no_team`, `form_no_queue`, `form_adopted` (ja estava com um analista do time), `form_move_refused` (`move_chat` recusado no teto), `form_skip_past` (formulario encerrado nao entra na fila) |
-| Abertura form-aware | `case_linked`, `case_link_unconfirmed` (vinculo por palpite de fila, sem identidade), `form_aware_greeting`, `form_aware_choice`, `form_aware_wait`, `form_aware_skip`, `case_sibling_delivered` |
+| Caso/formulario | `case_link_unconfirmed`, `case_sibling_delivered`, `case_key_divergente`, `case_closed` (a abertura form-aware foi removida em 28/09) |
 | Indice do formulario | `form_indexed`, `form_not_open`, `form_dropped`, `form_ignored_payload`, `form_queue_left`, `form_forget` (inclui `motivo=ausente_no_toa`), `form_state` (pendente/em atendimento/passado), `form_closed`, `form_resolvido_toa` (ausente das listas do TOA por `form_absent_readings` leituras: fecha o caso e libera a vaga), `form_route_cancelled` |
 | Carga por analista | `analyst_load` (resumo de cada leitura: analistas, itens vistos no TOA, `toa_ok` e quantos foram resolvidos por ausencia) |
 | Resposta ignorada | `message_ignored` (mensagem do tecnico em status que o bot nao trata; antes era silencioso) |
@@ -712,6 +652,8 @@ de atendimento **nao le** nenhuma dessas tabelas; `bot_migrate_rbac` (PHP) e
 | Catalogo | `catalog_synced`, `sync_error` |
 | Perguntas antes de transferir | `ask_collected`, `route_retry` |
 | Fila de espera | `queued`, `queue_position`, `queued_assigned`, `queue_expired` |
+| Analista offline (resgate) | `case_reclaimed` (caso devolvido a fila), `reclaim_invite_only` (chat: move recusado, so convida), `reclaim_no_queue` (caso sem fila), `reclaim_empty` (botao do painel sem caso aberto) |
+| Analista entra na fila | `chat_adopted` (analista do time entrou no chat que esperava: caso e dele e o bot sai) |
 
 ## 14. Status possiveis do chat
 
@@ -721,7 +663,7 @@ de atendimento **nao le** nenhuma dessas tabelas; `bot_migrate_rbac` (PHP) e
 | `joined` | bot entrou no chat |
 | `menu_sent` | menu enviado |
 | `awaiting_reply` | esperando o digito, com timeout |
-| `awaiting_form_choice` | abertura form-aware: esperando 1 (falar sobre o formulario) ou 2 (abrir o menu) |
+| ~~`awaiting_form_choice`~~ | **removido em 28/09** (abertura form-aware); chats antigos nesse status sao ignorados |
 | `awaiting_script_answer` | script: preenchendo campo |
 | `awaiting_script_confirm` | script: confirmando os dados |
 | `awaiting_script_run` | script: execucao em andamento |
@@ -741,7 +683,7 @@ Quem esta na fila de espera continua em `classified` ate ser atribuido (`closed`
 | Item | Situacao |
 |---|---|
 | **Fila de espera com posicao** | **feita Fase 2** - vive na `pending_routes` (nao numa `route_queue` a parte): posicao FIFO por time, aviso no chat e silencio no formulario |
-| **Abertura form-aware** | **feita**: ao assumir, se o tecnico tem formulario aberto, o bot oferece 1) falar sobre o formulario / 2) abrir o menu (secao 4.1); o chat espera o analista do formulario ou entra na fila, e chat + formulario do mesmo tecnico sao **um caso so** |
+| **Abertura form-aware** | **removida em 28/09**: associava errado o formulario ao chat; agora o chat de fila sempre recebe o menu |
 | **Painel da fila de espera** | **feito Fase 2** na aba Roteamento: posicao, tempo de espera, tentativas, vencimento e "Encerrar espera". "Vagas do time" nao entram: dependem da presenca ao vivo do TOA, que o painel nao enxerga |
 | **Metricas de espera** | **feitas Fase 2**: card "Fila de espera do chat" no Dashboard (na fila agora, espera media e maior espera do periodo) |
 | `action_if_form` / `reply_text_if_form` do menu | **legado sem uso**: o painel grava vazio e o motor ignora (removido junto com `has_open_validation_form`); a abertura form-aware ficou no vinculo do caso (secao 4.1) |
@@ -765,6 +707,7 @@ python tests/test_form_aware.py
 python tests/test_ask_flow.py
 python tests/test_queue.py
 python tests/test_load.py
+python tests/test_offline_reclaim.py
 python tests/test_reply_lost.py
 
 # Suites PHP
@@ -782,5 +725,5 @@ php tests/test_panel_render.php
 
 ---
 
-**Resumo em uma frase:** o bot assume o chat da fila habilitada, **abre form-aware quando o tecnico ja tem um formulario de validacao em andamento (1 falar sobre ele / 2 menu, com chat e formulario como um caso so)**, oferece o menu, classifica a folha escolhida e entao decide quem recebe - contando **casos por solicitante** no TOA, no ledger e nas entregas em voo - com **afinidade** para o formulario do mesmo tecnico, **fila de espera com posicao e sem limite de tempo** no chat (o tecnico so sai quando um analista aparece, ele mesmo sai ou alguem usa *Encerrar espera*), timeout medido por **silencio real do tecnico** com recuperacao da resposta que chegou com o bot fora, e retry assincrono para o formulario, que nunca entra na conversa nem e encerrado pelo bot.
+**Resumo em uma frase:** o bot assume o chat da fila habilitada (**com menu ativo e time ativo — sem isso nao entra**), oferece o menu, classifica a folha escolhida e entao decide quem recebe - contando **casos por solicitante** no TOA, no ledger e nas entregas em voo - com **afinidade** para o formulario do mesmo tecnico, **fila de espera com posicao e sem limite de tempo** no chat (o tecnico so sai quando um analista aparece, ele mesmo sai ou alguem usa *Encerrar espera*), timeout medido por **silencio real do tecnico** com recuperacao da resposta que chegou com o bot fora, e retry assincrono para o formulario (que exige a MESMA fila habilitada + time ativo do chat), que nunca entra na conversa nem e encerrado pelo bot.
 

@@ -44,14 +44,13 @@ _FORM_STATE_TTL_SEC = 120.0
 # dono do formulario de outro tecnico para este caso.
 _REGRAS_IDENTIDADE = ("address", "autor", "name")
 
-# Status em que o bot espera resposta do tecnico. Ficava repetido em dois pontos
-# e foi exatamente esquecer o status novo em um deles que engoliu o "1" da
-# abertura form-aware: agora a lista e uma so.
+# Status em que o bot espera resposta do tecnico. A lista e uma so de proposito:
+# ficava repetida e foi esquecer o status novo em um dos pontos que engoliu a
+# resposta do tecnico.
 _REPLY_STATUSES = (
     "awaiting_reply",
     "awaiting_script_answer",
     "awaiting_script_confirm",
-    "awaiting_form_choice",
 )
 
 
@@ -140,6 +139,14 @@ def _last_activity(row: dict) -> datetime | None:
     """Marca mais recente entre a ultima pergunta do bot e a ultima resposta do tecnico."""
     marcas = [t for t in (_as_utc(row.get("last_prompt_at")), _as_utc(row.get("last_reply_at"))) if t]
     return max(marcas) if marcas else None
+
+
+def _offline_seconds(valor) -> float:
+    """Segundos desde o carimbo de offline (0 quando nao da para ler a data)."""
+    quando = _as_utc(valor)
+    if quando is None:
+        return 0.0
+    return max(0.0, (datetime.now(timezone.utc) - quando).total_seconds())
 
 
 def _silence_expired(row: dict, seconds: int, *, now: datetime | None = None) -> bool:
@@ -314,6 +321,31 @@ def _choice_of(text: str) -> str:
     if t.startswith("abrir") or t.startswith("menu"):
         return "2"
     return ""
+
+
+def _presentes(chat: dict) -> list[str]:
+    """Enderecos PRESENTES no chat (`participants` com `present`).
+
+    Aceita as duas formas do TOA: dict address->participante (o address sai da
+    CHAVE quando o payload nao o repete dentro) e lista de participantes.
+    """
+    parts = chat.get("participants") or {}
+    if isinstance(parts, dict):
+        itens = list(parts.items())
+    elif isinstance(parts, list):
+        itens = [(p.get("address"), p) for p in parts if isinstance(p, dict)]
+    else:
+        return []
+    vistos: list[str] = []
+    for chave, p in itens:
+        if not isinstance(p, dict):
+            p = {"present": True}
+        if not p.get("present"):
+            continue
+        addr = str(p.get("address") or chave or "")
+        if addr:
+            vistos.append(addr)
+    return vistos
 
 
 def _own_present_in(chat: dict, own: str) -> bool:
@@ -536,7 +568,6 @@ class Engine:
                     f"origem={origem}; {_form_shape(chat)}",
                 )
             self._close_case(cid, "form_done")
-            self._unblock_linked_chats(cid)
             return
         if cid in self._open_forms and cid not in self._form_not_open:
             # Payload sem sinal de formulario: o antigo descartava o indice aqui
@@ -642,7 +673,6 @@ class Engine:
         # Motivo no ledger: a ausencia nas listas do TOA e o sinal mais forte (o
         # formulario resolvido desaparece da lista) — vale registrar como tal.
         self._close_case(int(fid), "form_resolvido_toa" if str(motivo).startswith("form_resolvido_toa") else "form_done")
-        self._unblock_linked_chats(int(fid))
         # Formulario encerrado nao tem mais o que entregar: sem isso uma rota
         # `waiting` seguia tentando `move_chat` num chat que o TOA ja recusa —
         # era o retry infinito dos formularios antigos (13..32 tentativas).
@@ -848,6 +878,16 @@ class Engine:
                 db.upsert_queue(self.conn, q, "")
             self._emit("queue_off", cid, q, "fila desabilitada")
             return
+        # Fila habilitada mas sem menu ATIVO (ou sem opcoes) / sem time ATIVO: o
+        # bot NAO assume. Antes ele assumia, mandava o menu e so descobria na
+        # entrega — o chat terminava em "menu vazio" (join_failed) ou encerrado
+        # por falta de time (closed_no_agent), sem transferir ninguem.
+        if not db.queue_menu_options(self.conn, q):
+            self._emit("queue_no_menu", cid, q, "fila habilitada sem menu ativo (ou sem opções)")
+            return
+        if not db.team_for_queue(self.conn, q):
+            self._emit("queue_no_team", cid, q, "fila habilitada sem time ativo")
+            return
         if not is_new(chat, self.own):
             self._emit("not_new", cid, q, "já tem analista ou bot")
             return
@@ -916,9 +956,9 @@ class Engine:
             return
         db.upsert_chat(self.conn, cid, queue_address=queue_address, status="joined")
         self._emit("assumed", cid, queue_address, "chat assumido")
-        if await self._form_aware_greet(cid, queue_address):
-            return
-        opts = db.menu_options(self.conn, queue_address, None)
+        # Sem abertura form-aware: o chat de fila sempre recebe o MENU da fila
+        # (a verificacao de formulario aberto foi removida — associava errado).
+        opts = db.queue_menu_options(self.conn, queue_address)
         if not opts:
             self._emit("join_failed", cid, queue_address, "menu vazio")
             return
@@ -943,165 +983,6 @@ class Engine:
             return
         log.info("rejoin_silent %s fila=%s", cid, queue_address)
 
-    # ------------------------------------------------------------------
-    # Abertura form-aware: o tecnico abre o chat e ja tem formulario aberto
-    # ------------------------------------------------------------------
-    def _match_open_form(
-        self, cid: int, queue_address: str | None
-    ) -> tuple[dict, str, str, str] | None:
-        """(formulario, regra, dono, diagnostico) do formulario aberto do tecnico.
-
-        Antes de casar, poda o indice (TTL) e descarta candidato cujo caso no
-        ledger ja foi encerrado de verdade (`form_done`/`chat_removed`).
-        """
-        self._prune_open_forms()
-        if not self._open_forms:
-            return None
-        chat = self._queue_chat_snapshot(cid, {})
-        if queue_address and not (chat.get("helpdesk_address") or chat.get("channel_addr")):
-            chat["helpdesk_address"] = queue_address
-        settings = self._team_settings(queue_address, "chat")[1]
-        vinculados = db.open_linked_forms(self.conn)
-        candidatos = form_open.form_candidates(
-            chat, list(self._open_forms.values()), linked=vinculados, own=self.own
-        )
-        vivos: list[dict] = []
-        encerrados = 0
-        ociosos = 0
-        sem_dono: set[int] = set()
-        oferta = self._form_idle_offer_min()
-        for f in candidatos:
-            fid = form_open.form_fid(f)
-            if db.form_case_state(self.conn, fid) == "done":
-                encerrados += 1
-                continue
-            # Ocioso (sem mensagem nova e sem analista do time dentro) nao e
-            # oferecido: era o formulario morto que enchia a fila e desligava a
-            # abertura por ambiguidade.
-            if self._form_ocioso(fid, oferta):
-                ociosos += 1
-                continue
-            if not db.open_assignment(self.conn, fid) and not self._form_owner_msg.get(fid):
-                sem_dono.add(fid)
-            vivos.append(f)
-        info = (
-            f"abertos={len(self._open_forms)}; na_fila={len(candidatos)};"
-            f" vinculados={len(vinculados)}; encerrados={encerrados}; ociosos={ociosos}"
-        )
-        if not vivos:
-            return None, "", "", info
-        form, regra = form_open.form_by_technician(
-            chat,
-            vivos,
-            self.own,
-            match_name=bool(settings.get("affinity_match_name")),
-            linked=vinculados,
-            authors=self._form_authors,
-            sem_dono=sem_dono,
-        )
-        if not form:
-            # `regra` traz o motivo da desistencia (ex.: `ambiguo:3`).
-            return None, "", "", (f"{info}; {regra}" if regra else info)
-        fid = int(form.get("chat_id") or form.get("chatId"))
-        dono = str((db.open_assignment(self.conn, fid) or {}).get("assignee") or "")
-        return form, regra, dono, info
-
-    def _case_identity(self, cid: int, form: dict | None = None) -> tuple:
-        """Identidade do CASO: o chat manda (o formulario costuma vir sem address)."""
-        req = form_open.requester_key(self._queue_chat_snapshot(cid, {}), self.own)
-        if req and req[0]:
-            return req
-        if form:
-            req = form_open.requester_key(form, self.own)
-            if req and req[0]:
-                return req
-        return ('chat:' + str(int(cid)), '', '', '')
-
-    def _link_case(self, cid: int, fid: int, case_key: str, req: tuple, regra: str = "") -> int:
-        """Amarra chat e formulario no MESMO caso (ledger, rota e marca no chat).
-
-        O vinculo no CHAT (`linked_form_chat_id`) vale sempre. A reescrita do caso
-        do formulario (`relink_case`) exige identidade: confirmada (address/autor/
-        nome) ou, no palpite por fila, um formulario cuja identidade propria NAO
-        conflite com quem abriu o chat (`_form_identidade_conflita`). Era o
-        vinculo cego por recencia que movia o formulario de OUTRO tecnico para
-        este caso — o caso "trocava de analista" no painel.
-        """
-        db.set_linked_form(self.conn, cid, int(fid))
-        if str(regra or "") not in _REGRAS_IDENTIDADE:
-            # Auditoria do vinculo por palpite de fila (o chamador ja recusou
-            # conflito de identidade). Era este caminho que passava despercebido.
-            self._emit(
-                "case_link_unconfirmed", cid, MEM.get(int(cid), {}).get("queue_address"),
-                f"form={int(fid)}; regra={regra or '—'}; unificado por fila",
-            )
-        mudou = 0
-        if db.open_assignment(self.conn, int(fid)):
-            mudou = db.relink_case(
-                self.conn, int(fid),
-                str(case_key or ""),
-                str(req[1] if len(req) > 1 else ""),
-                str(req[2] if len(req) > 2 else ""),
-                str((req[3] if len(req) > 3 else "") or "address"),
-            )
-        for linha in self.conn.execute(
-            """SELECT id, case_key FROM pending_routes
-                WHERE kind = 'form' AND chat_id = ?
-                  AND status NOT IN ('done', 'failed', 'cancelled')""",
-            (int(fid),),
-        ).fetchall():
-            if str(linha.get("case_key") or "") == str(case_key or ""):
-                continue
-            db.set_delivery_marks(
-                self.conn, int(linha["id"]),
-                case_key=str(case_key or ""),
-                requester_addr=str(req[1] if len(req) > 1 else ""),
-            )
-        return mudou
-
-    async def _fill_form_authors(self, cid: int, queue_address: str | None, limite: int = 3) -> bool:
-        """Le as mensagens dos candidatos para achar o AUTOR do formulario.
-
-        O payload do `message_scenario` costuma vir sem o address do tecnico; o
-        autor das mensagens dele e a identidade que sobra (sem isso o vinculo
-        caia em `regra=fila`, palpite por recencia). Le no maximo `limite`
-        candidatos (os mais recentes) e devolve True quando algum ganhou autor.
-        """
-        chat = self._queue_chat_snapshot(cid, {})
-        if queue_address and not (chat.get("helpdesk_address") or chat.get("channel_addr")):
-            chat["helpdesk_address"] = queue_address
-        candidatos = form_open.form_candidates(
-            chat, list(self._open_forms.values()),
-            linked=db.open_linked_forms(self.conn), own=self.own,
-        )
-        novo = False
-        for f in (candidatos[-int(limite):] if limite else []):
-            fid = form_open.form_fid(f)
-            if not fid or self._form_authors.get(fid):
-                continue
-            await self._refresh_form_state(fid, motivo="autores", forcar=True)
-            if self._form_authors.get(fid):
-                novo = True
-        return novo
-
-    def _form_pending_text(self, dono: str, queue_address: str | None = None) -> str:
-        if not dono:
-            return str(self.tpl.get("form_pending_wait") or "").strip()
-        nome = dono
-        membro = self._member_of_queue(queue_address, dono)
-        if membro:
-            nome = str(membro.get("name") or dono).strip() or dono
-        return str(self.tpl.get("form_pending") or "").replace("{analista}", nome).strip()
-
-    def _member_of_queue(self, queue_address: str | None, addr: str) -> dict | None:
-        team, _ = self._team_settings(queue_address, "chat")
-        if not team:
-            return None
-        for m in db.team_members(self.conn, team["id"]):
-            if _addr_eq(m.get("address"), addr):
-                return m
-        return None
-
     def _operadores_da_fila(self, queue_address: str | None) -> set[str]:
         """Enderecos dos analistas do time da fila (separa tecnico de analista)."""
         if not queue_address:
@@ -1114,32 +995,6 @@ class Engine:
             for m in db.team_members(self.conn, team["id"])
             if m.get("address")
         }
-
-    def _form_identidade_conflita(self, fid: int, cid: int) -> str:
-        """O formulario do palpite por fila e de OUTRO tecnico? Devolve o motivo.
-
-        A chave do caso do formulario (`a:<address>`) e a identidade dele. Quando
-        ela aponta para alguem diferente de quem abriu o chat, o vinculo por
-        recencia unificaria casos de pessoas diferentes — era assim que um caso
-        "trocava de analista" no painel.
-        """
-        chave = str((db.open_assignment(self.conn, int(fid)) or {}).get("case_key") or "").strip().lower()
-        if not chave:
-            for r in self.conn.execute(
-                "SELECT case_key FROM pending_routes WHERE kind = 'form' AND chat_id = ?"
-                " AND status = 'waiting'",
-                (int(fid),),
-            ).fetchall():
-                chave = str(r.get("case_key") or "").strip().lower()
-                if chave:
-                    break
-        if not chave.startswith("a:"):
-            return ""
-        alvo = form_open.chat_opener(self._queue_chat_snapshot(int(cid), {}), self.own)
-        addr = str(alvo.get("address") or "").strip().lower()
-        if not addr or chave[2:] == addr:
-            return ""
-        return f"form={int(fid)} e de {chave[2:]}; chat de {addr}"
 
     def _autores_form(self, fid: int) -> list[str]:
         """Chaves `a:<address>` dos autores do formulário — só com UM autor.
@@ -1170,116 +1025,6 @@ class Engine:
             return max(1, int(self.cfg.get("form_move_max_fail") or 3))
         except (TypeError, ValueError):
             return 3
-
-    def _form_owner(self, row: dict) -> str:
-        """Analista que atende o formulario vinculado ao chat (`linked_form_chat_id`)."""
-        fid = row.get("linked_form_chat_id")
-        if not fid:
-            return ""
-        return str((db.open_assignment(self.conn, int(fid)) or {}).get("assignee") or "")
-
-    async def _form_aware_greet(self, cid: int, queue_address: str | None) -> bool:
-        """Oferece 1) falar sobre o formulario / 2) abrir o menu.
-
-        Devolve True quando assume a conversa com as opcoes (o menu normal nao e
-        enviado). Sem formulario vinculavel, devolve False e nada muda.
-        """
-        achado = None
-        for _tentativa in range(3):
-            candidato = self._match_open_form(cid, queue_address)
-            if not candidato:
-                self._emit("form_aware_skip", cid, queue_address, "nenhum formulario no indice")
-                return False
-            if not candidato[0]:
-                # Sem identidade no payload: le as mensagens dos candidatos para
-                # achar o AUTOR (o tecnico escreve no formulario) e decide de novo.
-                # So depois de esgotar isso o vinculo e recusado.
-                if _tentativa == 0 and await self._fill_form_authors(cid, queue_address):
-                    continue
-                # Diagnostico do porque nao casou (antes isso era silencioso).
-                self._emit("form_aware_skip", cid, queue_address, candidato[3] or "sem candidato na fila")
-                return False
-            form, regra, dono, info = candidato
-            fid_cand = form_open.form_fid(form)
-            if regra == "fila":
-                # Palpite por fila: so vale sem conflito de identidade. Com o
-                # formulario de OUTRO tecnico, o vinculo unificaria casos de
-                # pessoas diferentes (era o caso que "trocava de analista").
-                conflito = self._form_identidade_conflita(fid_cand, cid)
-                if conflito:
-                    self._emit("form_aware_skip", cid, queue_address, conflito)
-                    return False
-            # Visao viva (como a extensao do TOA): formulario passado nao entra.
-            # Leitura FORCADA: a resposta ao tecnico nao pode sair de cache.
-            estado = await self._refresh_form_state(fid_cand, motivo="abertura", forcar=True)
-            if estado == form_open.FORM_PAST:
-                self._emit("form_aware_skip", cid, queue_address, f"form={fid_cand} passado; {info}")
-                continue
-            # A leitura acima traz o relogio da vida dele: formulario sem mensagem
-            # nova (e sem analista do time dentro) nao e oferecido.
-            if self._form_ocioso(fid_cand, self._form_idle_offer_min()):
-                self._emit(
-                    "form_aware_skip", cid, queue_address,
-                    f"form={fid_cand} ocioso ({self._form_idle_min(fid_cand):.0f} min); {info}",
-                )
-                continue
-            if regra == "fila" and _tentativa == 0:
-                # A leitura acima pode ter revelado o AUTOR das mensagens: com
-                # identidade o vinculo deixa de ser palpite (e unifica o caso).
-                novo = self._match_open_form(cid, queue_address)
-                if novo and novo[0] and str(novo[1]) in _REGRAS_IDENTIDADE:
-                    achado = novo
-                    break
-            achado = candidato
-            break
-        if not achado:
-            return False
-        form, regra, dono, _info = achado
-        fid = form_open.form_fid(form)
-        req = self._case_identity(cid, form)
-        mudou = self._link_case(cid, fid, req[0], req, regra=regra)
-        self._emit(
-            "case_linked", cid, queue_address,
-            f"form={fid}; regra={regra}; dono={dono or '—'}; case={req[0] or '—'}; ledger={mudou}",
-        )
-        txt = self._form_pending_text(dono, queue_address)
-        now = datetime.now(timezone.utc)
-        db.upsert_chat(
-            self.conn, cid,
-            queue_address=queue_address,
-            status="awaiting_form_choice",
-            retries=0,
-            menu_node_id=None,
-            menu_sent_at=now,
-            last_prompt_at=now,
-            linked_form_chat_id=fid,
-        )
-        await self.send_guarded(cid, txt, queue_address)
-        self._emit(
-            "form_aware_greeting", cid, queue_address,
-            f"form={fid}; 1=falar sobre o formulario; 2=menu" + (f"; dono={dono}" if dono else ""),
-        )
-        return True
-
-    def _unblock_linked_chats(self, fid: int) -> int:
-        """Formulario encerrado: a rota presa ao dono volta a ser rota normal."""
-        ids = [
-            int(r["chat_id"])
-            for r in self.conn.execute(
-                "SELECT chat_id FROM chats WHERE linked_form_chat_id = ?", (int(fid),)
-            ).fetchall()
-        ]
-        livres = 0
-        for cid in ids:
-            cur = self.conn.execute(
-                """UPDATE pending_routes SET expects_owner = 0
-                    WHERE chat_id = ? AND kind = 'chat' AND status = 'waiting'""",
-                (cid,),
-            )
-            livres += int(cur.rowcount or 0)
-        if livres:
-            log.info("form %s encerrado: %s rota(s) de chat liberadas do dono", fid, livres)
-        return livres
 
     def _hydrate_open_forms(self) -> int:
         """Reconstroi o indice de formularios abertos a partir do ledger.
@@ -1605,8 +1350,13 @@ class Engine:
             auth = m.get("author")
             if isinstance(auth, dict):
                 auth = auth.get("address")
-            if _addr_eq(addr or auth, self.own):
+            quem = str(addr or auth or "")
+            if _addr_eq(quem, self.own):
                 self._mark_present(cid)
+                return
+            # Terceiro entrou no chat: se for analista do time e o chat estiver na
+            # fila, o caso e dele — o bot para de avisar posicao e sai.
+            await self._note_join_analista(cid, quem)
             return
         if sysm == "user_left" and m.get("author"):
             await self.on_left(cid, m["author"])
@@ -1641,9 +1391,6 @@ class Engine:
 
     async def handle_reply(self, cid: int, row: dict, text: str) -> None:
         st = row.get("status")
-        if st == "awaiting_form_choice":
-            await self.handle_form_choice(cid, row, text)
-            return
         if st == "awaiting_script_answer":
             if row.get("ask_option_id"):
                 await self.handle_ask_answer(cid, row, text)
@@ -1677,109 +1424,6 @@ class Engine:
             await self.apply_option(cid, row, chosen)
             return
         await self._invalid_reply(cid, row)
-
-    async def handle_form_choice(self, cid: int, row: dict, text: str) -> None:
-        """Abertura form-aware: 1 = falar sobre o formulario, 2 = abrir o menu."""
-        escolha = _choice_of(text)
-        q = row.get("queue_address")
-        if escolha == "2":
-            self._emit("form_aware_choice", cid, q, "2; abrir o menu")
-            await self._prompt_menu(cid, row, None)
-            return
-        if escolha == "1":
-            self._emit("form_aware_choice", cid, q, "1; falar sobre o formulario")
-            await self._form_choice_transfer(cid, row)
-            return
-        await self._invalid_form_choice(cid, row)
-
-    async def _invalid_form_choice(self, cid: int, row: dict) -> None:
-        """Resposta fora de 1/2 na abertura: reenvia as opcoes (mesmo contador)."""
-        max_r = int(self.cfg.get("max_invalid_retries") or 3)
-        retries = int(row.get("retries") or 0)
-        q = row.get("queue_address")
-        if retries >= max_r:
-            await self.close_out(cid, "closed_invalid")
-            return
-        now = datetime.now(timezone.utc)
-        db.upsert_chat(
-            self.conn, cid,
-            status="awaiting_form_choice",
-            retries=retries + 1,
-            last_prompt_at=now,
-        )
-        self._emit("ignored_reply", cid, q, "opção inválida na abertura form-aware")
-        await self.send_guarded(cid, self.tpl.get("retry") or "", q)
-        await self.send_guarded(cid, self._form_pending_text(self._form_owner(row), q), q)
-
-    async def _form_choice_transfer(self, cid: int, row: dict) -> None:
-        """Ramo 1: encaminha o chat ao analista que atende o formulario.
-
-        O chat vai junto com o historico (o tecnico ve "Transferido para ..." e o
-        analista recebe a conversa). Sem dono ainda — ou dono fora da janela — o
-        chat entra na fila de espera PRESO ao caso: o tick entrega assim que o
-        formulario tiver um analista elegivel.
-        """
-        q = row.get("queue_address")
-        req = self._case_identity(cid, None)
-        case_key = req[0]
-        now = datetime.now(timezone.utc)
-        db.upsert_chat(
-            self.conn, cid,
-            status="classified",
-            classification="Falar sobre o formulário",
-            classified_at=now,
-            auto_close=False,
-        )
-        self._emit("classified", cid, q, "Falar sobre o formulário")
-        if not row.get("linked_form_chat_id"):
-            # Estado antigo/limite (abertura sem vinculo): nao prender o chat em
-            # um caso que nao existe — vale a rota normal (afinidade ou fila).
-            await self._deliver_classified_chat(
-                cid, row, q, case_key,
-                detail="abertura form-aware sem vinculo de formulario",
-            )
-            return
-        dono = self._form_owner(row)
-        if dono:
-            membro = self._member_of_queue(q, dono)
-            if membro and _in_route_window(membro, datetime.now(TZ_BRT)):
-                await self._deliver_classified_chat(
-                    cid, row, q, case_key,
-                    force_assignee=dono,
-                    detail="abertura form-aware: falar sobre o formulario",
-                )
-                return
-            self._emit(
-                "form_aware_wait", cid, q,
-                f"dono={dono} fora_da_janela; o chat espera o caso",
-            )
-        else:
-            self._emit("form_aware_wait", cid, q, "formulario ainda sem analista; o chat espera o caso")
-        await self._park_chat_for_owner(cid, row, case_key)
-
-    async def _park_chat_for_owner(self, cid: int, row: dict, case_key: str) -> None:
-        """Chat do ramo 1 esperando o dono do caso (nao consome tentativas)."""
-        q = row.get("queue_address")
-        team, settings = self._team_settings(q, "chat")
-        now = datetime.now(timezone.utc)
-        db.upsert_chat(
-            self.conn, cid,
-            status="classified",
-            classification="Falar sobre o formulário",
-            classified_at=now,
-            auto_close=False,
-        )
-        rid = db.enqueue_route(
-            self.conn, "chat", cid, q, int(team["id"]) if team else None,
-            detail="aguardando o analista do formulario",
-            delay_sec=settings["retry_interval_sec"],
-            expects_owner=True,
-        )
-        db.set_delivery_marks(self.conn, rid, case_key=case_key)
-        texto = str(self.tpl.get("form_waiting") or "").strip()
-        if texto:
-            await self.send_guarded(cid, texto, q)
-        self._emit("queued", cid, q, "espera o analista do formulario (mesmo caso)")
 
     async def _invalid_reply(self, cid: int, row: dict) -> None:
         max_r = int(self.cfg.get("max_invalid_retries") or 3)
@@ -2484,7 +2128,15 @@ class Engine:
             except Exception as e:
                 log.warning("move_chat %s %s: %s", cid, q, e)
                 self._reserve_drop(addr, "chat", case_key)
-                return False, f"{route}; move_falhou={e}"
+                if not str(marks.get("exclude_assignee") or "").strip():
+                    return False, f"{route}; move_falhou={e}"
+                # Resgate: o chat ja estava com o analista que ficou offline e o
+                # TOA recusou um novo move — segue para o convite do novo alvo.
+                self._emit(
+                    "reclaim_invite_only", cid, q,
+                    f"{marks.get('exclude_assignee')}; move recusado={e}",
+                )
+                db.set_delivery_marks(self.conn, route_id, invite_target=addr)
             db.set_delivery_marks(self.conn, route_id, move_sent_at=True, invite_target=addr)
             db.mark_chat_moved(self.conn, cid)
         elif not alvo:
@@ -2623,12 +2275,16 @@ class Engine:
         if pos < 1:
             return
         row = self.conn.execute(
-            "SELECT kind, last_position, expects_owner FROM pending_routes WHERE id = ?", (int(route_id),)
+            "SELECT kind, last_position FROM pending_routes WHERE id = ?", (int(route_id),)
         ).fetchone() or {}
-        # Rota presa ao dono do caso (abertura form-aware): quem ja foi avisado
-        # (`form_waiting`) nao recebe posicao de fila por cima.
-        if int(row.get("expects_owner") or 0):
-            return
+        # Antes de falar de fila: alguem ja entrou no chat? Entao o caso e dele —
+        # o bot para de avisar posicao, registra o dono e sai (sem isso ele
+        # seguiria mandando "voce avancou" e poderia entregar o mesmo chat).
+        if routing.kind_of(row.get("kind")) != "form":
+            presente = self._analista_presente(cid, q)
+            if presente:
+                await self._adota_chat_na_fila(cid, q, presente, origem="participante")
+                return
         anterior = int(row.get("last_position") or 0)
         if pos == anterior:
             return
@@ -2652,6 +2308,72 @@ class Engine:
             # `send_guarded`: falha de transporte no aviso de posicao nao pode
             # derrubar o tick nem o handler do handler que a chamou.
             await self.send_guarded(cid, texto, q)
+
+    def _analista_presente(self, cid: int, q: str | None) -> str:
+        """Analista do time da fila ja dentro do chat (entrou por conta propria)?
+
+        Le os `participants` do payload mais recente do chat (`MEM.raw`): o TOA
+        reenvia a lista do helpdesk a cada poucos segundos, entao ela e a visao
+        viva de quem esta dentro. Ignora o proprio bot e o tecnico que abriu.
+        """
+        operadores = self._operadores_da_fila(q)
+        if not operadores:
+            return ""
+        chat = self._queue_chat_snapshot(int(cid), {"queue_address": q})
+        origin = str((MEM.get(int(cid)) or {}).get("started_addr") or "")
+        for addr in _presentes(chat):
+            if _addr_eq(addr, self.own) or (origin and _addr_eq(addr, origin)):
+                continue
+            for op in operadores:
+                if _addr_eq(addr, op):
+                    return op
+        return ""
+
+    async def _adota_chat_na_fila(self, cid: int, q: str | None, addr: str, origem: str = "") -> bool:
+        """Analista entrou no chat que estava na fila: o caso e dele e o bot sai.
+
+        Fecha a rota `waiting` (o aviso de posicao para na hora), registra o caso
+        no ledger para ele (cap/caso e a afinidade do formulario irmao passam a
+        contar o dono) e o bot deixa o chat. Sem isso o bot seguia avisando
+        posicao e podia entregar o MESMO chat para outro analista.
+        """
+        cid = int(cid)
+        row = self.conn.execute("SELECT * FROM chats WHERE chat_id = ?", (cid,)).fetchone() or {}
+        if str(row.get("status") or "") != "classified":
+            return False
+        rota = db.waiting_route(self.conn, "chat", cid)
+        if not rota:
+            return False
+        rid = int(rota["id"])
+        case_key = str(rota.get("case_key") or "").strip()
+        req = form_open.requester_key(self._queue_chat_snapshot(cid, {"queue_address": q}), self.own)
+        req_addr = str(rota.get("requester_addr") or req[1])
+        team, _settings = self._team_settings(q, "chat")
+        db.set_delivery_marks(self.conn, rid, case_key=case_key, requester_addr=req_addr)
+        db.assign_open(
+            self.conn, "chat", cid, q, int(team["id"]) if team else None,
+            addr, case_key or req[0], req_addr, req[2], "adocao",
+        )
+        db.finish_route(self.conn, rid, "done", f"adotado: {addr} entrou no chat ({origem or 'entrou'})")
+        self._emit("chat_adopted", cid, q, f"{addr}; entrou no chat da fila ({origem or 'entrou'})")
+        if team:
+            # Caso unico: o formulario do mesmo tecnico vai junto para o mesmo dono.
+            await self._deliver_sibling(case_key or req[0], addr, team)
+        await self.leave(cid, "closed")
+        return True
+
+    async def _note_join_analista(self, cid: int, addr: str) -> None:
+        """`user_joined` de terceiro: e analista do time entrando num chat na fila?"""
+        if not addr or _addr_eq(addr, self.own):
+            return
+        row = self.conn.execute("SELECT * FROM chats WHERE chat_id = ?", (int(cid),)).fetchone() or {}
+        if str(row.get("status") or "") != "classified":
+            return
+        q = row.get("queue_address") or (MEM.get(int(cid)) or {}).get("queue_address")
+        for op in self._operadores_da_fila(q):
+            if _addr_eq(addr, op):
+                await self._adota_chat_na_fila(cid, q, op, origem="user_joined")
+                return
 
     def _team_settings(self, queue_address: str | None, kind: str = "chat") -> tuple[dict | None, dict]:
         """(time, ajustes resolvidos) da fila — herança team_routing → bot_settings."""
@@ -2914,6 +2636,7 @@ class Engine:
         })
         operadores = {str(m["address"]) for ms in membros_por_time.values() for m in ms if m.get("address")}
         online: set[str] = set()
+        online_ok = False
         if logins:
             try:
                 ack = await self.sock.command("get_online_users", {"users": logins}, timeout=12.0)
@@ -2922,6 +2645,7 @@ class Engine:
                     # O TOA devolve como digitado (F119537); normaliza para casar
                     # com member_login(addr) — mesma regra do roteamento.
                     online = {_member_login(x) for x in parsed}
+                    online_ok = True
             except Exception as e:
                 log.warning("get_online_users carga: %s", e)
         ledger: dict[str, dict] = {}
@@ -2972,7 +2696,9 @@ class Engine:
                 db.load_upsert(
                     self.conn, addr,
                     name=str(m.get("name") or addr), team_id=tid,
-                    janela=_window_label(m), online=1 if _member_login(addr) in online else 0,
+                    janela=_window_label(m),
+                    online=1 if _member_login(addr) in online else 0,
+                    online_ok=1 if online_ok else 0,
                     chats_toa=chats_toa, forms_toa=forms_toa,
                     chats_ledger=int(info["chats"]), forms_ledger=int(info["forms"]),
                     reservas=int(reservas.get(addr, 0)), casos_total=len(casos),
@@ -2985,6 +2711,14 @@ class Engine:
                         f"motivo={motivo}; filas={len(filas)}; toa_ok={bool(ok_geral)}; "
                         f"vistos={len(fontes)}; online={len(online)}; ledger={len(info['casos'])}"
                     ),
+                )
+                # Presenca: carimba desde quando o analista esta offline (e limpa
+                # quando volta). So vale com leitura BOA do `get_online_users` —
+                # `online_ok=0` = caiu a leitura, nao da para afirmar ausencia.
+                db.set_presence(
+                    self.conn, addr,
+                    online=_member_login(addr) in online,
+                    online_ok=bool(online_ok),
                 )
                 db.load_add_history(
                     self.conn, addr,
@@ -3067,6 +2801,7 @@ class Engine:
         retry_online: bool = True,
         case_key: str = "",
         force_assignee: str = "",
+        exclude_address: str = "",
     ) -> tuple[dict | None, str]:
         """Escolhe o analista da fila (kind='chat' ou 'form').
 
@@ -3074,6 +2809,8 @@ class Engine:
         assíncrono do formulário fica em pending_routes, sem travar o handler.
         `force_assignee` (abertura form-aware) prende a entrega ao dono do caso:
         se ele não estiver na janela, devolve None e quem entrega é a fila.
+        `exclude_address` é o resgate por analista offline: a rota socorrida não
+        pode voltar para quem a perdeu (nem pela afinidade).
         """
         kind = routing.kind_of(kind)
         team, settings = self._team_settings(queue_address, kind)
@@ -3084,6 +2821,11 @@ class Engine:
         if not members:
             log.warning("time %s sem membros", team.get("name") or team["id"])
             return None, "time sem membros"
+        if exclude_address:
+            restantes = [m for m in members if not _addr_eq(m.get("address"), exclude_address)]
+            if not restantes:
+                return None, f"unico membro do time esta excluido ({exclude_address})"
+            members = restantes
         if kind == "form" and not settings["form_enabled"]:
             log.info("time %s desabilitado para formulário", team.get("name") or team["id"])
             return None, "time desabilitado para formulário"
@@ -3127,6 +2869,9 @@ class Engine:
                 return m, f"dono_do_caso={force_assignee}; caso do formulario"
             return None, f"dono_do_caso={force_assignee} fora_do_time"
         dono = db.case_owner(self.conn, case_key) if (case_key and settings.get("affinity")) else ""
+        if dono and exclude_address and _addr_eq(dono, exclude_address):
+            # Resgate: a afinidade aponta para quem ficou offline — nao vale.
+            dono = ""
         aviso_afinidade = ""
         if dono:
             for m in members:
@@ -3227,6 +2972,10 @@ class Engine:
         # registra o caso e encerra a rota — a carga passa a contar a verdade.
         if not marks.get("move_sent_at"):
             dono_msg = str(self._form_owner_msg.get(int(cid)) or "")
+            if dono_msg and _addr_eq(dono_msg, str(marks.get("exclude_assignee") or "")):
+                # Resgate: o dono que o TOA mostra e justamente quem ficou
+                # offline — adotar aqui devolveria o caso para ele.
+                dono_msg = ""
             if not dono_msg and not db.open_assignment(self.conn, int(cid)):
                 await self._refresh_form_state(int(cid), motivo="pre-move", forcar=True)
                 dono_msg = str(self._form_owner_msg.get(int(cid)) or "")
@@ -3269,6 +3018,11 @@ class Engine:
             except Exception as e:
                 log.warning("form move_chat %s %s: %s", cid, queue_address, e)
                 self._reserve_drop(addr, "form", case_key)
+                if str(marks.get("exclude_assignee") or "").strip():
+                    # Resgate: o dono offline ainda aparece dentro no TOA (e=10).
+                    # Nao consome o teto de falhas — a rota segue esperando ele
+                    # sair, em vez de encerrar o caso.
+                    return False, f"{route}; move_falhou={e}; dono_offline"
                 falhas = db.bump_move_fails(self.conn, route_id)
                 return False, f"{route}; move_falhou={e}; falhas={falhas}"
             db.set_delivery_marks(
@@ -3326,14 +3080,19 @@ class Engine:
     async def route_form(self, cid: int, chat: dict, queue_address: str | None) -> None:
         """Formulário de validação: roteia para o time da fila, como o chat livre.
 
-        Não depende de queues.enabled: o formulário chega ao bot mesmo com a
-        fila desligada para atendimento. A permissão é form_routing_enabled
-        (global) + team_routing.form_enabled (por time).
+        MESMAS REGRAS DO CHAT: a fila precisa estar HABILITADA no painel e ter
+        time ATIVO que aceite formulário (`team_routing.form_enabled`). Com a
+        fila desligada o formulário apenas entra no índice (o painel mostra) e
+        NÃO é movido — é o que impede um bot ligado só para observar de mexer
+        nos quadros reais.
         """
         if (self.cfg.get("form_routing_enabled") or "true") != "true":
             return
         if not queue_address:
             self._emit("form_no_queue", cid, None, "formulário sem fila")
+            return
+        if queue_address not in self.enabled:
+            self._emit("form_queue_off", cid, queue_address, "fila desabilitada")
             return
         if db.route_seen(self.conn, "form", cid):
             log.info("form %s já roteado; ignorando repetição", cid)
@@ -3504,14 +3263,6 @@ class Engine:
                 await self._notify_queue_expired(cid, q, settings)
                 await self._apply_chat_fallback(cid, q)
                 continue
-            # Abertura form-aware: rota presa ao dono do caso (analista do
-            # formulario). Sem dono ainda ela so espera — sem tentativa e sem
-            # fallback — e sai quando o formulario for atribuido (peca irma).
-            dono_caso = ""
-            if int(row.get("expects_owner") or 0):
-                dono_caso = db.case_owner(self.conn, str(row.get("case_key") or ""))
-                if not dono_caso:
-                    continue
             if kind == "form":
                 req = form_open.requester_key(self._open_forms.get(cid) or {}, self.own)
                 anterior = str(row.get("case_key") or "").strip()
@@ -3549,13 +3300,10 @@ class Engine:
             row = claimed
             q = row.get("queue_address")
             picked, route = await self.pick_assignee(
-                q, kind=kind, retry_online=False, case_key=case_key, force_assignee=dono_caso
+                q, kind=kind, retry_online=False, case_key=case_key,
+                exclude_address=str(row.get("exclude_assignee") or ""),
             )
             if not picked:
-                if dono_caso:
-                    # Dono existe mas nao esta elegivel agora (janela/online): o
-                    # chat continua esperando o caso, sem gastar tentativa.
-                    continue
                 db.retry_route(self.conn, rid, used + 1, settings["retry_interval_sec"], route or "")
                 if fila and not movido:
                     await self._queue_notify(cid, rid, q)
@@ -3649,6 +3397,79 @@ class Engine:
             reason = "left"
         self._emit(reason, cid, q, status)
 
+    async def _reclaim_offline(self, force_address: str = "", limite: int = 5) -> int:
+        """Devolve para a fila o caso preso com analista OFFLINE.
+
+        Mesmas regras para chat e formulario: o caso sai do ledger
+        (`analista_offline` — solta cap, reserva e afinidade) e ganha rota nova
+        com o antigo dono **excluido**. No chat o tecnico e avisado
+        (`requeue_notice`) e o bot volta a falar no chat; no formulario a
+        devolucao e silenciosa.
+
+        `force_address` (botao do painel) devolve agora os casos daquele analista,
+        ignorando o limite do tick e o `0` que desliga o resgate no time.
+        """
+        global_settings = self._team_settings(None, "chat")[1]
+        if not bool(global_settings.get("offline_requeue_enabled", True)):
+            return 0
+        if force_address:
+            candidatos = [
+                row for row in db.open_assignments(self.conn)
+                if _addr_eq(str(row.get("assignee") or ""), force_address)
+            ]
+        else:
+            sec = int(global_settings.get("offline_requeue_sec") or 0)
+            if sec <= 0:
+                return 0
+            candidatos = db.offline_open_assignments(self.conn, sec)
+        devolvidos = 0
+        for row in candidatos:
+            if not force_address and devolvidos >= max(int(limite), 1):
+                break
+            cid = int(row["chat_id"])
+            kind = routing.kind_of(row.get("kind"))
+            addr = str(row.get("assignee") or "")
+            q = row.get("queue_address")
+            team, settings_fila = self._team_settings(q, kind)
+            if not bool(settings_fila.get("offline_requeue_enabled", True)):
+                continue
+            if not force_address and int(settings_fila.get("offline_requeue_sec") or 0) <= 0:
+                # O time desligou o resgate (0 = nao devolve).
+                continue
+            if not q:
+                self._emit("reclaim_no_queue", cid, None, f"{addr}; caso sem fila para devolver")
+                continue
+            # 1) A rota antiga sai do caminho (indice unico ativo por kind+chat).
+            db.finish_routes_for_chat(self.conn, cid, "failed", f"resgatado: {addr} offline")
+            # 2) Fecha o caso no ledger: solta cap, reserva e afinidade.
+            self._close_case(cid, "analista_offline")
+            offline_s = _offline_seconds(row.get("offline_since"))
+            if kind == "chat":
+                db.upsert_chat(
+                    self.conn, cid, status="classified", moved_at=None, auto_close=False
+                )
+                await self._join_until_present(cid)
+                texto = str(self.tpl.get("requeue_notice") or "").strip()
+                if texto:
+                    await self.send_guarded(cid, texto, q)
+            # 3) Rota nova, com o antigo dono excluido.
+            rid = db.enqueue_route(
+                self.conn, kind, cid, q, int(team["id"]) if team else None,
+                detail=f"resgatado: {addr} offline ha {offline_s:.0f}s",
+                delay_sec=0, exclude_assignee=addr,
+            )
+            db.set_delivery_marks(
+                self.conn, rid,
+                case_key=str(row.get("case_key") or ""),
+                requester_addr=str(row.get("requester_addr") or ""),
+                exclude_assignee=addr,
+            )
+            self._emit("case_reclaimed", cid, q, f"{addr}; offline={offline_s:.0f}s; {kind}")
+            devolvidos += 1
+        if devolvidos:
+            log.info("resgate: %s caso(s) devolvido(s) por analista offline", devolvidos)
+        return devolvidos
+
     async def tick_timeouts(self) -> None:
         db.assign_close_stale(self.conn, int(self.cfg.get("route_assign_ttl_sec") or 43200))
         # Visao viva dos formularios (pendente/em atendimento/passado): um por tick.
@@ -3656,6 +3477,11 @@ class Engine:
             await self._sweep_form_states()
         except Exception:
             log.exception("sweep_form_states")
+        # Caso preso com analista offline: volta para a fila (limite por tick).
+        try:
+            await self._reclaim_offline()
+        except Exception:
+            log.exception("reclaim_offline")
         sec = int(self.cfg.get("reply_timeout_sec") or 300)
         for row in db.awaiting_timeouts(self.conn):
             if not _silence_expired(row, sec):
@@ -3729,6 +3555,17 @@ class Engine:
             elif kind == "load_snapshot":
                 # Botao "Atualizar agora" da aba Carga: le as listas do TOA na hora.
                 await self.snapshot_load("painel")
+            elif kind == "requeue_offline":
+                # Botao "Devolver a fila agora" (aba Carga): devolve AGORA os casos
+                # do analista offline, pelo mesmo caminho do resgate automatico.
+                devolvidos = await self._reclaim_offline(
+                    force_address=str(job.get("payload") or "").strip()
+                )
+                if devolvidos == 0:
+                    db.log_event(
+                        self.conn, "reclaim_empty",
+                        detail=f"job={jid}; nenhum caso aberto para {job.get('payload') or '—'}",
+                    )
             else:
                 raise ValueError(f"job kind desconhecido: {kind}")
             db.finish_job(self.conn, jid, "done")

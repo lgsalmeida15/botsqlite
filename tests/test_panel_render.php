@@ -70,13 +70,56 @@ $pdo->exec(
     . " VALUES ('u:ana@claro.com', 'Ana', 1, '09:00-18:00', 1, 2, 1, 2, 1, 0, 2, 25.0, 1, 1, 'motivo=teste')"
 );
 // Analista inativo no roteamento com carga fisica MAIOR: a tabela tem que deixar
-// a linha dele no fim (e sem o "presente" no TOA form).
+// a linha dele no fim (e sem o "presente" no TOA form). Ele tambem esta OFFLINE
+// ha 5 min com caso no ledger: e o alvo do resgate (coluna "Offline ha" + botao).
 $pdo->exec("INSERT INTO team_members (team_id, address, name, active) VALUES (1, 'u:inativo@claro.com', 'Inativo', 0)");
 $pdo->exec(
-    "INSERT INTO analyst_load (address, name, team_id, janela, online, chats_toa, forms_toa, chats_ledger,"
+    "INSERT INTO analyst_load (address, name, team_id, janela, online, online_ok, offline_since, chats_toa, forms_toa, chats_ledger,"
     . " forms_ledger, reservas, casos_total, form_ocioso_min, form_presente_toa, toa_ok, detail)"
-    . " VALUES ('u:inativo@claro.com', 'Inativo', 1, '', 0, 9, 0, 9, 0, 0, 9, 0.0, 0, 1, 'motivo=teste')"
+    . " VALUES ('u:inativo@claro.com', 'Inativo', 1, '', 0, 1, datetime('now', '-5 minutes'), 9, 0, 9, 0, 0, 9, 0.0, 0, 1, 'motivo=teste')"
 );
+
+// Trava da aba Filas: habilitar exige Menu ATIVO + Time ATIVO vinculados.
+// Sem isso o bot assumia o chat, mandava o menu e fechava depois (closed_no_agent).
+// uma fila = um menu e um time (UNIQUE(queue_address) nas duas tabelas).
+$pdo->exec("INSERT INTO queues (address, name, enabled) VALUES ('h:q2', 'Fila sem vinculos', 0)");
+$pdo->exec("INSERT INTO queues (address, name, enabled) VALUES ('h:q3', 'Fila so com menu', 0)");
+$pdo->exec("INSERT INTO menu_queues (menu_id, queue_address) VALUES (1, 'h:q3')");
+$pdo->exec("INSERT INTO queues (address, name, enabled) VALUES ('h:q4', 'Fila com vinculos inativos', 0)");
+$pdo->exec("INSERT INTO menus (name, active) VALUES ('Menu inativo', 0)");
+$menuInativo = (int) $pdo->lastInsertId();
+$pdo->exec("INSERT INTO menu_queues (menu_id, queue_address) VALUES ({$menuInativo}, 'h:q4')");
+$pdo->exec("INSERT INTO teams (name, active) VALUES ('Time inativo', 0)");
+$timeInativo = (int) $pdo->lastInsertId();
+$pdo->exec("INSERT INTO team_queues (team_id, queue_address) VALUES ({$timeInativo}, 'h:q4')");
+// Menu ATIVO porem sem nenhuma opcao: tambem bloqueia (o chat cairia em "menu vazio").
+$pdo->exec("INSERT INTO queues (address, name, enabled) VALUES ('h:q5', 'Fila com menu vazio', 0)");
+$pdo->exec("INSERT INTO menus (name, active) VALUES ('Menu vazio', 1)");
+$menuVazio = (int) $pdo->lastInsertId();
+$pdo->exec("INSERT INTO menu_queues (menu_id, queue_address) VALUES ({$menuVazio}, 'h:q5')");
+$pdo->exec("INSERT INTO team_queues (team_id, queue_address) VALUES (1, 'h:q5')");
+
+ok(queue_enable_block($pdo, 'h:q1') === '', 'fila com menu e time ativos: libera habilitar');
+ok(
+    strpos(queue_enable_block($pdo, 'h:q5'), 'opção') !== false,
+    'menu ativo sem opcao cadastrada: bloqueia pela opcao'
+);
+$bloqSemNada = queue_enable_block($pdo, 'h:q2');
+ok(
+    strpos($bloqSemNada, 'Menu') !== false && strpos($bloqSemNada, 'Time') !== false,
+    'fila sem menu e sem time: bloqueia pelos dois'
+);
+$bloqSoMenu = queue_enable_block($pdo, 'h:q3');
+ok(
+    strpos($bloqSoMenu, 'Time') !== false && strpos($bloqSoMenu, 'Menu') === false,
+    'fila so com menu: bloqueia pelo time'
+);
+$bloqInativos = queue_enable_block($pdo, 'h:q4');
+ok(
+    strpos($bloqInativos, 'Menu') !== false && strpos($bloqInativos, 'Time') !== false,
+    'vinculo inativo de menu/time nao libera a fila'
+);
+ok(queue_enable_block($pdo, 'h:nada') === 'fila não encontrada', 'fila inexistente: motivo explicito');
 
 // Marcador de conteudo por aba: se o d-none ficar aberto, o marcador some.
 $marcadores = [
@@ -87,7 +130,7 @@ $marcadores = [
     'teams' => 'Plantão: pessoas + filas',
     'routing' => 'Rotas sem entrega',
     'settings' => 'Timeout de resposta',
-    'templates' => 'form_pending',
+    'templates' => 'greeting',
     'activity' => 'Todos os eventos',
     'load' => 'Leitura automática a cada',
     'chats' => 'Filtrar',
@@ -138,6 +181,18 @@ foreach ($marcadores as $pPage => $marca) {
     }
 }
 
+// Aba Filas: a trava de habilitacao precisa aparecer (selo + botao desabilitado)
+// sem esconder a acao de desabilitar das filas ja ligadas.
+$htmlFilas = (string) ($htmls['queues'] ?? '');
+ok(strpos($htmlFilas, 'sem menu ativo') !== false, 'aba queues: selo de fila sem menu ativo');
+ok(strpos($htmlFilas, 'sem time ativo') !== false, 'aba queues: selo de fila sem time ativo');
+ok(
+    strpos($htmlFilas, 'Vincule um Menu e um Time ativos antes de habilitar') !== false,
+    'aba queues: explica a pendencia no botao Habilitar'
+);
+ok(strpos($htmlFilas, 'disabled title="Vincule um Menu') !== false, 'aba queues: Habilitar desabilitado sem os vinculos');
+ok(strpos($htmlFilas, '>Desabilitar<') !== false, 'aba queues: Desabilitar continua liberado');
+
 // A aba Carga precisa listar a leitura semeada em analyst_load. Sem isso o
 // harness estaria lendo outro banco (era o caso quando o `.env` vencia o
 // SQLITE_PATH do teste) e a tabela viria vazia.
@@ -180,6 +235,22 @@ $posAna = strpos($htmlCarga, 'u:ana@claro.com');
 $posInativo = strpos($htmlCarga, 'u:inativo@claro.com');
 ok($posAna !== false && $posInativo !== false && $posAna < $posInativo, 'aba load: inativo no roteamento vai para o fim da tabela');
 ok(strpos($htmlCarga, '>inativo</span>') !== false, 'aba load: selo de inativo no roteamento');
+
+// Resgate por analista offline: coluna, alerta e botao manual na aba Carga.
+ok(strpos($htmlCarga, '<th>Offline há</th>') !== false, 'aba load: coluna Offline há');
+ok(strpos($htmlCarga, 'analista(s) <strong>offline</strong> com caso aberto') !== false, 'aba load: alerta de offline com caso aberto');
+ok(strpos($htmlCarga, 'value="requeue_offline"') !== false, 'aba load: botao Devolver a fila (job requeue_offline)');
+ok(strpos($htmlCarga, 'Devolver à fila') !== false, 'aba load: rotulo do botao manual');
+
+// Ajustes do resgate no Roteamento: globais + por time (linha de cada time).
+$htmlRoutingOff = (string) ($htmls['routing'] ?? '');
+ok(strpos($htmlRoutingOff, 'name="offline_requeue_enabled"') !== false, 'aba routing: liga/desliga do resgate');
+ok(strpos($htmlRoutingOff, 'name="offline_requeue_sec"') !== false, 'aba routing: segundos de offline para devolver');
+ok(
+    substr_count($htmlRoutingOff, 'name="offline_requeue_sec"') >= 2,
+    'aba routing: resgate global + por time (linha do time)'
+);
+ok(strpos($htmlRoutingOff, '0 = este time nao devolve') !== false, 'aba routing: explica o 0 do resgate por time');
 
 // Filtro de time: aplica na requisicao, grava na sessao e sobrevive a proxima
 // requisicao (duas execucoes do harness com o MESMO id de sessao).

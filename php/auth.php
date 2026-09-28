@@ -79,7 +79,7 @@ function bot_action_permission(string $page, string $action): ?string
         ],
         "templates" => ["save" => "templates.manage"],
         "settings" => ["save" => "settings.manage"],
-        "load" => ["load_now" => "load.manage"],
+        "load" => ["load_now" => "load.manage", "requeue_offline" => "load.manage"],
         "menus" => [
             "create" => "menus.manage",
             "rename" => "menus.manage",

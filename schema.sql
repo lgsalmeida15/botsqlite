@@ -186,6 +186,8 @@ CREATE TABLE IF NOT EXISTS bot_jobs (
   status TEXT NOT NULL DEFAULT 'pending'
     CHECK (status IN ('pending', 'running', 'done', 'error')),
   detail TEXT NOT NULL DEFAULT '',
+  -- Parametro do pedido (ex.: o address do analista no `requeue_offline`).
+  payload TEXT NOT NULL DEFAULT '',
   requested_at TEXT NOT NULL DEFAULT (datetime('now')),
   started_at TEXT,
   finished_at TEXT
@@ -205,7 +207,11 @@ INSERT OR IGNORE INTO bot_settings (key, value) VALUES
   ('max_open_chats_per_agent', '8'),
   ('ws_stale_sec', '180'),
   ('transfer_attempts', '5'),
-  ('transfer_retry_interval_sec', '60');
+  ('transfer_retry_interval_sec', '60'),
+  -- Resgate por ausencia do operador: caso preso com analista offline volta para
+  -- a fila depois de `offline_requeue_sec` (0 desliga; por time em team_routing).
+  ('offline_requeue_enabled', 'true'),
+  ('offline_requeue_sec', '120');
 
 -- Roteamento por time (1:1 com teams). NULL = herda o global (bot_settings).
 -- Só o formulário de validação tem retry assíncrono; o chat segue o fluxo atual.
@@ -221,6 +227,9 @@ CREATE TABLE IF NOT EXISTS team_routing (
   retry_interval_sec INTEGER,
   fallback TEXT CHECK (fallback IN ('close', 'retry', 'monitor')),
   form_enabled INTEGER NOT NULL DEFAULT 1,
+  -- Resgate por ausencia do operador: NULL = herda o global; 0 = este time nao
+  -- devolve para a fila o caso de analista offline.
+  offline_requeue_sec INTEGER,
   -- Tipo de atendimento padrao dos operadores do time (membro sem linha herda
   -- isto): 'both' (padrao), 'chat' ou 'form'.
   member_kinds TEXT CHECK (member_kinds IN ('both', 'chat', 'form')),
@@ -267,6 +276,9 @@ CREATE TABLE IF NOT EXISTS pending_routes (
   -- `move_chat` recusado pelo TOA (e=10 = formulario ja com alguem): a rota para
   -- depois de N falhas em vez de girar para sempre.
   move_fails INTEGER NOT NULL DEFAULT 0,
+  -- Alvo que NAO deve receber de novo (resgate por analista offline): a rota
+  -- socorrida exclui quem a detinha, para nao devolver o caso ao mesmo operador.
+  exclude_assignee TEXT NOT NULL DEFAULT '',
   -- Posse da entrega (claim atomico em db.claim_delivery): evita dupla entrega.
   claimed_by TEXT NOT NULL DEFAULT '',
   claimed_at TEXT,
@@ -331,6 +343,12 @@ CREATE TABLE IF NOT EXISTS analyst_load (
   team_id INTEGER,
   janela TEXT NOT NULL DEFAULT '',
   online INTEGER NOT NULL DEFAULT 0,
+  -- Presenca: `online_ok` diz se a leitura do `get_online_users` respondeu nesta
+  -- volta (sem isso um timeout do TOA marcaria todo mundo como offline) e
+  -- `offline_since` e o carimbo da PRIMEIRA leitura que o viu offline — e o que
+  -- permite devolver o caso para a fila depois de `offline_requeue_sec`.
+  online_ok INTEGER NOT NULL DEFAULT 0,
+  offline_since TEXT,
   chats_toa INTEGER NOT NULL DEFAULT 0,
   forms_toa INTEGER NOT NULL DEFAULT 0,
   chats_ledger INTEGER NOT NULL DEFAULT 0,
@@ -414,19 +432,15 @@ INSERT OR IGNORE INTO templates (slug, body) VALUES
   -- técnico de que ele saiu da fila (com `close` o texto `closing` já informa).
   ('queue_expired', 'Sua espera na fila foi encerrada. Assim que um analista ficar disponível eu volto a falar com você.');
 
--- Abertura form-aware (aba Templates): o tecnico abre o chat e ja tem uma
--- validacao de encerramento em andamento. `{analista}` = quem atende o formulario.
--- char(10) = quebra de linha de verdade (o texto sai no chat como esta).
+-- Operador que estava atendendo ficou offline: o chat volta para a fila e o
+-- tecnico e avisado (o bot ainda pode demorar a achar o proximo elegivel).
 INSERT OR IGNORE INTO templates (slug, body) VALUES
-  ('form_pending', 'Você tem um formulário de validação em andamento com {analista}.'
-    || char(10) || char(10) || 'Digite o número da opção:'
-    || char(10) || '1) Falar sobre o formulário'
-    || char(10) || '2) Abrir o menu'),
-  ('form_pending_wait', 'Você tem um formulário de validação aguardando atendimento.'
-    || char(10) || char(10) || 'Digite o número da opção:'
-    || char(10) || '1) Falar sobre o formulário'
-    || char(10) || '2) Abrir o menu'),
-  ('form_waiting', 'Assim que um analista assumir a sua validação, eu encaminho este chat para ele. Em breve você será atendido.');
+  ('requeue_notice', 'Operador ficou offline, transferindo para outro operador');
+
+-- Abertura form-aware: REMOVIDA em 28/09 (associava errado o formulario ao chat).
+-- Os textos `form_pending`, `form_pending_wait` e `form_waiting` saem do banco na
+-- migracao (`db._migrate_form_aware` / `bot_migrate_form_aware`); o chat de fila
+-- sempre recebe o menu da fila.
 
 -- ---------------------------------------------------------------------------
 -- Painel: usuarios, grupos de permissao e escopo de dados (RBAC).

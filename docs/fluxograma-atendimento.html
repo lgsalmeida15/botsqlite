@@ -41,7 +41,7 @@
     <ol>
       <li>Visão geral do atendimento</li>
       <li>Filtros para assumir o chat</li>
-      <li>Menu, submenu, dígito, retry e timeout — inclui a <strong>abertura form-aware</strong> (3.1)</li>
+      <li>Menu, submenu, dígito, retry e timeout (a abertura form-aware foi removida — ver 3.1)</li>
       <li>Folha escolhida: resposta, perguntas, script e transferência</li>
       <li>Quem recebe: roteamento por caso</li>
       <li>Entrega, fila de espera e fallback</li>
@@ -188,24 +188,14 @@ flowchart LR
   retry -->|nao| fechaInv
     </pre>
     <p class="note">São consideradas só mensagens do técnico que abriu o chat (<code>started_addr</code>), depois do <code>menu_sent_at</code> e com texto. Resposta inválida <strong>também</strong> reinicia o relógio: <code>closed_timeout</code> só acontece com silêncio real. O menu nunca volta sozinho para a raiz — <code>0</code> só funciona dentro de um submenu. Ao voltar de restart, <code>replay_pending_reply</code> processa a resposta que chegou com o bot fora (evento <code>reply_replayed</code>) antes de qualquer timeout.</p>
-    <h2>3.1 Abertura form-aware: técnico com formulário em andamento</h2>
-    <p class="lead">Quando o chat assumido é de um técnico que <strong>já tem formulário de validação aberto</strong>, o bot não manda o menu: ele oferece <strong>1) Falar sobre o formulário</strong> / <strong>2) Abrir o menu</strong>. Chat e formulário passam a ser <strong>um caso só</strong> (mesmo <code>case_key</code> no ledger): encaminhado um, o outro vai junto.</p>
-    <pre class="mermaid">
-flowchart TD
-  A[assumed] --> B{Tem formulario aberto do mesmo tecnico?}
-  B -->|nao| M[menu normal - secao 3]
-  B -->|sim| L[case_linked: chat + formulario no MESMO caso]
-  L --> G[1 falar sobre o formulario / 2 abrir o menu]
-  G -->|2| M
-  G -->|1| D{Ja tem analista no formulario?}
-  D -->|sim e na janela| T[move_chat + invite_to_chat para ele - o chat vai com o historico]
-  D -->|nao, ou fora da janela| W[form_waiting: o chat espera preso ao caso] --> T
-  T --> I[transferred + mesmo caso no ledger]
-    </pre>
-    <p class="note">Correlação (qual formulário é do técnico): por <code>address</code>; por nome quando <code>affinity_match_name</code> = true; e, como o formulário do TOA normalmente <strong>não traz o address do técnico</strong> (o ledger chega a gravar <code>case_key='n:message scenario agent'</code>), o fallback é o <strong>formulário aberto mais recente da mesma fila</strong> que ainda não está vinculado a outro chat — o evento <code>case_linked</code> registra a regra usada. <strong>Estados do formulário</strong> (como na extensão do TOA): <em>pendente</em>, <em>em atendimento</em> (o analista entrou) e <em>passado</em> (o analista saiu / atendimento concluído) — o bot lê isso das <strong>mensagens do formulário</strong> (<code>get_chat_messages</code>, só leitura), no boot, na abertura e numa varredura de 1 por tick; passado sai de cena (<code>form_closed</code>) e nada é decidido se o TOA não responder. O vínculo é <strong>definitivo</strong>: formulário já oferecido a um chat não é oferecido de novo. <strong>Índice do formulário:</strong> fica acompanhado até um fim explícito, <code>chat_removed</code>, TTL de 12 h ou caso já encerrado no ledger; aviso de <em>fila</em> (<code>helpdesk_chat_removed</code>, que o <code>move_chat</code> para o analista gera) <strong>não</strong> tira o formulário, e o boot reconstrói o índice do ledger antes do resume (a varredura de boot não fecha caso de formulário). Eventos de diagnóstico: <code>form_indexed</code>, <code>form_not_open</code>, <code>form_dropped</code>, <code>form_ignored_payload</code>, <code>form_queue_left</code>, <code>form_forget</code>, <code>form_state</code>, <code>form_closed</code>, <code>form_aware_skip</code>. O chat do ramo 1 entra na fila com <code>expects_owner=1</code>: espera o analista do formulário <strong>sem gastar tentativa nem cair no fallback</strong>, e a entrega das duas peças juntas acontece quando uma delas é atribuída (<code>case_sibling_delivered</code>). Textos: <code>form_pending</code>, <code>form_pending_wait</code> e <code>form_waiting</code> (aba Templates).</p>
-  </section>
+  <h2>3.1 Abertura form-aware — REMOVIDA em 28/09/2026</h2>
+  <p class="lead">O bot <strong>não</strong> verifica mais se o técnico tem formulário de validação em
+  andamento: assumiu o chat da fila, ele sempre recebe o menu. Saíram o status <code>awaiting_form_choice</code>,
+  os textos <code>form_pending</code>/<code>form_pending_wait</code>/<code>form_waiting</code> e os eventos
+  <code>form_aware_*</code> e <code>case_linked</code>.</p>
+  <p class="note">Continua valendo: formulário roteado para o time da fila (7 e 7.1), afinidade pelo caso, peça
+  irmã e fechamento por ausência no TOA / ociosidade.</p>
 
-  <section>
     <h2>4. Folha escolhida: resposta, perguntas, script e transferência</h2>
     <p class="lead">A folha grava a classificação e resolve a ação. <code>ask_and_transfer</code> com perguntas cadastradas coleta no chat antes de tentar entregar; <code>run_script</code> chama o script de apoio com a sessão do navegador.</p>
     <pre class="mermaid">
@@ -608,7 +598,7 @@ flowchart LR
         <tr><td><code>joined</code></td><td>Bot entrou no chat.</td></tr>
         <tr><td><code>menu_sent</code></td><td>Menu enviado (o estado já é <code>awaiting_reply</code>).</td></tr>
         <tr><td><code>awaiting_reply</code></td><td>Esperando o dígito, com timeout por silêncio.</td></tr>
-        <tr><td><code>awaiting_form_choice</code></td><td>Abertura form-aware: esperando <strong>1</strong> (falar sobre o formulário) ou <strong>2</strong> (abrir o menu); o timeout por silêncio continua valendo como salvaguarda.</td></tr>
+        <tr><td><code>awaiting_form_choice</code></td><td><strong>Removido em 28/09</strong> (abertura form-aware).</td></tr>
         <tr><td><code>awaiting_script_answer</code></td><td>Wizard de perguntas ou script: preenchendo um campo.</td></tr>
         <tr><td><code>awaiting_script_confirm</code></td><td>Wizard/script: confirmando os dados (1 confirma, 2 corrige).</td></tr>
         <tr><td><code>awaiting_script_run</code></td><td>Script em execução com a sessão do navegador.</td></tr>
@@ -632,7 +622,7 @@ flowchart LR
         <tr><td>Fila de espera</td><td><code>queued</code>, <code>queue_position</code>, <code>queued_assigned</code>, <code>queue_expired</code></td></tr>
         <tr><td>Scripts</td><td><code>script_ok</code>, <code>script_error</code>, <code>script_denied</code></td></tr>
         <tr><td>Formulário de validação</td><td><code>closure</code>, <code>form_routed</code>, <code>form_no_agent</code>, <code>form_route_retry</code>, <code>form_no_team</code>, <code>form_no_queue</code></td></tr>
-        <tr><td>Abertura form-aware</td><td><code>case_linked</code> (chat + formulário no mesmo caso), <code>form_aware_greeting</code>, <code>form_aware_choice</code>, <code>form_aware_wait</code>, <code>form_aware_skip</code>, <code>case_sibling_delivered</code></td></tr>
+        <tr><td>Caso/formulário</td><td><code>case_link_unconfirmed</code>, <code>case_sibling_delivered</code>, <code>case_key_divergente</code>, <code>case_closed</code> (a abertura form-aware foi removida em 28/09)</td></tr>
         <tr><td>Índice do formulário</td><td><code>form_indexed</code>, <code>form_not_open</code>, <code>form_dropped</code>, <code>form_ignored_payload</code>, <code>form_queue_left</code> (aviso de fila; o formulário segue aberto), <code>form_forget</code>, <code>form_state</code> (pendente/em atendimento/passado), <code>form_closed</code> (virou passado), <code>case_key_divergente</code> (identidade do payload venceu a chave da rota)</td></tr>
         <tr><td>Resposta ignorada</td><td><code>message_ignored</code> — mensagem do técnico em status que o bot não trata (antes era silencioso)</td></tr>
         <tr><td>Catálogo</td><td><code>catalog_synced</code>, <code>sync_error</code></td></tr>

@@ -269,6 +269,24 @@ class FormRouteTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("form_no_team", events(conn))
         self.assertIn("closure", events(conn))
 
+    async def test_fila_desabilitada_nao_roteia_formulario(self):
+        """Mesmas regras do chat: fila desligada no painel = formulario so indexado.
+
+        Sem isso um bot conectado apenas para observar movia formularios reais nos
+        quadros (o caso de 28/09: 9 formularios movidos com todas as filas off).
+        """
+        eng, conn, sock = self._eng()
+        conn.execute("UPDATE queues SET enabled = 0")
+        eng.reload_config()
+        await eng.consider(form_chat())
+        self.assertNotIn("move_chat", sock.names())
+        self.assertNotIn("invite_to_chat", sock.names())
+        self.assertNotIn("form_routed", events(conn))
+        self.assertNotIn("queued", events(conn))
+        self.assertIn("form_queue_off", events(conn))
+        self.assertIn("closure", events(conn))
+        self.assertEqual(len(routes(conn, "waiting")), 0)
+
     async def test_time_sem_formulario_habilitado_nao_roteia(self):
         eng, conn, sock = self._eng()
         conn.execute("INSERT INTO team_routing (team_id, form_enabled) VALUES (1, 0)")

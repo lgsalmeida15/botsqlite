@@ -35,6 +35,8 @@ $colunas = [
     'address', 'at', 'name', 'team_id', 'janela', 'online', 'chats_toa', 'forms_toa',
     'chats_ledger', 'forms_ledger', 'reservas', 'casos_total', 'form_ocioso_min',
     'form_presente_toa', 'toa_ok', 'detail', 'casos_toa_keys',
+    // Presenca do resgate por analista offline (28/09).
+    'online_ok', 'offline_since',
 ];
 $cols = bot_table_columns($pdo, 'analyst_load');
 $faltando = array_values(array_diff($colunas, array_keys($cols)));
@@ -56,6 +58,18 @@ foreach ($pdo->query('SELECT key, value FROM bot_settings') as $r) {
 ok(($cfg['load_poll_sec'] ?? '') === '30', 'bot_settings.load_poll_sec = 30 s');
 ok(($cfg['form_absent_readings'] ?? '') === '2', 'bot_settings.form_absent_readings = 2 leituras');
 ok(($cfg['analyst_load_keep'] ?? '') === '200', 'bot_settings.analyst_load_keep = 200 linhas');
+// Resgate por analista offline (28/09): presenca + ajustes + template.
+ok(($cfg['offline_requeue_sec'] ?? '') === '120', 'bot_settings.offline_requeue_sec = 120 s (2 min)');
+ok(($cfg['offline_requeue_enabled'] ?? '') === 'true', 'bot_settings.offline_requeue_enabled = true');
+ok(isset(bot_table_columns($pdo, 'team_routing')['offline_requeue_sec']), 'team_routing.offline_requeue_sec criada');
+$tplReq = [];
+foreach ($pdo->query('SELECT slug, body FROM templates') as $rTpl) {
+    $tplReq[$rTpl['slug']] = (string) $rTpl['body'];
+}
+ok(isset($tplReq['requeue_notice']), 'template requeue_notice existe');
+ok(strpos($tplReq['requeue_notice'] ?? '', 'offline') !== false, 'requeue_notice fala do operador offline');
+// `bot_jobs.payload`: parametro do botao "Devolver a fila agora".
+ok(isset(bot_table_columns($pdo, 'bot_jobs')['payload']), 'bot_jobs.payload criada');
 
 // RBAC: pagina + acao no catalogo e no mapa de acoes.
 $catalogo = bot_permission_catalog();
