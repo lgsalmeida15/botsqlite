@@ -121,6 +121,36 @@ def _in_route_window(member: dict, now: datetime | None = None) -> bool:
     return now_m >= start_m or now_m < end_m
 
 
+def _minutes_to_window_end(member: dict, now: datetime | None = None) -> int | None:
+    """Quantos minutos faltam para o fim da janela do operador (None = 24h).
+
+    A janela e a ESCALA (`team_members.route_start/route_end`), nao a presenca:
+    quem sai as 18:00 nao deve receber um formulario novo as 17:57. Overnight
+    (22:00-06:00) conta a virada do dia; leitura fora da janela devolve 0.
+    """
+    start = _as_clock(member.get("route_start"))
+    end = _as_clock(member.get("route_end"))
+    if start is None or end is None:
+        return None
+    start_m = _clock_minutes(start)
+    end_m = _clock_minutes(end)
+    if start_m == end_m:
+        return None
+    now = now or datetime.now(TZ_BRT)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=TZ_BRT)
+    now_m = _clock_minutes(now.astimezone(TZ_BRT).time().replace(microsecond=0))
+    if start_m < end_m:
+        if not (start_m <= now_m < end_m):
+            return 0
+        return end_m - now_m
+    if now_m >= start_m:
+        return (24 * 60 - now_m) + end_m
+    if now_m < end_m:
+        return end_m - now_m
+    return 0
+
+
 def member_login_raw(addr) -> str:
     x = str(addr or "").strip()
     if x.lower().startswith("u:"):
@@ -214,8 +244,19 @@ def resolve_settings(cfg: dict, routing_row: dict | None, kind: str) -> dict:
         "member_kinds": kinds_of(row.get("member_kinds")),
         "capacity_source": fonte,
         "affinity": _to_bool(cfg.get("affinity_enabled"), True),
-        "affinity_require_online": _to_bool(cfg.get("affinity_require_online"), False),
+        # Afinidade NAO e excecao ao online: dono do caso offline nao recebe nada
+        # (a chave `affinity_require_online` foi removida — permitia prender caso
+        # em quem estava fora). `require_online` vale para todo mundo.
         "affinity_match_name": _to_bool(cfg.get("affinity_match_name"), False),
+        # Formulario: para de ser OFERECIDO N minutos antes do fim da janela do
+        # operador (a escala, nao a presenca). NULL no time = herda o global.
+        "form_window_margin_min": max(
+            _to_int(
+                row.get("form_window_margin_min"),
+                _to_int(cfg.get("form_window_margin_min"), 10),
+            ),
+            0,
+        ),
         # Resgate por ausencia do operador: o time sobrescreve os segundos
         # (NULL = herda o global; 0 = este time nao devolve caso de analista
         # offline para a fila). O liga/desliga e global.
@@ -313,15 +354,23 @@ def decide(
     now: datetime | None = None,
     team_name: str = "",
     attempts_used: int = 0,
+    exclude: set[str] | None = None,
 ) -> tuple[dict | None, str]:
-    """Filtra e escolhe. Devolve (membro|None, detalhe legível para o log)."""
+    """Filtra e escolhe. Devolve (membro|None, detalhe legível para o log).
+
+    `exclude` e a lista de enderecos que NUNCA podem receber: o proprio bot
+    (`self.own`) e, no resgate, o analista que acabou de ficar offline.
+    """
     kind = kind_of(kind)
     mrouting = mrouting or {}
     loads = loads or {}
     online = online or set()
     now = now or datetime.now(TZ_BRT)
+    excluidos = [str(x).strip() for x in (exclude or set()) if str(x or "").strip()]
 
+    props: list[dict] = []
     off_window: list[dict] = []
+    fim_janela: list[dict] = []
     offline: list[dict] = []
     only_chat: list[dict] = []
     only_form: list[dict] = []
@@ -331,6 +380,10 @@ def decide(
 
     for m in members:
         addr = _addr(m)
+        # Alvo proibido (bot da casa): nao e elegivel por decisao nenhuma.
+        if excluidos and any(addr_eq(addr, x) for x in excluidos):
+            props.append(m)
+            continue
         rules = member_rules(mrouting.get(addr), settings, kind)
         # Tipo de atendimento do operador: quem so atende chat nao recebe
         # formulario e quem so atende formulario nao recebe chat.
@@ -344,6 +397,15 @@ def decide(
         if settings.get("respect_window", True) and not _in_route_window(m, now):
             off_window.append(m)
             continue
+        # Fim de janela: nao entrega formulario novo a quem esta saindo (o caso
+        # ficaria preso com um operador que ja foi embora).
+        if kind == "form":
+            margem = int(settings.get("form_window_margin_min") or 0)
+            if margem > 0:
+                falta = _minutes_to_window_end(m, now)
+                if falta is not None and falta < margem:
+                    fim_janela.append(m)
+                    continue
         if settings.get("require_online", True) and member_login(addr) not in online:
             offline.append(m)
             continue
@@ -379,10 +441,15 @@ def decide(
     pick_label = str((pick or {}).get("name") or _addr(pick)) if pick else ""
     casos = ",".join(f"{member_login_raw(_addr(m))}={int(loads.get(_addr(m), 0))}" for m in members)
     carga = ",".join(f"{member_login_raw(_addr(m))}={int(por_tipo.get(_addr(m), 0))}" for m in members)
+    fim = ",".join(
+        f"{member_login_raw(_addr(m))}:{int(_minutes_to_window_end(m, now) or 0)}min"
+        for m in fim_janela
+    )
     detail = (
         f"time={team_name or '—'}; estrategia={strategy}; cap={settings.get('cap')}; "
         f"membros={_names(members)}; janela={_names(eligible, windows=True)}; "
-        f"fora_horario={_names(off_window, windows=True)}; sem_online={_names(offline)}; "
+        f"fora_horario={_names(off_window, windows=True)}; fim_janela={fim or '—'}; "
+        f"sem_online={_names(offline)}; proprio_bot={_names(props)}; "
         f"so_chat={_names(only_chat)}; so_form={_names(only_form)}; no_cap={_names(over_cap)}; "
         f"casos={casos or '—'}; carga={carga or '—'}; tentativas={int(attempts_used)}"
     )

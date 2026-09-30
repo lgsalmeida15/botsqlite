@@ -42,6 +42,16 @@ if ($extraQuery !== '') {
 }
 $_SERVER['REQUEST_METHOD'] = 'GET';
 
+// POST simulado (opcional, argv[5]): passa pelo mesmo CSRF da sessao gravada
+// acima. Ex.: 'action=add_member&team_id=1&address=u:bot@claro.com'.
+$postQuery = (string) ($argv[5] ?? '');
+if ($postQuery !== '') {
+    $posted = [];
+    parse_str($postQuery, $posted);
+    $_POST = array_merge(['csrf' => 'teste-csrf'], $posted);
+    $_SERVER['REQUEST_METHOD'] = 'POST';
+}
+
 require __DIR__ . '/../php/index.php';
 
 // Eco da sessao (quando pedido): prova que o filtro ficou gravado no servidor.

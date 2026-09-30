@@ -357,6 +357,101 @@ class FormRouteTest(unittest.IsolatedAsyncioTestCase):
         await eng.tick_routes()
         self.assertEqual(sock.last("invite_to_chat")["address"], BIA)
 
+    async def test_tick_encerra_a_rota_do_formulario_com_a_fila_desabilitada(self):
+        """Fila desligada: a rota do formulario PARA — nao fica pendurada esperando religar.
+
+        Antes ela era segurada `waiting` com as tentativas intactas: o item sumia
+        das duas recuperacoes (`due_routes` so ve vencidas e
+        `classified_without_route` exige NOT EXISTS) e so voltava por acao manual
+        no painel. Agora o formulario deixa de ser oferecido e alguem assume.
+        """
+        eng, conn, sock = self._eng(online=[])
+        eng.cfg["form_route_retry_interval_sec"] = "0"
+        await eng.consider(form_chat())
+        conn.execute("UPDATE queues SET enabled = 0")
+        eng.reload_config()
+        await eng.tick_routes()
+        self.assertNotIn("move_chat", sock.names())
+        self.assertNotIn("invite_to_chat", sock.names())
+        self.assertEqual(routes(conn, "waiting"), [], "a espera e encerrada, nao segurada")
+        falha = routes(conn, "failed")
+        self.assertEqual(len(falha), 1)
+        self.assertIn("fila desabilitada", falha[0]["detail"])
+        self.assertIn("form_queue_off", events(conn))
+        self.assertNotIn("leave_chat", sock.names(), "nao ha chat de formulario para sair")
+        # Religou a fila: a rota ja foi encerrada — quem entregar e uma pessoa.
+        conn.execute("UPDATE queues SET enabled = 1")
+        eng.reload_config()
+        sock.online = ["ana"]
+        await eng.tick_routes()
+        self.assertNotIn("invite_to_chat", sock.names())
+        self.assertEqual(len(routes(conn, "done")), 0)
+        self.assertEqual(events(conn).count("form_queue_off"), 1, "o aviso nao se repete")
+
+    async def test_bot_no_time_nunca_recebe(self):
+        """O endereco do proprio bot nunca e alvo: ele so repassa o atendimento."""
+        eng, conn, _sock = self._eng(online=["bot", "ana"])
+        add_member(conn, RouteSock.own_address, "Bot", sort_order=0)
+        conn.execute("DELETE FROM team_members WHERE address = ?", (ANA,))
+        picked, detalhe = await eng.pick_assignee("h:q1", kind="chat", retry_online=False)
+        self.assertIsNone(picked)
+        self.assertIn("excluido", detalhe)
+
+    async def test_tick_com_o_bot_desligado_devolve_o_que_esperava(self):
+        """Bot desligado no painel: as esperas sao ENCERRADAS, nao guardadas.
+
+        Antes o tick apenas voltava e a rota ficava `waiting` ate o bot religar.
+        Agora vale a mesma regra da fila desabilitada: motivo gravado e o item
+        volta para o quadro.
+        """
+        eng, conn, sock = self._eng(online=["ana"])
+        eng.cfg["bot_enabled"] = "false"
+        await eng.consider(form_chat())
+        self.assertEqual(routes(conn, "waiting"), [], "bot desligado nem classifica")
+        # Rota criada antes de desligar: o tick encerra com o motivo.
+        db.enqueue_route(conn, "chat", 12, "h:q1", 1, detail="teste", delay_sec=0)
+        await eng.tick_routes()
+        self.assertNotIn("move_chat", sock.names())
+        self.assertNotIn("invite_to_chat", sock.names())
+        self.assertEqual(routes(conn, "waiting"), [], "nada fica pendurado esperando religar")
+        falha = routes(conn, "failed")
+        self.assertEqual(len(falha), 1)
+        self.assertIn("bot desligado", falha[0]["detail"])
+        self.assertIn("queue_off", events(conn))
+
+    async def test_bot_desligado_sai_dos_chats_que_conduz(self):
+        """Bot desligado: sai em silencio (sem despedida) dos chats em que ainda esta."""
+        eng, conn, sock = self._eng(online=["ana"])
+        db.upsert_chat(conn, 20, queue_address="h:q1", status="classified")
+        db.upsert_chat(conn, 21, queue_address="h:q1", status="monitoring")
+        eng.cfg["bot_enabled"] = "false"
+        await eng.tick_routes()
+        self.assertIn("leave_chat", sock.names(), "o bot sai do chat")
+        self.assertNotIn("move_chat", sock.names(), "o quadro nao e tocado")
+        self.assertEqual(
+            int(conn.execute("SELECT COUNT(*) AS n FROM chats WHERE status = 'left'").fetchone()["n"]),
+            2,
+        )
+        self.assertEqual(events(conn).count("queue_off"), 2)
+        self.assertEqual(events(conn).count("left"), 2, "cada saida fica no log")
+        self.assertEqual(sock.sent_texts(), [], "sem mensagem de despedida no chat")
+
+    async def test_entrega_para_o_proprio_bot_e_barrada(self):
+        """Ultima guarda antes do TOA: mesmo com alvo errado, nada vai para o bot."""
+        eng, conn, sock = self._eng(online=["bot"])
+        rid = db.enqueue_route(conn, "chat", 10, "h:q1", 1, detail="teste", delay_sec=0)
+        db.set_delivery_marks(conn, rid, case_key="a:" + TEC)
+        ok, detalhe = await eng._deliver_chat(
+            10, "h:q1",
+            {"address": RouteSock.own_address, "name": "Bot", "team_id": 1},
+            "teste", "a:" + TEC, route_id=rid,
+        )
+        self.assertFalse(ok)
+        self.assertIn("alvo proibido", detalhe)
+        self.assertNotIn("move_chat", sock.names())
+        self.assertNotIn("invite_to_chat", sock.names())
+        self.assertIn("self_target_blocked", events(conn))
+
     async def test_prioridade_escolhe_o_maior_weight(self):
         eng, conn, sock = self._eng(online=["ana", "bia"])
         add_member(conn, BIA, "Bia", sort_order=1)

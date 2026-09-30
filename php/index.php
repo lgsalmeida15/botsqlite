@@ -691,6 +691,7 @@ function event_badge(string $reason, string $label): string
         'queue_no_menu' => 'bg-danger',
         'queue_no_team' => 'bg-danger',
         'form_queue_off' => 'bg-secondary',
+        'self_target_blocked' => 'bg-danger',
         'case_reclaimed' => 'bg-warning text-dark',
         'chat_adopted' => 'bg-success',
         'reclaim_invite_only' => 'bg-warning text-dark',
@@ -1194,7 +1195,11 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && $page !== 'login') {
                     $addr = trim((string) ($_POST['catalog_address'] ?? ''));
                 }
                 $name = trim((string) ($_POST['member_name'] ?? ''));
-                if (substr($addr, 0, 2) !== 'u:') {
+                if (addr_is_bot($addr, bot_own_address($pdo))) {
+                    // O bot só repassa o atendimento: como operador ele receberia o
+                    // proprio caso de volta (e a carga dele nao existe no TOA).
+                    $formError = 'Este endereço é o PRÓPRIO bot — ele só repassa o atendimento e não pode ser operador.';
+                } elseif (substr($addr, 0, 2) !== 'u:') {
                     $formError = 'Address do membro deve ser u:login@dominio.';
                 } else {
                     if ($name === '') {
@@ -1224,7 +1229,9 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && $page !== 'login') {
                 $name = trim((string) ($_POST['member_name'] ?? ''));
                 $ord = (int) ($_POST['sort_order'] ?? 0);
                 [$routeStart, $routeEnd, $timeErr] = posted_route_times();
-                if ($addr === '') {
+                if ($addr !== '' && addr_is_bot($addr, bot_own_address($pdo))) {
+                    $formError = 'Este endereço é o PRÓPRIO bot — ele só repassa o atendimento e não pode ser operador.';
+                } elseif ($addr === '') {
                     $formError = 'Membro inválido.';
                 } elseif ($timeErr) {
                     $formError = $timeErr;
@@ -1264,6 +1271,9 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && $page !== 'login') {
                         'queue_top_pos',
                         // Resgate por analista offline (0 = desligado).
                         'offline_requeue_sec',
+                        // Formulário: para de ser oferecido N min antes do fim da
+                        // janela do operador (0 = desligado).
+                        'form_window_margin_min',
                     ] as $k
                 ) {
                     if (isset($_POST[$k])) {
@@ -1377,8 +1387,9 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && $page !== 'login') {
                     $pdo->prepare(
                         "INSERT INTO team_routing
                            (team_id, strategy, cap_chat, cap_form, cap_cases, require_online, respect_window,
-                            attempts, retry_interval_sec, fallback, form_enabled, member_kinds, offline_requeue_sec)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            attempts, retry_interval_sec, fallback, form_enabled, member_kinds, offline_requeue_sec,
+                            form_window_margin_min)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                          ON CONFLICT (team_id) DO UPDATE SET
                            strategy = excluded.strategy, cap_chat = excluded.cap_chat,
                            cap_form = excluded.cap_form, cap_cases = excluded.cap_cases,
@@ -1387,6 +1398,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && $page !== 'login') {
                            retry_interval_sec = excluded.retry_interval_sec, fallback = excluded.fallback,
                            form_enabled = excluded.form_enabled, member_kinds = excluded.member_kinds,
                            offline_requeue_sec = excluded.offline_requeue_sec,
+                           form_window_margin_min = excluded.form_window_margin_min,
                            updated_at = datetime('now')"
                     )->execute([
                         $rid,
@@ -1402,6 +1414,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && $page !== 'login') {
                         ((string) ($_POST['form_enabled'] ?? '1')) === '1' ? 1 : 0,
                         $memberKinds,
                         $int_or_null('offline_requeue_sec'),
+                        $int_or_null('form_window_margin_min'),
                     ]);
                     // "Replicar para todos os operadores": limpa o ajuste individual
                     // (NULL = herda o time) e, se pedido, o tipo individual tambem.
@@ -2209,6 +2222,7 @@ if ($page === 'routing') {
         'queue_top_pos' => ['Posição a partir da qual o chat ouve o número (0 = sempre)', '5'],
         'form_route_attempts' => ['Tentativas de rota do formulário', '5'],
         'form_route_retry_interval_sec' => ['Intervalo entre tentativas do formulário (s)', '60'],
+        'form_window_margin_min' => ['Formulário: parar de oferecer (min antes do fim da janela)', '10'],
     ];
     foreach ($globFields as $gk => $gv) {
         echo '<div class="col-md-3"><label class="form-label">' . h($gv[0]) . '</label>';
@@ -2480,6 +2494,7 @@ if ($page === 'routing') {
         }
         echo '</select></div>';
         echo '<div class="col-md-1"><label class="form-label">Offline</label><input class="form-control form-control-sm" type="number" min="0" name="offline_requeue_sec" value="' . h($numOrNull($tr['offline_requeue_sec'] ?? null)) . '" placeholder="' . h($map['offline_requeue_sec'] ?? '120') . '" title="Segundos offline antes de devolver o caso do operador para a fila (0 = este time nao devolve)"></div>';
+        echo '<div class="col-md-1"><label class="form-label">Fim janela</label><input class="form-control form-control-sm" type="number" min="0" name="form_window_margin_min" value="' . h($numOrNull($tr['form_window_margin_min'] ?? null)) . '" placeholder="' . h($map['form_window_margin_min'] ?? '10') . '" title="Minutos antes do fim da janela do operador em que o formulário deixa de ser oferecido (vazio = herda o global; 0 = desligado)"></div>';
         echo '<div class="col-md-2"><label class="form-label">Padrão dos operadores</label><select class="form-select form-select-sm" name="member_kinds">';
         foreach (['both' => 'atende os dois', 'chat' => 'só chat', 'form' => 'só formulário'] as $k => $l) {
             $atualMK = (string) ($tr['member_kinds'] ?? 'both');
@@ -2595,7 +2610,7 @@ if ($page === 'settings') {
 if ($page === 'activity') {
     $labels = [
         'bot_off' => 'bot desligado',
-        'queue_off' => 'fila desabilitada',
+        'queue_off' => 'fila desabilitada no painel',
         'queue_unknown' => 'sem fila',
         'not_new' => 'já atendido',
         'closure' => 'formulário recebido',
@@ -2627,12 +2642,13 @@ if ($page === 'activity') {
         'queue_expired' => 'espera expirou',
         'queue_no_menu' => 'fila habilitada sem menu ativo',
         'queue_no_team' => 'fila habilitada sem time ativo',
-        'form_queue_off' => 'formulário com a fila desabilitada (só indexado)',
+        'form_queue_off' => 'formulário com a fila desabilitada (rota encerrada)',
+        'self_target_blocked' => 'entrega cancelada: o alvo era o próprio bot',
         'case_reclaimed' => 'caso devolvido à fila (analista offline)',
         'chat_adopted' => 'analista entrou no chat da fila (caso adotado)',
         'reclaim_invite_only' => 'resgate: convite sem novo move',
         'reclaim_no_queue' => 'resgate: caso sem fila para devolver',
-        'reclaim_empty' => 'resgate: nenhum caso aberto para devolver',
+        'reclaim_empty' => 'resgate: nenhum caso de chat para devolver (formulário não se re-roteia)',
         'form_aware_greeting' => '(removida) abertura: formulário em andamento',
         'form_aware_choice' => '(removida) abertura: escolha do técnico',
         'form_aware_wait' => '(removida) abertura: aguardava o analista do formulário',

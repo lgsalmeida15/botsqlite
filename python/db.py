@@ -57,6 +57,7 @@ def ensure_schema(conn) -> None:
     _migrate_case_keys(conn)
     _migrate_load(conn)
     _migrate_kinds(conn)
+    _migrate_form_window(conn)
     _migrate_jobs(conn)
 
 
@@ -415,6 +416,24 @@ def _migrate_kinds(conn) -> None:
         )
 
 
+def _migrate_form_window(conn) -> None:
+    """Margem de fim de janela do formulario (por time; NULL = herda o global).
+
+    O formulario deixa de ser OFERECIDO N minutos antes do fim da escala do
+    operador (`team_members.route_end`): entregar em cima da saida prendia o caso
+    com quem ja tinha ido embora. O valor global fica em `bot_settings`
+    (`form_window_margin_min`, padrao 10) e o time sobrescreve se quiser.
+
+    Aqui tambem sai a chave MORTA `affinity_require_online`: a afinidade deixou de
+    ser excecao ao online, entao o ajuste antigo e removido para nao parecer que
+    ainda vale (mesma convencao do `queue_max_wait_sec`).
+    """
+    if "team_routing" in _table_names(conn) and "form_window_margin_min" not in _table_columns(conn, "team_routing"):
+        conn.execute("ALTER TABLE team_routing ADD COLUMN form_window_margin_min INTEGER")
+    if "bot_settings" in _table_names(conn):
+        conn.execute("DELETE FROM bot_settings WHERE key = 'affinity_require_online'")
+
+
 def _migrate_load(conn) -> None:
     """Carga por analista (medicao): estado atual + historico curto.
 
@@ -682,6 +701,15 @@ def enabled_queues(conn) -> set[str]:
 def settings(conn) -> dict:
     rows = conn.execute("SELECT key, value FROM bot_settings").fetchall()
     return {r["key"]: r["value"] for r in rows}
+
+
+def set_setting(conn, key: str, value) -> None:
+    """Grava um ajuste do bot (mesma tabela/forma que o painel usa)."""
+    conn.execute(
+        """INSERT INTO bot_settings (key, value) VALUES (?, ?)
+           ON CONFLICT (key) DO UPDATE SET value = excluded.value""",
+        (str(key), "" if value is None else str(value)),
+    )
 
 
 def templates(conn) -> dict:
@@ -1246,6 +1274,21 @@ def retry_route(conn, route_id: int, attempts: int, delay_sec: float, detail: st
            WHERE id = ?""",
         (int(attempts), detail or "", str(max(int(delay_sec), 0)), int(route_id)),
     )
+
+
+def waiting_routes(conn, limite: int = 5) -> list[dict]:
+    """Rotas ainda em espera, de QUALQUER linha (chat e formulario).
+
+    Usada quando o bot nao pode atuar de jeito nenhum (desligado no painel): o
+    tick encerra o que esta esperando em vez de deixar pendurado.
+    """
+    return conn.execute(
+        """SELECT * FROM pending_routes
+            WHERE status = 'waiting'
+            ORDER BY id
+            LIMIT ?""",
+        (max(int(limite), 1),),
+    ).fetchall()
 
 
 def finish_route(conn, route_id: int, status: str, detail: str = "") -> None:

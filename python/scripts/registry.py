@@ -45,6 +45,28 @@ def _spec_field(f: dict) -> dict:
     return item
 
 
+# Chaves extras que um campo do wizard pode declarar e que NAO entram no
+# manifest (que continua so com key/type/prompt/choices):
+# - `label`: texto curto usado no resumo da confirmacao (no lugar do prompt);
+# - `confirm`: False omite o campo do resumo (campo de busca interno).
+FIELD_FLAGS = ("label", "confirm")
+
+
+def _runtime_field(f: dict) -> dict:
+    """Campo do wizard em tempo de execucao (mantem `label` e `confirm`)."""
+    item = _spec_field(f)
+    for flag in FIELD_FLAGS:
+        if flag in f:
+            item[flag] = f[flag]
+    return item
+
+
+def _normalized_fields(raw) -> list[dict]:
+    if not isinstance(raw, list):
+        return []
+    return [_runtime_field(f) for f in raw if isinstance(f, dict) and f.get("key")]
+
+
 def list_specs() -> list[dict]:
     specs = []
     folder = Path(__file__).parent
@@ -75,6 +97,82 @@ def get_spec(slug: str) -> dict | None:
         if spec["slug"] == slug:
             return spec
     return None
+
+
+def fields_for(slug: str, answers: dict | None = None) -> list[dict]:
+    """Campos que o wizard deve perguntar agora.
+
+    Scripts sem o hook `fields_for(answers)` continuam com a lista estatica
+    `FIELDS` (comportamento antigo, campo a campo). Com o hook, a lista pode
+    depender do que ja foi coletado: e assim que `criar_acesso_hub` pergunta os
+    tecnicos 1..N e troca o texto livre do hub por uma lista numerada de
+    sugestoes quando o nome nao e localizado.
+    """
+    mod = _load_module(str(slug or ""))
+    if mod is None:
+        return []
+    raw = None
+    fn = getattr(mod, "fields_for", None)
+    if callable(fn):
+        try:
+            raw = fn(answers if isinstance(answers, dict) else {})
+        except Exception:
+            log.warning("fields_for de %s falhou", slug, exc_info=True)
+            raw = None
+    if not isinstance(raw, list):
+        raw = getattr(mod, "FIELDS", None)
+    return _normalized_fields(raw)
+
+
+def normalize_answer(
+    slug: str, field: dict, text: str, answers: dict | None = None
+) -> dict | None:
+    """Valida/normaliza a resposta pelo hook opcional do modulo.
+
+    Devolve `None` quando o modulo nao define `normalize_answer`: nesse caso o
+    engine usa a validacao padrao (`text`/`int`/`choice`), como sempre. Contrato
+    do retorno:
+
+    - `value`: valor normalizado (str) ou `None` quando a resposta nao serve;
+    - `state`: chaves internas (prefixo `_`) a persistir junto das respostas,
+      valido **inclusive na recusa** (e como a lista de sugestoes viaja);
+    - `retry`: `True` conta tentativa; `False` apenas re-pergunta (sugestao);
+    - `message`: aviso enviado antes de re-perguntar.
+    """
+    mod = _load_module(str(slug or ""))
+    fn = getattr(mod, "normalize_answer", None) if mod else None
+    if not callable(fn):
+        return None
+    key = str((field or {}).get("key") or "")
+    try:
+        raw = fn(key, str(text or ""), answers if isinstance(answers, dict) else {})
+    except Exception:
+        log.warning("normalize_answer de %s falhou", slug, exc_info=True)
+        return {"value": None, "state": {}, "retry": True, "message": ""}
+    data = raw if isinstance(raw, dict) else {}
+    value = data.get("value")
+    value = str(value).strip() if value is not None else ""
+    if not value:
+        value = None
+    state: dict = {}
+    if isinstance(data.get("state"), dict):
+        for k, v in data["state"].items():
+            name = str(k or "")
+            if name:
+                state[name] = v
+    retry = data.get("retry")
+    return {
+        "value": value,
+        "state": state,
+        "retry": True if retry is None else bool(retry),
+        "message": str(data.get("message") or "")[:800],
+    }
+
+
+def confirm_note(slug: str) -> str:
+    """Aviso extra do script no resumo da confirmacao (`CONFIRM_NOTE`)."""
+    mod = _load_module(str(slug or ""))
+    return str(getattr(mod, "CONFIRM_NOTE", "") or "") if mod else ""
 
 
 def manifest_payload() -> dict:

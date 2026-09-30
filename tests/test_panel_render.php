@@ -292,6 +292,53 @@ ok(strpos($htmlRouting, 'name="member_kinds"') !== false, 'aba routing: tipo pad
 ok(strpos($htmlRouting, 'name="kinds"') !== false, 'aba routing: tipo de atendimento por operador');
 ok(strpos($htmlRouting, 'linhas apartadas') !== false, 'aba routing: explica as duas linhas da fila');
 ok(strpos($htmlRouting, 'value="queue_expire"') !== false, 'aba routing: Encerrar espera do chat na fila');
+ok(
+    strpos($htmlRouting, 'name="form_window_margin_min"') !== false,
+    'aba routing: margem de fim de janela do formulario'
+);
+ok(
+    substr_count($htmlRouting, 'name="form_window_margin_min"') >= 2,
+    'aba routing: margem global + por time (linha do time)'
+);
+
+// Endereço do PRÓPRIO bot: o engine publica em bot_settings e o painel RECUSA
+// cadastrá-lo como operador (o caso voltaria para quem só repassa).
+$pdo->exec(
+    "INSERT INTO bot_settings (key, value) VALUES ('bot_own_address', 'u:bot@claro.com')
+     ON CONFLICT (key) DO UPDATE SET value = excluded.value"
+);
+ok(bot_own_address($pdo) === 'u:bot@claro.com', 'aba teams: endereco do bot publicado pelo engine');
+
+/** Renderiza UMA pagina com POST simulado (argv[5] do harness). */
+function render_post(string $page, int $uid, string $post): array
+{
+    $cmd = escapeshellarg(PHP_BINARY) . ' ' . escapeshellarg(__DIR__ . DIRECTORY_SEPARATOR . '_panel_render.php')
+        . ' ' . escapeshellarg($page) . ' ' . escapeshellarg((string) $uid) . ' '
+        . escapeshellarg('') . ' ' . escapeshellarg('') . ' ' . escapeshellarg($post) . ' 2>&1';
+    $out = [];
+    $code = 0;
+    exec($cmd, $out, $code);
+    return [implode("\n", $out), $code];
+}
+
+[$htmlBot, $codeBot] = render_post(
+    'teams', $uid, 'action=add_member&team_id=1&address=u:bot@claro.com&member_name=Bot'
+);
+ok($codeBot === 0, 'aba teams (POST): renderizou sem erro fatal');
+ok(strpos($htmlBot, 'PRÓPRIO bot') !== false, 'aba teams: recusa cadastrar o endereco do proprio bot');
+ok(
+    (int) $pdo->query("SELECT COUNT(*) FROM team_members WHERE address = 'u:bot@claro.com'")->fetchColumn() === 0,
+    'aba teams: o bot nao entra em team_members'
+);
+
+[$htmlNovo, $codeNovo] = render_post(
+    'teams', $uid, 'action=add_member&team_id=1&address=u:novo@claro.com&member_name=Novo'
+);
+ok($codeNovo === 0, 'aba teams (POST): operador comum segue aceito');
+ok(
+    (int) $pdo->query("SELECT COUNT(*) FROM team_members WHERE address = 'u:novo@claro.com'")->fetchColumn() === 1,
+    'aba teams: operador comum e cadastrado normalmente'
+);
 
 @unlink($path);
 exit($failed === 0 ? 0 : 1);

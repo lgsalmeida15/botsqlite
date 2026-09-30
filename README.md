@@ -117,6 +117,12 @@ cap/janela/online; ao conseguir, entrega e registra `queued_assigned` com o temp
 - **Formulário:** mesma régua — sem prazo, não gasta tentativas e não cai no fallback com a fila ligada
   (tentativas e fallback valem com a fila desligada). A rota dele também termina com `form_no_agent` quando
   o item some das listas do TOA.
+- **Fila desabilitada (ou bot desligado no painel):** o bot **não fica dentro** de um quadro que o operador
+  tirou dele — a espera é **encerrada com o motivo** (`fila_desabilitada`/`bot_desligado`) e o chat volta ao
+  quadro **em silêncio** (sai do chat, sem mensagem ao técnico); o formulário apenas deixa de ser oferecido
+  (`form_queue_off`). Religar a fila (ou o bot) **não** retoma o item: quem entrega é uma pessoa. Antes a rota
+  era segurada (`waiting`) para voltar sozinha e, na prática, ficava fora das duas recuperações — só o botão
+  *Reabrir rota* a trazia de volta.
 - **Entrar na fila não é falha:** com a fila ligada o evento é `queued` (com o motivo "sem analista
   elegível") para chat **e** formulário; `form_no_agent` fica reservado para a fila desligada/fallback
   *monitorar* — antes o painel mostrava "sem analista" para item que estava esperando a vez.

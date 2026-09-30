@@ -97,18 +97,29 @@ class ResgateOfflineTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(espera[0]["exclude_assignee"], ANA)
         self.assertIn("resgatado", espera[0]["detail"])
 
-    async def test_formulario_offline_volta_sem_mensagem(self):
+    async def test_formulario_offline_fica_com_o_analista(self):
+        """Formulario NAO se re-roteia: o caso continua com o dono (link pessoal)."""
         eng, conn, sock = self._eng()
         abre_caso_form(conn)
         devolvidos = await eng._reclaim_offline()
-        self.assertEqual(devolvidos, 1)
-        self.assertIn("case_reclaimed", events(conn))
+        self.assertEqual(devolvidos, 0)
+        caso = conn.execute("SELECT * FROM route_assignments WHERE chat_id = 99").fetchone()
+        self.assertIsNone(caso["closed_at"], "o caso continua com o analista offline")
+        self.assertNotIn("case_reclaimed", events(conn))
+        self.assertEqual(routes(conn, "waiting"), [], "nao nasce rota nova para o formulario")
         self.assertEqual(sock.sent_texts(), [], "formulario nao tem conversa")
-        espera = routes(conn, "waiting")
-        self.assertEqual(len(espera), 1)
-        self.assertEqual(espera[0]["kind"], "form")
-        self.assertEqual(espera[0]["exclude_assignee"], ANA)
-        self.assertEqual(espera[0]["case_key"], "a:" + TEC)
+
+    async def test_fila_desabilitada_nao_devolve_nada(self):
+        """Fila desligada no painel: o resgate nao cria rota (o tick a seguraria)."""
+        eng, conn, _sock = self._eng()
+        conn.execute("UPDATE queues SET enabled = 0")
+        eng.reload_config()
+        abre_caso_chat(conn)
+        self.assertEqual(await eng._reclaim_offline(), 0)
+        caso = conn.execute("SELECT * FROM route_assignments WHERE chat_id = 10").fetchone()
+        self.assertIsNone(caso["closed_at"])
+        self.assertEqual(routes(conn, "waiting"), [])
+        self.assertNotIn("case_reclaimed", events(conn))
 
     async def test_offline_recente_nao_devolve(self):
         eng, conn, _sock = self._eng()
@@ -207,9 +218,11 @@ class ResgateOfflineTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("online_ok", db._table_columns(conn, "analyst_load"))
         self.assertIn("exclude_assignee", db._table_columns(conn, "pending_routes"))
         self.assertIn("offline_requeue_sec", db._table_columns(conn, "team_routing"))
+        self.assertIn("form_window_margin_min", db._table_columns(conn, "team_routing"))
         self.assertIn("payload", db._table_columns(conn, "bot_jobs"))
         self.assertIn("requeue_notice", db.templates(conn))
         self.assertEqual(db.settings(conn).get("offline_requeue_sec"), "120")
+        self.assertEqual(db.settings(conn).get("form_window_margin_min"), "10")
 
 
 if __name__ == "__main__":

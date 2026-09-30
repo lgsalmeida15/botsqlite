@@ -21,6 +21,7 @@ ENV_APOIO = {
     "APOIO_STATUS_URL": "http://example.test/api/v1/toa",
     "APOIO_API_KEY": "sekret",
 }
+ENV_HUB = {"WEBHOOK_ACESSO_HUB": "http://example.test/hook/acesso-hub"}
 
 
 def seed_apoio_leaf(conn) -> int:
@@ -63,6 +64,28 @@ def seed_infra_leaf(conn) -> int:
         classification="infra",
         action="run_script",
         script_slug="criar_infra_rede",
+    )
+    return parent
+
+
+def seed_hub_leaf(conn) -> int:
+    parent = insert_option(
+        conn,
+        menu_id=1,
+        sort_order=1,
+        label="Acesso Hub",
+        classification="",
+        action="submenu",
+    )
+    insert_option(
+        conn,
+        menu_id=1,
+        parent_id=parent,
+        sort_order=1,
+        label="Acesso Hub",
+        classification="hub",
+        action="run_script",
+        script_slug="criar_acesso_hub",
     )
     return parent
 
@@ -399,6 +422,158 @@ class InfraRedeWizardTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(answers["rede"], "HFC")
         conf = sock.sent_texts()[-1]
         self.assertIn("Qual a rede: HFC.", conf)
+
+
+class AcessoHubWizardTest(unittest.IsolatedAsyncioTestCase):
+    def _eng(self, conn) -> tuple[Engine, FakeSock]:
+        sock = FakeSock()
+        return Engine(conn, sock), sock
+
+    async def _abre(self, eng: Engine, conn) -> None:
+        await eng.handle_reply(10, awaiting(conn), "1")
+        await eng.handle_reply(10, row_of(conn), "1")
+
+    async def _informa_um_tecnico(self, eng: Engine, conn) -> None:
+        await eng.handle_reply(10, row_of(conn), "HUBSAM")
+        await eng.handle_reply(10, row_of(conn), "RAL-569474/2026")
+        await eng.handle_reply(10, row_of(conn), "1")
+        for ans in ("Claro", "José de Jesus Barros", "14253236-x", "529.982.247-25"):
+            await eng.handle_reply(10, row_of(conn), ans)
+        await eng.handle_reply(10, row_of(conn), "TESTES COM OTDR")
+
+    async def test_fluxo_completo_com_sugestao_e_webhook(self):
+        conn = mem_conn()
+        seed_queue_menu(conn)
+        seed_hub_leaf(conn)
+        eng, sock = self._eng(conn)
+        await self._abre(eng, conn)
+        chat = row_of(conn)
+        self.assertEqual(chat["status"], "awaiting_script_answer")
+        self.assertEqual(chat["script_slug"], "criar_acesso_hub")
+        self.assertIn("Qual hub/site? Ex: VMN ou VILA MARIANA", sock.sent_texts()[-1])
+
+        # Hub desconhecido vira lista numerada e NAO consome tentativa.
+        await eng.handle_reply(10, chat, "vila mariiana")
+        chat = row_of(conn)
+        self.assertEqual(int(chat["retries"] or 0), 0)
+        sugestao = sock.sent_texts()[-1]
+        self.assertIn('Não localizei "vila mariiana"', sugestao)
+        self.assertIn("1) HEVMN - VILA MARIANA", sugestao)
+
+        await eng.handle_reply(10, chat, "1")
+        self.assertIn("Qual número do Incidente? (RAL/REC/INM)", sock.sent_texts()[-1])
+
+        await eng.handle_reply(10, row_of(conn), "RAL-569474/2026")
+        self.assertIn("Quantos técnicos acessarão o local?", sock.sent_texts()[-1])
+
+        await eng.handle_reply(10, row_of(conn), "2")
+        self.assertIn("Técnico 1:", sock.sent_texts()[-1])
+
+        await eng.handle_reply(10, row_of(conn), "Claro")
+        self.assertEqual(sock.sent_texts()[-1], "Nome Completo")
+        await eng.handle_reply(10, row_of(conn), "José de Jesus Barros")
+        await eng.handle_reply(10, row_of(conn), "14253236-x")
+        await eng.handle_reply(10, row_of(conn), "529.982.247-25")
+        self.assertIn("Técnico 2:", sock.sent_texts()[-1])
+        await eng.handle_reply(10, row_of(conn), "Claro")
+        await eng.handle_reply(10, row_of(conn), "Marcos Romeu Gerardi")
+        await eng.handle_reply(10, row_of(conn), "12653236-X")
+        await eng.handle_reply(10, row_of(conn), "529.982.247-25")
+        self.assertEqual(sock.sent_texts()[-1], "Informe o motivo do acesso")
+        await eng.handle_reply(10, row_of(conn), "TESTES COM OTDR RAL-569474/2026")
+
+        chat = row_of(conn)
+        self.assertEqual(chat["status"], "awaiting_script_confirm")
+        answers = json.loads(chat["script_answers"])
+        self.assertEqual(answers["hub"], "HEVMN - VILA MARIANA")
+        self.assertEqual(answers["qtd_tecnicos"], "2")
+        self.assertEqual(answers["tec_1_rg"], "14253236-X")
+        self.assertEqual(answers["tec_1_cpf"], "529.982.247-25")
+        conf = "\n".join(sock.sent_texts()[-2:])  # resumo longo pode vir em 2 blocos
+        self.assertIn("Confirme as informações:", conf)
+        self.assertIn("Hub/site: HEVMN - VILA MARIANA.", conf)
+        self.assertIn("Incidente: RAL-569474/2026.", conf)
+        self.assertIn("Técnicos: 2.", conf)
+        self.assertIn("Técnico 1 — Empresa: Claro.", conf)
+        self.assertIn("Técnico 2 — CPF: 529.982.247-25.", conf)
+        self.assertIn("Motivo: TESTES COM OTDR RAL-569474/2026.", conf)
+        self.assertIn("Qualquer inconsistência pode ocasionar na recusa.", conf)
+        self.assertIn("1) Confirmar", conf)
+        self.assertIn("2) Corrigir", conf)
+
+        capturado = {}
+
+        def fake_post(url, payload, headers, *a, **k):
+            capturado["url"] = url
+            capturado["payload"] = payload
+            return 200, {"ok": True}
+
+        with patch.dict(os.environ, ENV_HUB, clear=False), patch(
+            "python.scripts.criar_acesso_hub._post_json", side_effect=fake_post
+        ):
+            await eng.handle_reply(10, chat, "1")
+
+        chat = row_of(conn)
+        self.assertEqual(chat["status"], "closed")
+        self.assertEqual(chat["classification"], "hub")
+        self.assertTrue(
+            any("Solicitação de acesso ao HUB enviada" in t for t in sock.sent_texts())
+        )
+        self.assertEqual(capturado["url"], ENV_HUB["WEBHOOK_ACESSO_HUB"])
+        texto = capturado["payload"]["text"]
+        self.assertIn("HUB DE ACESSO:  HEVMN - VILA MARIANA", texto)
+        self.assertIn("Incidente: RAL-569474/2026", texto)
+        self.assertIn("Motivo: TESTES COM OTDR RAL-569474/2026", texto)
+        self.assertIn("Técnico 1:  \nEmpresa: Claro", texto)
+        self.assertIn("Técnico 2:  \nEmpresa: Claro", texto)
+
+    async def test_qtd_acima_do_limite_conta_tentativa(self):
+        conn = mem_conn()
+        seed_queue_menu(conn)
+        seed_hub_leaf(conn)
+        eng, sock = self._eng(conn)
+        await self._abre(eng, conn)
+        await eng.handle_reply(10, row_of(conn), "HUBSAM")
+        await eng.handle_reply(10, row_of(conn), "RAL-0001/2026")
+        self.assertIn("Quantos técnicos", sock.sent_texts()[-1])
+
+        await eng.handle_reply(10, row_of(conn), "5")
+        chat = row_of(conn)
+        self.assertEqual(int(chat["retries"] or 0), 1)
+        self.assertIn("O limite é de 4 técnicos", sock.sent_texts()[-2])
+        self.assertIn("Quantos técnicos", sock.sent_texts()[-1])
+        self.assertNotIn("qtd_tecnicos", json.loads(chat["script_answers"] or "{}"))
+
+    async def test_cpf_invalido_avisa_e_nao_avanca(self):
+        conn = mem_conn()
+        seed_queue_menu(conn)
+        seed_hub_leaf(conn)
+        eng, sock = self._eng(conn)
+        await self._abre(eng, conn)
+        for ans in ("HUBSAM", "RAL-0001/2026", "1", "Claro", "José de Jesus Barros", "14253236-x"):
+            await eng.handle_reply(10, row_of(conn), ans)
+        await eng.handle_reply(10, row_of(conn), "123")
+        chat = row_of(conn)
+        self.assertEqual(int(chat["retries"] or 0), 1)
+        self.assertIn("CPF inválido", sock.sent_texts()[-2])
+        self.assertEqual(sock.sent_texts()[-1], "CPF")
+        self.assertNotIn("tec_1_cpf", json.loads(chat["script_answers"] or "{}"))
+
+    async def test_corrigir_volta_ao_hub(self):
+        conn = mem_conn()
+        seed_queue_menu(conn)
+        seed_hub_leaf(conn)
+        eng, sock = self._eng(conn)
+        await self._abre(eng, conn)
+        await self._informa_um_tecnico(eng, conn)
+        self.assertEqual(row_of(conn)["status"], "awaiting_script_confirm")
+
+        await eng.handle_reply(10, row_of(conn), "2")
+        chat = row_of(conn)
+        self.assertEqual(chat["status"], "awaiting_script_answer")
+        self.assertEqual(int(chat["script_field_index"] or 0), 0)
+        self.assertEqual(json.loads(chat["script_answers"] or "{}"), {})
+        self.assertIn("Qual hub/site?", sock.sent_texts()[-1])
 
 
 class ResumeScriptStatusTest(unittest.TestCase):

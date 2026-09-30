@@ -425,6 +425,42 @@ function bot_table_columns(PDO $pdo, string $table): array
     return $cols;
 }
 
+/** Endereço do PRÓPRIO bot (gravado pelo engine em `bot_settings`). */
+function bot_own_address(PDO $pdo): string
+{
+    try {
+        $raw = $pdo->query("SELECT value FROM bot_settings WHERE key = 'bot_own_address'")->fetchColumn();
+    } catch (Throwable $e) {
+        return '';
+    }
+    return trim((string) ($raw ?: ''));
+}
+
+/** O endereço informado é o do próprio bot? (ele nunca pode ser operador) */
+function addr_is_bot(string $addr, string $own): bool
+{
+    $a = strtolower(trim($addr));
+    $b = strtolower(trim($own));
+    if ($a === '' || $b === '') {
+        return false;
+    }
+    if ($a === $b) {
+        return true;
+    }
+    // Compara também pelo login: o TOA às vezes devolve o endereço sem o prefixo
+    // `u:` e o bot não pode entrar como operador de jeito nenhum (o caso voltaria
+    // para quem só repassa o atendimento).
+    $login = static function (string $v): string {
+        if (strpos($v, 'u:') === 0) {
+            $v = substr($v, 2);
+        }
+        $at = strpos($v, '@');
+        return $at === false ? $v : substr($v, 0, $at);
+    };
+    $la = $login($a);
+    return $la !== '' && $la === $login($b);
+}
+
 function bot_migrate_submenu(PDO $pdo): void
 {
     $optCols = bot_table_columns($pdo, 'menu_options');
@@ -471,6 +507,9 @@ function bot_migrate_submenu(PDO $pdo): void
         $trCols = bot_table_columns($pdo, 'team_routing');
         if (!isset($trCols['cap_cases'])) {
             $pdo->exec('ALTER TABLE team_routing ADD COLUMN cap_cases INTEGER');
+        }
+        if (!isset($trCols['form_window_margin_min'])) {
+            $pdo->exec('ALTER TABLE team_routing ADD COLUMN form_window_margin_min INTEGER');
         }
     }
     if (bot_table_exists($pdo, 'team_member_routing')) {

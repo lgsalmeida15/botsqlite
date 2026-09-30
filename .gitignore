@@ -12,3 +12,4 @@ data/*.sqlite-shm
 .DS_Store
 Thumbs.db
 *.stackdump
+tmp_bak/

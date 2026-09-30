@@ -200,6 +200,63 @@ class QueueTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(chat_row(conn)["status"], "closed_no_agent")
         self.assertIn("leave_chat", sock.names())
 
+    async def test_fila_desabilitada_sai_do_chat_e_encerra_a_espera(self):
+        """Fila desligada depois de o bot entrar: ele sai do chat em silencio.
+
+        Antes a rota era segurada `waiting` (sem gastar tentativa) para voltar
+        quando a fila religasse: o chat ficava `classified` com uma rota pendurada e
+        nem `due_routes` nem a recuperacao o viam de volta. Agora o atendimento
+        volta para o quadro sem o bot dentro.
+        """
+        eng, conn, sock = self._eng(online=[])
+        await self._entra_na_fila(eng, conn)
+        self.assertEqual(len(routes(conn, "waiting")), 1)
+        faladas = len(sock.sent_texts())
+        conn.execute("UPDATE queues SET enabled = 0")
+        eng.reload_config()
+        await eng.tick_routes()
+        self.assertNotIn("move_chat", sock.names())
+        self.assertIn("leave_chat", sock.names(), "o bot sai do chat")
+        self.assertEqual(chat_row(conn)["status"], "left")
+        self.assertEqual(routes(conn, "waiting"), [], "a espera e encerrada")
+        falha = routes(conn, "failed")
+        self.assertEqual(len(falha), 1)
+        self.assertIn("fila desabilitada", falha[0]["detail"])
+        self.assertIn("queue_off", events(conn))
+        self.assertIn("left", events(conn))
+        self.assertEqual(len(sock.sent_texts()), faladas, "saida silenciosa: nada e dito")
+        # Fila religada: o bot nao volta sozinho para um chat que ele ja largou.
+        conn.execute("UPDATE queues SET enabled = 1")
+        eng.reload_config()
+        sock.online = ["ana"]
+        await eng.tick_routes()
+        self.assertNotIn("invite_to_chat", sock.names())
+        self.assertEqual(len(routes(conn, "done")), 0)
+
+    async def test_chat_ja_entregue_sai_quando_a_fila_e_desabilitada(self):
+        """A varredura pega quem JA foi entregue: sem rota em espera nao havia saida.
+
+        E o caso do chat que o bot entregou (ou so acompanha) e cuja fila foi
+        desabilitada depois: ele continua DENTRO do chat.
+        """
+        eng, conn, sock = self._eng(online=["ana"])
+        await self._entra_na_fila(eng, conn)
+        sock.online = ["ana"]
+        await eng.tick_routes()
+        self.assertEqual(chat_row(conn)["status"], "closed", "entrega normal")
+        # O bot segue no quadro (acompanhando) quando a fila e desligada.
+        db.upsert_chat(conn, 10, status="monitoring", queue_address="h:q1")
+        conn.execute("UPDATE queues SET enabled = 0")
+        eng.reload_config()
+        await eng.tick_routes()
+        self.assertEqual(chat_row(conn)["status"], "left")
+        self.assertIn("leave_chat", sock.names())
+        self.assertIn("queue_off", events(conn))
+        # Sem fila bloqueada e sem espera: o proximo tick nao mexe em mais nada.
+        antes = len(sock.names())
+        await eng.tick_routes()
+        self.assertEqual(len(sock.names()), antes)
+
     async def test_fila_desligada_nao_avisa_e_nao_expira_por_tempo(self):
         eng, conn, sock = self._eng(online=[])
         eng.cfg["queue_wait_enabled"] = "false"

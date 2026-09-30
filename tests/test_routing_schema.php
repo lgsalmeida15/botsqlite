@@ -43,7 +43,7 @@ $tr = bot_table_columns($pdo, 'team_routing');
 foreach (
     ['strategy', 'cap_chat', 'cap_form', 'require_online', 'respect_window', 'attempts',
         'retry_interval_sec', 'fallback', 'form_enabled', 'last_assigned_chat', 'last_assigned_form',
-        'cap_cases', 'member_kinds']
+        'cap_cases', 'member_kinds', 'form_window_margin_min']
     as $col
 ) {
     ok(isset($tr[$col]), "team_routing.$col");
@@ -63,11 +63,31 @@ foreach ($pdo->query('SELECT key, value FROM bot_settings') as $r) {
 }
 foreach (
     ['form_routing_enabled', 'max_open_forms_per_agent', 'form_route_attempts',
-        'form_route_retry_interval_sec', 'form_route_fallback', 'routing_strategy']
+        'form_route_retry_interval_sec', 'form_route_fallback', 'routing_strategy',
+        'form_window_margin_min']
     as $key
 ) {
     ok(isset($settings[$key]), "bot_settings.$key");
 }
+ok(
+    (int) $settings['form_window_margin_min'] === 10,
+    'margem de fim de janela do formulario nasce em 10 min'
+);
+
+// Guarda do painel: o endereco do PROPRIO bot (publicado pelo engine) nunca
+// pode ser cadastrado como operador — o caso voltaria para quem so repassa.
+$pdo->exec(
+    "INSERT INTO bot_settings (key, value) VALUES ('bot_own_address', 'u:bot@claro.com')
+     ON CONFLICT (key) DO UPDATE SET value = excluded.value"
+);
+ok(bot_own_address($pdo) === 'u:bot@claro.com', 'bot_own_address le o endereco publicado pelo engine');
+ok(addr_is_bot('u:bot@claro.com', bot_own_address($pdo)), 'addr_is_bot reconhece o endereco do bot');
+ok(addr_is_bot('BOT@claro.com', 'u:bot@claro.com'), 'addr_is_bot compara pelo login (sem u:/dominio)');
+ok(!addr_is_bot('u:ana@claro.com', 'u:bot@claro.com'), 'addr_is_bot libera outro operador');
+ok(
+    !addr_is_bot('', 'u:bot@claro.com') && !addr_is_bot('u:ana@claro.com', ''),
+    'addr_is_bot ignora endereco vazio (bot ainda nao conhecido)'
+);
 
 $pdo->exec("INSERT INTO queues (address, name, enabled) VALUES ('h:q1', 'Q1', 1)");
 $pdo->exec("INSERT INTO teams (name, active) VALUES ('T1', 1)");

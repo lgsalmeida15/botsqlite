@@ -102,6 +102,25 @@ class ResolveSettingsTest(unittest.TestCase):
     def test_kind_desconhecido_vira_chat(self):
         self.assertEqual(routing.resolve_settings({}, None, "xpto")["kind"], "chat")
 
+    def test_margem_do_formulario_herda_global_e_time(self):
+        """Margem de fim de janela do formulario: time → global → 10 min."""
+        self.assertEqual(routing.resolve_settings({}, None, "form")["form_window_margin_min"], 10)
+        cfg = {"form_window_margin_min": "5"}
+        self.assertEqual(routing.resolve_settings(cfg, None, "form")["form_window_margin_min"], 5)
+        self.assertEqual(routing.resolve_settings(cfg, {}, "form")["form_window_margin_min"], 5)
+        # 0 no time desliga o corte so neste time; valor negativo cai em 0.
+        self.assertEqual(
+            routing.resolve_settings(cfg, {"form_window_margin_min": 0}, "form")["form_window_margin_min"], 0
+        )
+        self.assertEqual(
+            routing.resolve_settings(cfg, {"form_window_margin_min": "-3"}, "form")["form_window_margin_min"], 0
+        )
+
+    def test_affinity_require_online_nao_existe_mais(self):
+        """Afinidade nao e excecao ao online: a chave antiga nao volta a valer."""
+        s = routing.resolve_settings({"affinity_require_online": "true"}, None, "chat")
+        self.assertNotIn("affinity_require_online", s)
+
 
 class MemberRulesTest(unittest.TestCase):
     def test_sem_linha_herda_o_cap_do_time(self):
@@ -305,6 +324,95 @@ class DecideTest(unittest.TestCase):
         )
         self.assertEqual(pick["address"], ANA)
 
+    def test_form_para_de_oferecer_no_fim_da_janela(self):
+        """Fim de escala: o formulario nao nasce com quem sai em minutos."""
+        ms = [
+            member(ANA, route_start="08:00:00", route_end="18:00:00"),
+            member(BIA, route_start="08:00:00", route_end="22:00:00"),
+        ]
+        pick, detail = routing.decide(
+            ms,
+            settings=routing.resolve_settings({}, None, "form"),
+            kind="form",
+            online={"ana", "bia"},
+            now=brt(17, 55),
+            team_name="T1",
+        )
+        self.assertEqual(pick["address"], BIA)
+        self.assertIn("fim_janela=ana:5min", detail)
+
+    def test_margem_zero_desliga_o_corte_de_janela(self):
+        ms = [member(ANA, route_start="08:00:00", route_end="18:00:00")]
+        pick, _ = routing.decide(
+            ms,
+            settings=routing.resolve_settings({"form_window_margin_min": "0"}, None, "form"),
+            kind="form",
+            online={"ana"},
+            now=brt(17, 55),
+        )
+        self.assertEqual(pick["address"], ANA)
+
+    def test_chat_ignora_a_margem_de_fim_de_janela(self):
+        """A margem e do FORMULARIO: o chat segue indo para quem esta de saida."""
+        ms = [member(ANA, route_start="08:00:00", route_end="18:00:00")]
+        pick, _ = routing.decide(
+            ms, settings=self.settings(), kind="chat", online={"ana"}, now=brt(17, 55)
+        )
+        self.assertEqual(pick["address"], ANA)
+
+    def test_escala_24h_nunca_cai_na_margem(self):
+        pick, _ = routing.decide(
+            [member(ANA)],
+            settings=routing.resolve_settings({}, None, "form"),
+            kind="form",
+            online={"ana"},
+            now=brt(23, 55),
+        )
+        self.assertEqual(pick["address"], ANA)
+
+    def test_exclude_barra_o_alvo_proibido(self):
+        """O proprio bot nunca entra como alvo (nem pelo rodizio)."""
+        bot = "u:bot@claro.com"
+        pick, detail = routing.decide(
+            [member(ANA), member(bot)],
+            settings=self.settings(),
+            online={"ana", "bot"},
+            exclude={bot},
+            now=brt(10),
+        )
+        self.assertEqual(pick["address"], ANA)
+        self.assertIn("proprio_bot=bot", detail)
+
+    def test_exclude_sozinho_deixa_o_time_sem_elegivel(self):
+        bot = "u:bot@claro.com"
+        pick, detail = routing.decide(
+            [member(bot)],
+            settings=self.settings(),
+            online={"bot"},
+            exclude={bot},
+            now=brt(10),
+        )
+        self.assertIsNone(pick)
+        self.assertIn("proprio_bot=bot", detail)
+
+
+class MargemDeJanelaTest(unittest.TestCase):
+    """`_minutes_to_window_end`: quantos minutos faltam para a escala acabar."""
+
+    def test_minutos_ate_o_fim_da_janela(self):
+        dia = member(ANA, route_start="08:00:00", route_end="18:00:00")
+        self.assertEqual(routing._minutes_to_window_end(dia, brt(17, 30)), 30)
+        # Fora da janela (ainda nao entrou ou ja saiu) nao ha o que "faltar".
+        self.assertEqual(routing._minutes_to_window_end(dia, brt(3)), 0)
+        self.assertEqual(routing._minutes_to_window_end(dia, brt(20)), 0)
+        # Escala 24h: nao existe fim de janela.
+        self.assertIsNone(routing._minutes_to_window_end(member(ANA), brt(12)))
+
+    def test_virada_de_meia_noite_conta_o_dia(self):
+        noite = member(ANA, route_start="22:00:00", route_end="06:00:00")
+        self.assertEqual(routing._minutes_to_window_end(noite, brt(23)), 420)
+        self.assertEqual(routing._minutes_to_window_end(noite, brt(5, 50)), 10)
+
 
 class MigracaoRoutingTest(unittest.TestCase):
     """Deploy em banco antigo: cria tabelas/settings sem apagar o que o usuário definiu."""
@@ -356,6 +464,26 @@ class MigracaoRoutingTest(unittest.TestCase):
         ).fetchone()
         self.assertEqual(int(cap["cap_cases"]), 2, "a migracao nao mexe em cap nenhum")
 
+    def test_migracao_traz_a_margem_e_apaga_a_chave_morta(self):
+        """`form_window_margin_min` nasce no time + global; `affinity_require_online` sai."""
+        self.conn.execute("INSERT INTO teams (name, active) VALUES ('T1', 1)")
+        db.set_last_assigned(self.conn, 1, "chat", "u:ana@claro.com")
+        # Banco antigo: a coluna nao existe e a chave morta esta gravada.
+        self.conn.execute("ALTER TABLE team_routing DROP COLUMN form_window_margin_min")
+        self.conn.execute(
+            "INSERT INTO bot_settings (key, value) VALUES ('affinity_require_online', 'true')"
+            " ON CONFLICT (key) DO UPDATE SET value = 'true'"
+        )
+        db.ensure_schema(self.conn)
+        self.assertIn("form_window_margin_min", db._table_columns(self.conn, "team_routing"))
+        cfg = db.settings(self.conn)
+        self.assertNotIn("affinity_require_online", cfg, "a chave morta nao volta")
+        self.assertEqual(cfg["form_window_margin_min"], "10")
+        # As linhas do time continuam inteiras (a coluna nova entra como NULL).
+        linha = db.team_routing(self.conn, 1)
+        self.assertEqual(linha["last_assigned_chat"], "u:ana@claro.com")
+        self.assertIsNone(linha["form_window_margin_min"], "NULL = herda o global")
+
     def test_ensure_schema_e_idempotente(self):
         self.conn.execute("INSERT INTO teams (name, active) VALUES ('T1', 1)")
         db.set_last_assigned(self.conn, 1, "form", "u:ana@claro.com")
@@ -400,6 +528,29 @@ class MigracaoRoutingTest(unittest.TestCase):
         due = db.due_routes(self.conn)
         self.assertEqual([int(r["chat_id"]) for r in due["chat"]], [1, 2, 3])
         self.assertEqual([int(r["chat_id"]) for r in due["form"]], [9], "form e a cabeca da linha dele")
+
+    def test_waiting_routes_lista_o_que_espera_mesmo_adiado(self):
+        """Bot desligado: o tick precisa de TODAS as rotas em espera, nas duas linhas.
+
+        `due_routes` nao serve (so devolve o que venceu) e uma rota adiada por
+        retry tambem tem de ser encerrada quando o bot sai.
+        """
+        db.enqueue_route(self.conn, "chat", 7, "h:q1", 1, delay_sec=0)
+        db.enqueue_route(self.conn, "form", 8, "h:q1", 1, delay_sec=0)
+        adiada = db.enqueue_route(self.conn, "chat", 9, "h:q1", 1, delay_sec=0)
+        db.retry_route(self.conn, adiada, 2, 600, "sem analista")
+        self.assertEqual([int(r["chat_id"]) for r in db.waiting_routes(self.conn)], [7, 8, 9])
+        self.assertEqual([int(r["chat_id"]) for r in db.waiting_routes(self.conn, 2)], [7, 8])
+        db.finish_route(self.conn, adiada, "failed", "encerrada")
+        self.assertNotIn(9, [int(r["chat_id"]) for r in db.waiting_routes(self.conn)])
+
+    def test_set_setting_grava_e_sobrescreve(self):
+        db.set_setting(self.conn, "bot_own_address", "u:bot@claro.com")
+        self.assertEqual(db.settings(self.conn)["bot_own_address"], "u:bot@claro.com")
+        db.set_setting(self.conn, "bot_own_address", "u:bot2@claro.com")
+        self.assertEqual(db.settings(self.conn)["bot_own_address"], "u:bot2@claro.com")
+        db.set_setting(self.conn, "bot_own_address", None)
+        self.assertEqual(db.settings(self.conn)["bot_own_address"], "")
 
 
 if __name__ == "__main__":

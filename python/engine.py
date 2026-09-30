@@ -53,6 +53,12 @@ _REPLY_STATUSES = (
     "awaiting_script_confirm",
 )
 
+# Quantos chats o bot DEVOLVE ao quadro por tick quando nao pode atuar (fila
+# desabilitada no painel ou bot desligado). Cada devolucao e um `leave_chat` no
+# TOA: o limite evita rajada quando o operador desliga uma fila com muita gente
+# dentro — o resto sai nos ciclos seguintes.
+_LEAVE_BUDGET = 10
+
 
 def _parts(chat: dict) -> list[dict]:
     p = chat.get("participants") or {}
@@ -237,13 +243,18 @@ def _validate_script_value(field: dict, text: str) -> str | None:
     return raw
 
 
-def _confirm_text(spec: dict, answers: dict) -> str:
+def _confirm_text(spec: dict, answers: dict, note: str = "") -> str:
     lines = ["Confirme as informações:", ""]
     for f in spec.get("fields") or []:
+        if f.get("confirm") is False:
+            continue
         key = str(f.get("key") or "")
-        prompt = str(f.get("prompt") or key).rstrip(" ?")
-        lines.append(f"{prompt}: {answers.get(key, '')}.")
+        label = str(f.get("label") or f.get("prompt") or key).rstrip(" ?")
+        lines.append(f"{label}: {answers.get(key, '')}.")
     lines.append("")
+    if str(note or "").strip():
+        lines.append(str(note).strip())
+        lines.append("")
     lines.append("Digite:")
     lines.append("1) Confirmar")
     lines.append("2) Corrigir")
@@ -414,10 +425,28 @@ class Engine:
         self.cfg = db.settings(self.conn)
         self.tpl = db.templates(self.conn)
         self.enabled = db.enabled_queues(self.conn)
+        self._sync_own_address()
 
     @property
     def own(self) -> str:
         return self.sock.own_address
+
+    def _sync_own_address(self) -> None:
+        """Publica no banco o endereco do PROPRIO bot.
+
+        Ele nunca pode ser alvo de rota: o caso voltaria para o bot, que so
+        repassa (e a carga dele nunca aparece no TOA). O painel usa este valor
+        para recusar o cadastro do bot como operador de um time.
+        """
+        own = str(self.own or "").strip()
+        if not own or str(self.cfg.get("bot_own_address") or "") == own:
+            return
+        try:
+            db.set_setting(self.conn, "bot_own_address", own)
+        except Exception:
+            log.exception("gravando bot_own_address")
+            return
+        self.cfg["bot_own_address"] = own
 
     @property
     def bot_on(self) -> bool:
@@ -1458,9 +1487,8 @@ class Engine:
 
     async def start_script(self, cid: int, row: dict, opt: dict) -> None:
         slug = str(opt.get("script_slug") or "")
-        spec = registry.get_spec(slug)
-        fields = spec.get("fields") if spec else None
-        if not spec or not fields:
+        fields = registry.fields_for(slug, {})
+        if not fields:
             await self._invalid_reply(cid, row)
             return
         if slug == "criar_apoio":
@@ -1488,8 +1516,8 @@ class Engine:
             await self.send(cid, prompt)
 
     async def _restart_script(self, cid: int, row: dict) -> None:
-        spec = registry.get_spec(row.get("script_slug"))
-        fields = spec.get("fields") if spec else None
+        slug = str(row.get("script_slug") or "")
+        fields = registry.fields_for(slug, {})
         now = datetime.now(timezone.utc)
         db.upsert_chat(
             self.conn, cid,
@@ -1505,8 +1533,9 @@ class Engine:
                 await self.send(cid, prompt)
 
     async def handle_script_answer(self, cid: int, row: dict, text: str) -> None:
-        spec = registry.get_spec(row.get("script_slug"))
-        fields = spec.get("fields") if spec else []
+        slug = str(row.get("script_slug") or "")
+        answers = _script_answers(row)
+        fields = registry.fields_for(slug, answers)
         try:
             idx = int(row.get("script_field_index") or 0)
         except (TypeError, ValueError):
@@ -1515,25 +1544,52 @@ class Engine:
             await self._restart_script(cid, row)
             return
         field = fields[idx]
-        value = _validate_script_value(field, text)
+        norm = registry.normalize_answer(slug, field, text, answers)
         now = datetime.now(timezone.utc)
+        if norm is None:
+            value = _validate_script_value(field, text)
+        else:
+            value = norm["value"]
+            if norm["state"]:
+                # Estado interno do script (chaves `_`): vai para o banco mesmo
+                # quando a resposta e recusada — e assim a lista de sugestoes de
+                # hub chega na proxima pergunta.
+                answers.update(norm["state"])
+            if norm["message"]:
+                await self.send_guarded(cid, norm["message"], row.get("queue_address"))
         if value is None:
-            prompt = _field_prompt(field)
+            # A pergunta pode ter mudado com o estado da recusa (texto -> lista
+            # numerada de sugestoes): reenvia o campo atual, nao o antigo.
+            atual = registry.fields_for(slug, answers) or fields
+            prompt = _field_prompt(atual[idx]) if 0 <= idx < len(atual) else ""
             if prompt:
                 await self.send(cid, prompt)
+            payload = json.dumps(answers, ensure_ascii=False)
+            if norm is not None and not norm["retry"]:
+                # Sugestao apresentada nao consome tentativa.
+                db.upsert_chat(
+                    self.conn, cid,
+                    status="awaiting_script_answer",
+                    script_answers=payload,
+                    last_prompt_at=now,
+                )
+                return
             retries = int(row.get("retries") or 0)
             max_r = int(self.cfg.get("max_invalid_retries") or 3)
             if retries < max_r:
-                db.upsert_chat(self.conn, cid, status="awaiting_script_answer", retries=retries + 1, last_prompt_at=now)
+                db.upsert_chat(
+                    self.conn, cid, status="awaiting_script_answer",
+                    script_answers=payload, retries=retries + 1, last_prompt_at=now,
+                )
                 self._emit("ignored_reply", cid, row.get("queue_address"), "campo inválido")
                 return
             await self.close_out(cid, "closed_invalid")
             return
-        answers = _script_answers(row)
         answers[str(field.get("key") or "")] = value
         nxt = idx + 1
         payload = json.dumps(answers, ensure_ascii=False)
-        if nxt >= len(fields):
+        after = registry.fields_for(slug, answers)
+        if nxt >= len(after):
             db.upsert_chat(
                 self.conn, cid,
                 status="awaiting_script_confirm",
@@ -1541,7 +1597,11 @@ class Engine:
                 retries=0,
                 last_prompt_at=now,
             )
-            await self.send(cid, _confirm_text(spec, answers))
+            await self._send_blocks(
+                cid,
+                _confirm_text({"fields": after}, answers, note=registry.confirm_note(slug)),
+                q=row.get("queue_address"),
+            )
             return
         db.upsert_chat(
             self.conn, cid,
@@ -1551,27 +1611,32 @@ class Engine:
             retries=0,
             last_prompt_at=now,
         )
-        next_prompt = _field_prompt(fields[nxt])
+        next_prompt = _field_prompt(after[nxt])
         if next_prompt:
             await self.send(cid, next_prompt)
 
     async def handle_script_confirm(self, cid: int, row: dict, text: str) -> None:
         choice = text.strip()
+        slug = str(row.get("script_slug") or "")
         if choice == "2":
             await self._restart_script(cid, row)
             return
         if choice == "1":
             await self._execute_script(cid, row, resume=False)
             return
-        spec = registry.get_spec(row.get("script_slug"))
         answers = _script_answers(row)
+        fields = registry.fields_for(slug, answers)
         retries = int(row.get("retries") or 0)
         max_r = int(self.cfg.get("max_invalid_retries") or 3)
-        if spec and retries < max_r:
+        if fields and retries < max_r:
             now = datetime.now(timezone.utc)
             db.upsert_chat(self.conn, cid, status="awaiting_script_confirm", retries=retries + 1, last_prompt_at=now)
             self._emit("ignored_reply", cid, row.get("queue_address"), "confirmação inválida")
-            await self.send_guarded(cid, _confirm_text(spec, answers), row.get("queue_address"))
+            await self._send_blocks(
+                cid,
+                _confirm_text({"fields": fields}, answers, note=registry.confirm_note(slug)),
+                q=row.get("queue_address"),
+            )
             return
         await self.close_out(cid, "closed_invalid")
 
@@ -2067,6 +2132,21 @@ class Engine:
             db.finish_route(self.conn, rid, "done", detail)
             self._emit("case_sibling_delivered", cid, q, f"chat para {assignee}; caso={case_key}")
 
+    def _alvo_proibido(self, marks: dict, alvos: list) -> str:
+        """Algum alvo da entrega e o PROPRIO bot? Devolve o endereco, se for.
+
+        Ultima guarda antes de qualquer `move_chat`/`invite_to_chat`: entregar ao
+        bot nao atende ninguem e ainda cria um caso fantasma no ledger. O
+        `invite_target` gravado na rota entra na checagem porque ele manda nas
+        retentativas (um alvo errado ja gravado seria reusado).
+        """
+        if not str(self.own or "").strip():
+            return ""
+        for alvo in list(alvos) + [marks.get("invite_target")]:
+            if _addr_eq(str(alvo or ""), self.own):
+                return str(alvo or "")
+        return ""
+
     async def _deliver_chat(
         self, cid: int, q: str | None, picked: dict, route: str, case_key: str,
         req: tuple | None = None, route_id: int | None = None, token: str = "",
@@ -2087,6 +2167,14 @@ class Engine:
             or str(marks.get("case_key") or "").strip()
             or (req[0] if req else "")
         )
+        proprio_bot = self._alvo_proibido(marks, [picked.get("address")])
+        if proprio_bot:
+            self._reserve_drop(str(picked.get("address") or ""), "chat", case_key)
+            self._emit(
+                "self_target_blocked", cid, q,
+                f"{proprio_bot}; alvo e o proprio bot; entrega cancelada",
+            )
+            return False, f"{route}; alvo proibido={proprio_bot}"
         if not q:
             self._reserve_drop(str(picked.get("address") or ""), "chat", case_key)
             return False, f"{route}; move_falhou=sem fila"
@@ -2200,6 +2288,93 @@ class Engine:
     def _queue_on(self) -> bool:
         valor = str(self.cfg.get("queue_wait_enabled") or "true").strip().lower()
         return valor not in ("false", "0", "no")
+
+    def _fila_desligada(self, q: str | None) -> bool:
+        """A fila deste item esta DESABILITADA no painel (o bot nao atua nela)?"""
+        return bool(q) and q not in self.enabled
+
+    def _motivo_bloqueio(self, q: str | None) -> tuple[str, str]:
+        """Por que o bot NAO pode atuar nesta fila: (chave, texto) — vazio se pode.
+
+        `chave` vai para o ledger (`route_assignments`) e `texto` para o
+        evento/log. Duas situacoes: o bot foi DESLIGADO no painel (nao atua em
+        nada) ou a fila esta DESABILITADA (nao atua nesta fila).
+        """
+        if not self.bot_on:
+            return "bot_desligado", "bot desligado no painel"
+        if self._fila_desligada(q):
+            return "fila_desabilitada", "fila desabilitada no painel"
+        return "", ""
+
+    async def _sair_do_chat_bloqueado(self, cid: int, q: str | None, chave: str, texto: str) -> None:
+        """Sai do chat em silencio e devolve o atendimento ao quadro (com motivo).
+
+        Sem mensagem de despedida: o operador desligou a fila (ou o bot) e o
+        cliente/tecnico nao deve ver o bot "falando" justamente o que foi
+        desligado no painel.
+        """
+        detail = f"{texto}; bot saiu do chat"
+        self._emit("queue_off", cid, q, detail)
+        # Encerra a espera ABERTA com o motivo antes de sair: `leave` grava apenas
+        # o status dele na rota (`left`) e o motivo do bloqueio se perderia.
+        db.finish_routes_for_chat(self.conn, cid, "failed", detail)
+        self._close_case(cid, chave)
+        await self.leave(cid, "left")
+
+    async def _abandonar_rota(self, row: dict, kind: str, cid: int, q: str | None) -> None:
+        """Bot bloqueado nesta fila: encerra a rota e sai do chat.
+
+        Antes o item era SEGURADO ate a fila religar: ficava `classified` com uma
+        rota `failed`, sem evento e sem recuperacao automatica (nem `due_routes`
+        nem `classified_without_route` o viam de volta). Agora a rota e encerrada
+        com o motivo e o chat volta para o quadro, livre para alguem assumir; o
+        formulario apenas para de ser oferecido (nao ha chat para sair).
+        """
+        chave, texto = self._motivo_bloqueio(q)
+        if not chave:
+            return
+        if kind == "form":
+            detail = f"{texto}; formulario segue disponivel para assumir"
+            self._emit("form_queue_off", cid, q, detail)
+            db.finish_route(self.conn, int(row["id"]), "failed", detail)
+            return
+        # O chat sai por `_sair_do_chat_bloqueado`, que encerra a espera com o
+        # motivo (fazer isso aqui de novo seria so um UPDATE repetido).
+        await self._sair_do_chat_bloqueado(cid, q, chave, texto)
+
+    async def _devolver_chats_ao_quadro(self, limite: int = _LEAVE_BUDGET) -> int:
+        """Sai dos chats que o bot ainda conduz em fila bloqueada (ou todos, bot off).
+
+        Um chat ja entregue nao tem mais rota em espera, mas o bot segue DENTRO
+        dele: sem esta varredura ele ficaria para sempre num quadro que o operador
+        tirou do bot. Limitada por tick porque cada saida e um `leave_chat` no TOA.
+        """
+        saiu = 0
+        for row in db.resume_chats(self.conn):
+            if saiu >= max(int(limite), 1):
+                break
+            cid = int(row["chat_id"])
+            q = row.get("queue_address")
+            chave, texto = self._motivo_bloqueio(q)
+            if not chave:
+                continue
+            await self._sair_do_chat_bloqueado(cid, q, chave, texto)
+            saiu += 1
+        return saiu
+
+    async def _encerra_atuacao_bot_off(self) -> None:
+        """Bot DESLIGADO no painel: encerra as rotas em espera e sai dos chats.
+
+        Mesma regra da fila desabilitada — e por isso que ligar/desligar o bot no
+        painel devolve os atendimentos em vez de guarda-los: quem esta esperando
+        volta para o quadro e nao fica pendurado esperando o bot religar.
+        """
+        for row in db.waiting_routes(self.conn, _LEAVE_BUDGET):
+            await self._abandonar_rota(
+                row, routing.kind_of(row.get("kind")),
+                int(row["chat_id"]), row.get("queue_address"),
+            )
+        await self._devolver_chats_ao_quadro()
 
     def _queue_top_pos(self) -> int:
         """A partir de qual posicao o chat ouve o NUMERO da fila (`0` = sempre)."""
@@ -2810,7 +2985,8 @@ class Engine:
         `force_assignee` (abertura form-aware) prende a entrega ao dono do caso:
         se ele não estiver na janela, devolve None e quem entrega é a fila.
         `exclude_address` é o resgate por analista offline: a rota socorrida não
-        pode voltar para quem a perdeu (nem pela afinidade).
+        pode voltar para quem a perdeu (nem pela afinidade). O endereço do próprio
+        bot é sempre excluído — ele nunca é alvo de rota.
         """
         kind = routing.kind_of(kind)
         team, settings = self._team_settings(queue_address, kind)
@@ -2821,10 +2997,15 @@ class Engine:
         if not members:
             log.warning("time %s sem membros", team.get("name") or team["id"])
             return None, "time sem membros"
-        if exclude_address:
-            restantes = [m for m in members if not _addr_eq(m.get("address"), exclude_address)]
+        # Ninguem recebe o caso: nem o proprio bot, nem o analista resgatado.
+        proibidos = [x for x in (self.own, exclude_address) if str(x or "").strip()]
+        if proibidos:
+            restantes = [
+                m for m in members
+                if not any(_addr_eq(m.get("address"), x) for x in proibidos)
+            ]
             if not restantes:
-                return None, f"unico membro do time esta excluido ({exclude_address})"
+                return None, "time sem elegivel: so o proprio bot/excluido"
             members = restantes
         if kind == "form" and not settings["form_enabled"]:
             log.info("time %s desabilitado para formulário", team.get("name") or team["id"])
@@ -2857,18 +3038,26 @@ class Engine:
                     await asyncio.sleep(settings["retry_interval_sec"])
         online = {_member_login(x) for x in raw_online}
         casos, por_tipo, info = await self._capacidade(members, kind, queue_address)
+        if force_assignee and _addr_eq(force_assignee, self.own):
+            # O dono gravado e o proprio bot (config antiga): nao entrega — o caso
+            # iria para quem so repassa.
+            return None, f"dono_do_caso={force_assignee} proprio_bot"
         if force_assignee:
             for m in members:
                 if not _addr_eq(m["address"], force_assignee):
                     continue
                 if not _in_route_window(m, datetime.now(TZ_BRT)):
                     return None, f"dono_do_caso={force_assignee} fora_da_janela"
-                if settings.get("affinity_require_online") and _member_login(m["address"]) not in online:
+                # Afinidade NAO e excecao ao online: dono offline nao recebe.
+                if settings.get("require_online", True) and _member_login(m["address"]) not in online:
                     return None, f"dono_do_caso={force_assignee} sem_online"
                 self._reserve_add(str(m["address"]), kind, case_key)
                 return m, f"dono_do_caso={force_assignee}; caso do formulario"
             return None, f"dono_do_caso={force_assignee} fora_do_time"
         dono = db.case_owner(self.conn, case_key) if (case_key and settings.get("affinity")) else ""
+        if dono and _addr_eq(dono, self.own):
+            # Afinidade apontando para o bot: nunca (ele nao atende).
+            dono = ""
         if dono and exclude_address and _addr_eq(dono, exclude_address):
             # Resgate: a afinidade aponta para quem ficou offline — nao vale.
             dono = ""
@@ -2879,7 +3068,7 @@ class Engine:
                     continue
                 if not _in_route_window(m, datetime.now(TZ_BRT)):
                     aviso_afinidade = "afinidade=" + dono + " fora_da_janela"
-                elif settings.get("affinity_require_online") and _member_login(m["address"]) not in online:
+                elif settings.get("require_online", True) and _member_login(m["address"]) not in online:
                     aviso_afinidade = "afinidade=" + dono + " sem_online"
                 else:
                     self._reserve_add(str(m["address"]), kind, case_key)
@@ -2900,6 +3089,9 @@ class Engine:
             now=datetime.now(TZ_BRT),
             team_name=str(team.get("name") or team["id"]),
             attempts_used=attempts,
+            # Dupla guarda: o bot nao entra na escolha nem se alguem o readicionar
+            # ao time depois do filtro acima.
+            exclude={x for x in (self.own, exclude_address) if str(x or "").strip()},
         )
         if picked:
             self._reserve_add(str(picked["address"]), kind, case_key)
@@ -2924,6 +3116,14 @@ class Engine:
         meio repetia o `move_chat` e podia convidar outro analista.
         """
         marks = db.delivery_marks(self.conn, route_id)
+        proprio_bot = self._alvo_proibido(marks, [pick.get("address")])
+        if proprio_bot:
+            self._reserve_drop(str(pick.get("address") or ""), "form", case_key)
+            self._emit(
+                "self_target_blocked", cid, queue_address,
+                f"{proprio_bot}; alvo e o proprio bot; entrega cancelada",
+            )
+            return False, f"{route}; alvo proibido={proprio_bot}"
         req = form_open.requester_key(self._open_forms.get(int(cid)) or {}, self.own)
         # Leitura viva ANTES de entregar: (a) nunca oferece formulario ja passado
         # (o encerrado saia para a fila) e (b) e a fonte da identidade por AUTOR
@@ -3166,6 +3366,11 @@ class Engine:
         for row in db.classified_without_route(self.conn):
             cid = int(row["chat_id"])
             q = row.get("queue_address")
+            if self._fila_desligada(q):
+                # Fila desligada no painel: nao recria rota — o bot nao atua nela.
+                # Este chat e DEVOLVIDO ao quadro por `_devolver_chats_ao_quadro`
+                # (uma rota nova nasceria e morreria na hora).
+                continue
             team = db.team_for_queue(self.conn, q)
             try:
                 db.enqueue_route(
@@ -3188,7 +3393,18 @@ class Engine:
         delas (alternando) e tenta a cabeca das duas na mesma passada — assim um
         formulario enviado depois de 10 chats e o 1o da linha dele, nao o 11.
         """
+        if not self.bot_on:
+            # Bot DESLIGADO no painel: nada e entregue (nem recuperado). Mesma
+            # regra da fila desabilitada — o bot sai dos chats e encerra as
+            # esperas, em vez de guarda-las: quem esperava volta para o quadro e
+            # nao fica pendurado ate o bot religar.
+            await self._encerra_atuacao_bot_off()
+            return
         self._recover_classified()
+        # Fila desabilitada DEPOIS da entrega: o bot nao permanece dentro do chat
+        # de um quadro que o operador tirou dele (nao ha rota em espera para o
+        # loop acima ver).
+        await self._devolver_chats_ao_quadro()
         linhas = db.due_routes(self.conn)
         if self._turno_fila % 2 == 0:
             primeira = list(linhas.get("chat") or [])
@@ -3216,6 +3432,12 @@ class Engine:
             cid = int(row["chat_id"])
             q = row.get("queue_address")
             used = int(row.get("attempts") or 0)
+            if self._fila_desligada(q):
+                # Fila desabilitada no painel: o bot nao atua nela. Encerra a rota
+                # com o motivo e sai do chat em silencio — o atendimento volta
+                # para o quadro em vez de ficar esperando a fila religar.
+                await self._abandonar_rota(row, kind, cid, q)
+                continue
             team, settings = self._team_settings(q, kind)
             if not team:
                 detail = "fila sem time ativo"
@@ -3398,13 +3620,16 @@ class Engine:
         self._emit(reason, cid, q, status)
 
     async def _reclaim_offline(self, force_address: str = "", limite: int = 5) -> int:
-        """Devolve para a fila o caso preso com analista OFFLINE.
+        """Devolve para a fila o CHAT preso com analista OFFLINE.
 
-        Mesmas regras para chat e formulario: o caso sai do ledger
-        (`analista_offline` — solta cap, reserva e afinidade) e ganha rota nova
-        com o antigo dono **excluido**. No chat o tecnico e avisado
-        (`requeue_notice`) e o bot volta a falar no chat; no formulario a
-        devolucao e silenciosa.
+        O caso sai do ledger (`analista_offline` — solta cap, reserva e
+        afinidade) e ganha rota nova com o antigo dono **excluido**; o tecnico e
+        avisado (`requeue_notice`) e o bot volta a falar no chat.
+
+        **Só chat.** O formulário de validação é um link pessoal do analista:
+        re-roteá-lo move o caso para outra pessoa e deixa o quadro dos dois
+        mexido (era o efeito de 28/09). O formulário fica com o dono até o TTL de
+        caso órfão fechar o registro.
 
         `force_address` (botao do painel) devolve agora os casos daquele analista,
         ignorando o limite do tick e o `0` que desliga o resgate no time.
@@ -3430,6 +3655,12 @@ class Engine:
             kind = routing.kind_of(row.get("kind"))
             addr = str(row.get("assignee") or "")
             q = row.get("queue_address")
+            if kind != "chat":
+                # Formulario NAO se re-roteia (ver docstring).
+                continue
+            if self._fila_desligada(q):
+                # Fila desligada no painel: nao cria rota nova (o tick a seguraria).
+                continue
             team, settings_fila = self._team_settings(q, kind)
             if not bool(settings_fila.get("offline_requeue_enabled", True)):
                 continue
@@ -3444,14 +3675,13 @@ class Engine:
             # 2) Fecha o caso no ledger: solta cap, reserva e afinidade.
             self._close_case(cid, "analista_offline")
             offline_s = _offline_seconds(row.get("offline_since"))
-            if kind == "chat":
-                db.upsert_chat(
-                    self.conn, cid, status="classified", moved_at=None, auto_close=False
-                )
-                await self._join_until_present(cid)
-                texto = str(self.tpl.get("requeue_notice") or "").strip()
-                if texto:
-                    await self.send_guarded(cid, texto, q)
+            db.upsert_chat(
+                self.conn, cid, status="classified", moved_at=None, auto_close=False
+            )
+            await self._join_until_present(cid)
+            texto = str(self.tpl.get("requeue_notice") or "").strip()
+            if texto:
+                await self.send_guarded(cid, texto, q)
             # 3) Rota nova, com o antigo dono excluido.
             rid = db.enqueue_route(
                 self.conn, kind, cid, q, int(team["id"]) if team else None,
@@ -3564,7 +3794,10 @@ class Engine:
                 if devolvidos == 0:
                     db.log_event(
                         self.conn, "reclaim_empty",
-                        detail=f"job={jid}; nenhum caso aberto para {job.get('payload') or '—'}",
+                        detail=(
+                            f"job={jid}; nenhum caso de CHAT aberto para "
+                            f"{job.get('payload') or '—'} (formulario nao se re-roteia)"
+                        ),
                     )
             else:
                 raise ValueError(f"job kind desconhecido: {kind}")

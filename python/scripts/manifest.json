@@ -1,6 +1,16 @@
 {
   "scripts": [
     {
+      "slug": "criar_acesso_hub",
+      "label": "Criar acesso ao hub",
+      "fields": [
+        {"key": "hub", "type": "text", "prompt": "Qual hub/site? Ex: VMN ou VILA MARIANA"},
+        {"key": "incidente", "type": "text", "prompt": "Qual número do Incidente? (RAL/REC/INM)"},
+        {"key": "qtd_tecnicos", "type": "int", "prompt": "Quantos técnicos acessarão o local? Responda apenas o número (1 a 4)"},
+        {"key": "motivo", "type": "text", "prompt": "Informe o motivo do acesso"}
+      ]
+    },
+    {
       "slug": "criar_apoio",
       "label": "Criar apoio",
       "fields": [

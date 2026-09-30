@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from python.scripts import criar_apoio, criar_infra_rede, registry  # noqa: E402
+from python.scripts import criar_acesso_hub, criar_apoio, criar_infra_rede, registry  # noqa: E402
 from tests.test_submenu import insert_option, mem_conn, seed_queue_menu  # noqa: E402
 
 ENV = {
@@ -82,6 +82,55 @@ class ManifestRegistryTest(unittest.TestCase):
         slugs = [s["slug"] for s in live["scripts"]]
         self.assertIn("criar_apoio", slugs)
         self.assertIn("criar_infra_rede", slugs)
+        self.assertIn("criar_acesso_hub", slugs)
+
+
+class RegistryFieldsTest(unittest.TestCase):
+    def test_script_estatico_pergunta_o_fields(self):
+        self.assertEqual(
+            [f["key"] for f in registry.fields_for("criar_infra_rede", {})],
+            ["motivo", "cidade", "endereco", "equipamento", "rede", "tecnico"],
+        )
+
+    def test_script_dinamico_usa_fields_for(self):
+        self.assertEqual(
+            [f["key"] for f in registry.fields_for("criar_acesso_hub", {})], ["hub"]
+        )
+
+    def test_fields_for_com_excecao_cai_no_fields_estatico(self):
+        with patch.object(criar_acesso_hub, "fields_for", side_effect=RuntimeError("boom")):
+            keys = [f["key"] for f in registry.fields_for("criar_acesso_hub", {})]
+        self.assertEqual(keys, ["hub", "incidente", "qtd_tecnicos", "motivo"])
+
+    def test_script_sem_hook_devolve_none(self):
+        self.assertIsNone(
+            registry.normalize_answer("criar_infra_rede", {"key": "motivo"}, "x", {})
+        )
+
+    def test_hook_normaliza_contrato(self):
+        norm = registry.normalize_answer(
+            "criar_acesso_hub", {"key": "qtd_tecnicos"}, "2", {}
+        )
+        self.assertEqual(norm["value"], "2")
+        self.assertFalse(norm["retry"])
+        self.assertEqual(norm["state"], {})
+        ruim = registry.normalize_answer(
+            "criar_acesso_hub", {"key": "qtd_tecnicos"}, "9", {}
+        )
+        self.assertIsNone(ruim["value"])
+        self.assertTrue(ruim["retry"])
+
+    def test_hook_com_excecao_vira_recusa(self):
+        with patch.object(criar_acesso_hub, "normalize_answer", side_effect=RuntimeError("boom")):
+            norm = registry.normalize_answer(
+                "criar_acesso_hub", {"key": "hub"}, "HUBSAM", {}
+            )
+        self.assertIsNone(norm["value"])
+        self.assertTrue(norm["retry"])
+
+    def test_confirm_note(self):
+        self.assertIn("recusa", registry.confirm_note("criar_acesso_hub"))
+        self.assertEqual(registry.confirm_note("criar_infra_rede"), "")
 
 
 class CriarApoioTest(unittest.IsolatedAsyncioTestCase):

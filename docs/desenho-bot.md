@@ -32,7 +32,7 @@ flowchart LR
 | `python/form_open.py` | deteccao do formulario, **identidade do solicitante** e **correlacao com o chat do tecnico** |
 | `python/db.py` | SQLite: acesso, migracoes, **ledger de casos**, jobs |
 | `python/resource_profile.py` | valida perfil de gestor do operador nos scripts |
-| `python/scripts/` | scripts de apoio (`criar_apoio`, `criar_infra_rede`) + `registry.py` + `manifest.json` |
+| `python/scripts/` | scripts de atendimento (`criar_apoio`, `criar_infra_rede`, `criar_acesso_hub`) + `registry.py` + `manifest.json` + `bases/` |
 | `schema.sql` | DDL aplicada tanto pelo Python quanto pelo PHP |
 | `php/index.php` + `php/bootstrap.php` | painel: abas, acoes POST, render e migracoes |
 | `tests/` | 274 testes Python + 9 suites PHP |
@@ -149,6 +149,17 @@ flowchart TD
 
 - Status durante o script: `awaiting_script_answer` -> `awaiting_script_confirm` -> `awaiting_script_run`.
 - Os campos aceitam `text`, `int` e `choice` (escolha pelo numero da lista).
+- **Campos dinamicos:** quando o script define `fields_for(answers)`, a lista de perguntas e
+  recalculada a cada resposta — e assim que `criar_acesso_hub` pergunta o hub, o numero de tecnicos
+  e so entao os blocos 1..N + motivo. Sem o hook vale o `FIELDS` estatico, como em `criar_apoio`
+  e `criar_infra_rede` (o manifest continua sendo o espelho estatico do `FIELDS`).
+- **Validacao propria do script:** `normalize_answer(key, text, answers)` devolve
+  `{value, state, retry, message}`. `retry=false` re-pergunta **sem** gastar tentativa (e o caso das
+  sugestoes de hub), `message` e enviado antes da pergunta e `state` (chaves internas `_`) e gravado
+  **inclusive na recusa** — e assim que a lista de sugestoes chega na proxima pergunta. Sem o hook
+  o engine usa a validacao padrao (`text`/`int`/`choice`).
+- **`CONFIRM_NOTE`:** texto do script colocado no resumo da confirmacao, antes do
+  `1) Confirmar / 2) Corrigir` (ex.: `criar_acesso_hub` avisa que inconsistencia pode gerar recusa).
 - `tick_timeouts` retoma script que ficou preso em `awaiting_script_run` (orcamento `BUDGET_SEC`).
 - O perfil do operador e checado em `resourcemanagement` (`resource_profile.py`); sem permissao, o bot responde a mensagem padrao e registra o motivo.
 
@@ -284,17 +295,19 @@ flowchart TD
 
 ### 8.2 Ordem exata da decisao
 
-1. **Afinidade** - se o caso ja tem dono e ele esta **ativo + na janela**, entrega direto para ele, mesmo com o cap cheio. Online so barra se `affinity_require_online` = true.
+1. **O proprio bot nunca e alvo** - o engine publica o endereco dele em `bot_settings.bot_own_address`, exclui esse address da escolha (`proprio_bot=` no log) e ainda tem a guarda final na hora da entrega (`self_target_blocked`): entregar ao bot nao atende ninguem e ainda cria caso fantasma no ledger. O painel recusa cadastrar esse endereco como operador (aba Times).
+2. **Afinidade** - se o caso ja tem dono e ele esta **ativo + na janela + online**, entrega direto para ele, mesmo com o cap cheio. A afinidade **nao e excecao ao online** (a chave antiga `affinity_require_online` foi removida): dono offline nao recebe nada — nem o caso dele.
    - A chave do caso de um formulario sai do `address` do payload **ou do AUTOR das mensagens** dele; `db.case_owner` procura o dialeto atual (`a:u:...`) e o legado (`u:...`), entao um caso aberto antes da normalizacao das chaves nao fica invisivel para a afinidade.
    - Formulario **ja com um analista do time** dentro (mensagem de `user_joined`): o bot **adota** esse dono (`form_adopted`, sem repetir o `move_chat` que o TOA recusaria com `e=10`) e a carga do analista passa a contar a verdade.
-2. **Membros ativos do time**, na ordem do campo Ordem da aba Times.
-3. **Janela de plantao** do membro - vazio ou inicio igual ao fim = 24 h; madrugada 22:00-06:00 atravessa a meia-noite.
-4. **Online no TOA** - apenas se `require_online` (membro, time ou global).
-5. **Tipo de atendimento** - `kinds` do operador (membro -> `member_kinds` do time -> `both`): quem atende so chat nao recebe formulario (`so_chat` no log) e quem atende so formulario nao recebe chat (`so_form`).
-6. **Cap de casos** - `cap_cases` do membro, senao do time, senao `max_cases_per_agent` (padrao 4).
-7. **Sub-limites** por tipo - `cap_chat` e `cap_form` contam so o proprio tipo.
-8. **Estrategia** - escolhe entre os elegiveis.
-9. **Reserva** o escolhido e emite `move_chat` (**unico por chat**, marca em `chats.moved_at`) + `invite_to_chat`.
+3. **Membros ativos do time**, na ordem do campo Ordem da aba Times.
+4. **Janela de plantao** do membro - vazio ou inicio igual ao fim = 24 h; madrugada 22:00-06:00 atravessa a meia-noite.
+   - **Fim de janela (formulario):** quem esta a menos de `form_window_margin_min` minutos do fim da escala (global, padrao **10**; o time sobrescreve em `team_routing.form_window_margin_min`) deixa de ser oferecido (`fim_janela=ana:5min` no log). Um formulario entregue as 17:57 para quem sai as 18:00 nascia preso com quem ja foi embora; `0` desliga o corte.
+5. **Online no TOA** - apenas se `require_online` (membro, time ou global).
+6. **Tipo de atendimento** - `kinds` do operador (membro -> `member_kinds` do time -> `both`): quem atende so chat nao recebe formulario (`so_chat` no log) e quem atende so formulario nao recebe chat (`so_form`).
+7. **Cap de casos** - `cap_cases` do membro, senao do time, senao `max_cases_per_agent` (padrao 4).
+8. **Sub-limites** por tipo - `cap_chat` e `cap_form` contam so o proprio tipo.
+9. **Estrategia** - escolhe entre os elegiveis.
+10. **Reserva** o escolhido e emite `move_chat` (**unico por chat**, marca em `chats.moved_at`) + `invite_to_chat`.
 
 O painel (aba Roteamento -> Globais) tem o campo **Casos** com os checkboxes *fazer valer para
 todos os times* / *e para todos os operadores*: marcar limpa o `cap_cases` de time/operador (NULL =
@@ -344,12 +357,13 @@ O detalhe gravado em `bot_events` mostra o que foi contado e por que alguem foi 
 
 ```text
 time=T1; estrategia=round_robin; cap=4; membros=ana,bia; janela=ana:08:00-18:00;
-fora_horario=bia:22:00-06:00; sem_online=—; so_chat=—; no_cap=ana;
-casos=ana=4,bia=0; carga=ana=3,bia=0; tentativas=1; rr=bia-ana; last=bia
+fora_horario=bia:22:00-06:00; fim_janela=ana:5min; sem_online=—; proprio_bot=—;
+so_chat=—; no_cap=ana; casos=ana=4,bia=0; carga=ana=3,bia=0; tentativas=1; rr=bia-ana; last=bia
 ```
 
 - `casos` = solicitantes distintos; `carga` = contagem do proprio tipo - os dois alimentam os limites.
 - `so_chat` = membro que nao recebe formulario; `no_cap` = descartado pelo cap; `sem_online` e `fora_horario` explicam as demais exclusoes.
+- `fim_janela` = membro cortado pela margem de fim de escala do formulario (com quantos minutos faltavam); `proprio_bot` = o endereco do proprio bot, descartado por decisao nenhuma poder entrega-lo a ele.
 
 ### 8.7 Fila de espera com posicao (chat e formulario)
 
@@ -360,8 +374,8 @@ A propria `pending_routes` e a fila: `kind` (`chat` ou `form`), `team_id`, `expi
 | Entrada | em **qualquer** opcao de transferencia (`transfer_only` e `ask_and_transfer`, com ou sem perguntas) e tambem no **formulario**: o bot tenta entregar na hora; sem ninguem elegivel, a rota fica `waiting` |
 | Aviso | o tecnico recebe o texto `queue_progress` ("Voce avancou na fila") na entrada e **so quando a posicao melhora**; com `queue_show_pos=true` ele recebe `queue_position` (com `{pos}`) enquanto a posicao estiver dentro de `queue_top_pos`. O formulario espera em silencio (nao existe chat para avisar) |
 | Posicao | FIFO **por time e por LINHA**: o chat conta so chats, o formulario conta so formularios (`kind` entra na conta) |
-| Varredura | a cada 5 s o tick le a cabeca de **cada linha** e alterna por qual comeca; um formulario novo nao espera os chats que entraram antes dele. Respeita cap/janela/online e grava `queued_assigned` com `espera=NNs` |
-| Saida | atribuido (`done`); **tecnico saiu do chat** ou chat removido (rota `failed` + `leave`); item **ausente nas listas do TOA** (`chat_resolvido_toa`/`form_resolvido_toa`); ou **Encerrar espera** no painel (fallback do time). A espera **nao vence sozinha** |
+| Varredura | a cada 5 s o tick le a cabeca de **cada linha** e alterna por qual comeca; um formulario novo nao espera os chats que entraram antes dele. Respeita cap/janela/online e grava `queued_assigned` com `espera=NNs`. Com a **fila desabilitada** no painel (ou o **bot desligado**) o tick **nao entrega nem recupera** nada e **devolve o que estava esperando**: encerra a rota com o motivo (`fila_desabilitada`/`bot_desligado` em `detail`) e **sai do chat em silencio** (eventos `queue_off`/`form_queue_off` + `left`), sem falar nada no chat |
+| Saida | atribuido (`done`); **tecnico saiu do chat** ou chat removido (rota `failed` + `leave`); item **ausente nas listas do TOA** (`chat_resolvido_toa`/`form_resolvido_toa`); **fila desabilitada / bot desligado no painel** (`failed` + `left`); ou **Encerrar espera** no painel (fallback do time). A espera **nao vence sozinha** |
 
 Com a fila **ligada**, o formulario **nao gasta tentativas** (`form_route_attempts`) nem cai no
 fallback: ele espera a vez e vai sendo liberado conforme a carga dos analistas diminui. Tentativas e
@@ -372,6 +386,7 @@ fallback do formulario valem com a fila **desligada**.
 - **Sem prazo:** nao existe mais `queue_max_wait_sec` — a rota nasce sem `expires_at` (o campo continua na tabela apenas como marcador do botao **Encerrar espera**). O timeout antigo encerrava o chat sem transferencia quando o time ficava saturado.
 - Na aba **Roteamento** o card **Fila de espera (agora)** mostra posicao, tempo de espera, tentativas e o prazo ("sem prazo"); **Encerrar espera** encerra na hora e deixa o motor aplicar o fallback.
 - Quando a rota do chat e encerrada por outro motivo (tecnico saiu, chat removido, ausencia no TOA), a linha em `pending_routes` e fechada junto, para o tick nao insistir num chat que nao existe mais.
+- **Fila desabilitada (ou bot desligado no painel):** o bot **nao fica dentro** de um quadro que o operador tirou dele. A espera e **encerrada com o motivo** (`fila_desabilitada`, `bot_desligado` no `detail` da rota e em `route_assignments.close_reason`) e o chat volta ao quadro **em silencio** (`leave_chat`, sem mensagem ao tecnico); o formulario apenas deixa de ser oferecido (`form_queue_off`, rota `failed`). Cada tick devolve ate **10 chats** (`_LEAVE_BUDGET`) — o resto sai nos ciclos seguintes. Tambem sai quem **ja foi entregue**: a varredura olha os chats vivos (`db.resume_chats`), nao so as rotas em espera. Antes a rota era **segurada** `waiting` para voltar sozinha ao religar — na pratica o item ficava invisivel para as duas recuperacoes (`due_routes` so ve o que venceu; a recuperacao exige chat **sem** rota) e so voltava pelo botao *Reabrir rota*. **Religar nao retoma**: quem entrega e uma pessoa.
 
 ### 8.8 Entrega robusta (FASE A)
 
@@ -410,20 +425,20 @@ flowchart TD
   S -->|nao| S2[offline_since = COALESCE antigo, now]
   S2 --> R[analyst_load.online_ok=1, online=0, offline_since > offline_requeue_sec]
   R --> T{tick_timeouts: ate 5 casos}
-  T --> F[fecha a rota aberta - failed]
+  T --> K{o caso e CHAT?}
+  K -->|nao| KF[formulario FICA com o dono: link pessoal, nunca se re-roteia]
+  K -->|sim| F[fecha a rota aberta - failed]
   F --> L[_close_case analista_offline: solta cap, reserva e afinidade]
-  L --> CH{kind}
-  CH -->|chat| M[status classified + moved_at NULL + rejoin + requeue_notice]
-  CH -->|form| FS[volta em silencio]
+  L --> M[status classified + moved_at NULL + rejoin + requeue_notice]
   M --> N[rota nova kind=chat com exclude_assignee = antigo dono]
-  FS --> N2[rota nova kind=form com exclude_assignee]
   N --> E[evento case_reclaimed; tick entrega para outro elegivel]
-  N2 --> E
 ```
 
 - **Regua:** `offline_requeue_sec` (global, padrao **120 s**) — o time sobrescreve em `team_routing.offline_requeue_sec` e **`0` desliga** naquele time; `offline_requeue_enabled` (global) desliga em tudo.
 - **Como o "offline" e medido:** `snapshot_load` ja consulta `get_online_users` para todo mundo a cada `load_poll_sec`; agora grava `analyst_load.online_ok` (a leitura respondeu?) e `offline_since` (carimbo da **primeira** leitura que viu o analista offline). **Leitura falha nunca devolve caso de ninguem** — o resgate exige `online_ok=1`.
-- **O que o robo faz (por caso, ate 5 por tick):** encerra a rota aberta, fecha o caso no ledger (`close_reason=analista_offline`, liberando cap/reserva/afinidade), e cria **rota nova** com `pending_routes.exclude_assignee` = o antigo dono (a rota socorrida nao pode voltar para ele — nem pela afinidade, nem com `require_online=false`). No **chat**: volta a `classified`, limpa `moved_at`, entra no chat e avisa `requeue_notice` (“Operador ficou offline, transferindo para outro operador”); na fila ele segue recebendo posicao. No **formulario**: devolucao silenciosa (nao ha conversa).
+- **O que o robo faz (por caso, ate 5 por tick) — so CHAT:** encerra a rota aberta, fecha o caso no ledger (`close_reason=analista_offline`, liberando cap/reserva/afinidade), volta o chat a `classified`, limpa `moved_at`, entra no chat, avisa `requeue_notice` (“Operador ficou offline, transferindo para outro operador”) e cria **rota nova** com `pending_routes.exclude_assignee` = o antigo dono (a rota socorrida nao pode voltar para ele — nem pela afinidade, nem com `require_online=false`); na fila ele segue recebendo posicao.
+- **Formulario NAO se re-roteia:** o formulario de validacao e um **link pessoal do analista**; move-lo para outra pessoa deixa o caso orfao e mexe no quadro dos dois (efeito observado em 28/09). O formulario fica com o dono ate o TTL de caso orfao (`route_assign_ttl_sec`) fechar o registro no ledger.
+- **Fila desabilitada:** o resgate nao cria rota nenhuma para uma fila desligada no painel (o bot nao atua nela: a rota nasceria e seria encerrada na hora, devolvendo o chat) — o caso fica como esta ate a fila voltar.
 - **Guardas do TOA:** formulario que ainda aparece com o dono offline dentro recusa o `move_chat` (`e=10`): o bot **nao adota** esse dono e **nao consome** o teto de `move_fails` (a rota espera ele sair); no chat, se o novo move for recusado, o bot **convida mesmo assim** (`reclaim_invite_only`).
 - **Manual:** o botao **Devolver a fila** (aba Carga) grava `bot_jobs(kind='requeue_offline', payload=<address>)` e o bot roda o MESMO caminho, ignorando o limite do tick (decisao humana).
 - **Configuracao:** Roteamento (liga/desliga + segundos; por time na linha do time), Templates (`requeue_notice`), Atividade (`case_reclaimed`, `reclaim_invite_only`, `reclaim_no_queue`, `reclaim_empty`) e a coluna **Offline ha** + alerta na aba Carga.
@@ -625,8 +640,8 @@ de atendimento **nao le** nenhuma dessas tabelas; `bot_migrate_rbac` (PHP) e
 | **Dashboard** | volume de classificacoes por categoria no periodo, resumo dos eventos do formulario e **fila de espera do chat** (na fila agora, espera media e maior espera) |
 | **Filas** | liga/desliga a fila para o bot e dispara a sincronizacao do catalogo |
 | **Operadores** | operadores por fila, vindos do TOA ou cadastro manual |
-| **Times** | time, membros, **Ordem**, **janela de plantao** e as filas do time |
-| **Roteamento** | **globais** - bot ligado, formulario roteado, estrategia, fallback, caps, **fila de espera** (ligada/desligada e espera maxima), **resgate de analista offline** (`offline_requeue_enabled` + `offline_requeue_sec`) - **por time** - estrategia, caps, online, plantao, tentativas, fallback, recebe formulario, `offline_requeue_sec` (0 = o time nao devolve) - **por membro** - peso, cap chat, cap form, casos e recebe formulario |
+| **Times** | time, membros, **Ordem**, **janela de plantao** e as filas do time (o endereco do proprio bot e recusado: ele so repassa o atendimento) |
+| **Roteamento** | **globais** - bot ligado, formulario roteado, estrategia, fallback, caps, **fila de espera** (ligada/desligada e espera maxima), **resgate de analista offline** (`offline_requeue_enabled` + `offline_requeue_sec`) e **margem de fim de janela do formulario** (`form_window_margin_min`, min antes da escala acabar em que ele deixa de ser oferecido) - **por time** - estrategia, caps, online, plantao, tentativas, fallback, recebe formulario, a margem de fim de janela e `offline_requeue_sec` (0 = o time nao devolve) - **por membro** - peso, cap chat, cap form, casos e recebe formulario |
 | **Menus** | menus, opcoes, submenus, acao/texto normais, **acao/texto se formulario aberto** e scripts |
 | **Templates** | textos `greeting`, `menu`, `retry`, `closing`, `ask_received`, `ask_transferring`, `queue_position` (posicao na fila de espera), `queue_progress`, `queue_expired` e `requeue_notice` (operador offline) |
 | **Atividade** | log de eventos com filtro por tipo e atualizacao automatica na primeira pagina |
@@ -652,6 +667,8 @@ de atendimento **nao le** nenhuma dessas tabelas; `bot_migrate_rbac` (PHP) e
 | Catalogo | `catalog_synced`, `sync_error` |
 | Perguntas antes de transferir | `ask_collected`, `route_retry` |
 | Fila de espera | `queued`, `queue_position`, `queued_assigned`, `queue_expired` |
+| Fila desabilitada / bot desligado | `queue_off`, `form_queue_off` (a espera e **encerrada** com o motivo `fila_desabilitada`/`bot_desligado` e o chat **sai em silencio**: `left`; o formulario deixa de ser oferecido) |
+| Alvo proibido | `self_target_blocked` (o alvo da entrega era o **proprio bot**: nada e enviado ao TOA) |
 | Analista offline (resgate) | `case_reclaimed` (caso devolvido a fila), `reclaim_invite_only` (chat: move recusado, so convida), `reclaim_no_queue` (caso sem fila), `reclaim_empty` (botao do painel sem caso aberto) |
 | Analista entra na fila | `chat_adopted` (analista do time entrou no chat que esperava: caso e dele e o bot sai) |
 

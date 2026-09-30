@@ -211,7 +211,10 @@ INSERT OR IGNORE INTO bot_settings (key, value) VALUES
   -- Resgate por ausencia do operador: caso preso com analista offline volta para
   -- a fila depois de `offline_requeue_sec` (0 desliga; por time em team_routing).
   ('offline_requeue_enabled', 'true'),
-  ('offline_requeue_sec', '120');
+  ('offline_requeue_sec', '120'),
+  -- Formulario: para de ser OFERECIDO N minutos antes do fim da janela do
+  -- operador (a escala dele), para o caso nao nascer com quem ja vai sair.
+  ('form_window_margin_min', '10');
 
 -- Roteamento por time (1:1 com teams). NULL = herda o global (bot_settings).
 -- Só o formulário de validação tem retry assíncrono; o chat segue o fluxo atual.
@@ -230,6 +233,9 @@ CREATE TABLE IF NOT EXISTS team_routing (
   -- Resgate por ausencia do operador: NULL = herda o global; 0 = este time nao
   -- devolve para a fila o caso de analista offline.
   offline_requeue_sec INTEGER,
+  -- Formulario: para de ser OFERECIDO N minutos antes do fim da janela do
+  -- operador (NULL = herda o global `form_window_margin_min`).
+  form_window_margin_min INTEGER,
   -- Tipo de atendimento padrao dos operadores do time (membro sem linha herda
   -- isto): 'both' (padrao), 'chat' ou 'form'.
   member_kinds TEXT CHECK (member_kinds IN ('both', 'chat', 'form')),
@@ -407,7 +413,8 @@ INSERT OR IGNORE INTO bot_settings (key, value) VALUES
   ('route_assign_ttl_sec', '43200'),
   ('route_reserve_ttl_sec', '300'),
   ('affinity_enabled', 'true'),
-  ('affinity_require_online', 'false'),
+  -- A afinidade NAO e excecao ao online: `require_online` vale para todos (a
+  -- chave antiga `affinity_require_online` foi removida).
   ('affinity_match_name', 'false'),
   ('delivery_claim_ttl_sec', '300'),
   ('case_stale_confirm_sec', '300'),
