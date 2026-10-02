@@ -252,9 +252,6 @@ function bot_migrate_load(PDO $pdo): void
             $pdo->exec('ALTER TABLE analyst_load ADD COLUMN offline_since TEXT');
         }
     }
-    if (bot_table_exists($pdo, 'bot_jobs') && !isset(bot_table_columns($pdo, 'bot_jobs')['payload'])) {
-        $pdo->exec("ALTER TABLE bot_jobs ADD COLUMN payload TEXT NOT NULL DEFAULT ''");
-    }
     if (bot_table_exists($pdo, 'team_routing') && !isset(bot_table_columns($pdo, 'team_routing')['offline_requeue_sec'])) {
         $pdo->exec('ALTER TABLE team_routing ADD COLUMN offline_requeue_sec INTEGER');
     }

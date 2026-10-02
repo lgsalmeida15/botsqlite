@@ -186,8 +186,6 @@ CREATE TABLE IF NOT EXISTS bot_jobs (
   status TEXT NOT NULL DEFAULT 'pending'
     CHECK (status IN ('pending', 'running', 'done', 'error')),
   detail TEXT NOT NULL DEFAULT '',
-  -- Parametro do pedido (ex.: o address do analista no `requeue_offline`).
-  payload TEXT NOT NULL DEFAULT '',
   requested_at TEXT NOT NULL DEFAULT (datetime('now')),
   started_at TEXT,
   finished_at TEXT

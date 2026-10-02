@@ -58,7 +58,6 @@ def ensure_schema(conn) -> None:
     _migrate_load(conn)
     _migrate_kinds(conn)
     _migrate_form_window(conn)
-    _migrate_jobs(conn)
 
 
 def _table_columns(conn, table: str) -> set[str]:
@@ -496,12 +495,6 @@ def _migrate_load(conn) -> None:
             conn.execute("ALTER TABLE analyst_load ADD COLUMN online_ok INTEGER NOT NULL DEFAULT 0")
         if "offline_since" not in cols:
             conn.execute("ALTER TABLE analyst_load ADD COLUMN offline_since TEXT")
-
-
-def _migrate_jobs(conn) -> None:
-    """`bot_jobs.payload`: parametro do pedido do painel (ex.: requeue_offline)."""
-    if "bot_jobs" in _table_names(conn) and "payload" not in _table_columns(conn, "bot_jobs"):
-        conn.execute("ALTER TABLE bot_jobs ADD COLUMN payload TEXT NOT NULL DEFAULT ''")
 
 
 def load_reading(conn, address: str, fresh_sec: float = 90.0) -> dict | None:

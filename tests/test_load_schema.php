@@ -68,8 +68,6 @@ foreach ($pdo->query('SELECT slug, body FROM templates') as $rTpl) {
 }
 ok(isset($tplReq['requeue_notice']), 'template requeue_notice existe');
 ok(strpos($tplReq['requeue_notice'] ?? '', 'offline') !== false, 'requeue_notice fala do operador offline');
-// `bot_jobs.payload`: parametro do botao "Devolver a fila agora".
-ok(isset(bot_table_columns($pdo, 'bot_jobs')['payload']), 'bot_jobs.payload criada');
 
 // RBAC: pagina + acao no catalogo e no mapa de acoes.
 $catalogo = bot_permission_catalog();

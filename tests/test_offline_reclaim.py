@@ -158,18 +158,6 @@ class ResgateOfflineTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await eng._reclaim_offline(), 5)
         self.assertEqual(len(routes(conn, "waiting")), 5)
 
-    async def test_forca_do_painel_ignora_limite_e_presenca(self):
-        eng, conn, _sock = self._eng()
-        for i in range(3):
-            cid = 200 + i
-            db.upsert_chat(conn, cid, queue_address="h:q1", status="closed")
-            db.assign_open(conn, "chat", cid, "h:q1", 1, ANA, "a:%s%d" % (TEC, i), TEC, "Tec")
-        # Analista ONLINE: o botao do painel ainda devolve (decisao humana).
-        db.load_upsert(conn, ANA, name="Ana", team_id=1, online=1, online_ok=1)
-        with mock.patch.object(Engine, "_join_until_present", _sem_join):
-            self.assertEqual(await eng._reclaim_offline(force_address=ANA), 3)
-        self.assertEqual(len(routes(conn, "waiting")), 3)
-
     async def test_exclude_assignee_barra_o_mesmo_analista(self):
         eng, conn, _sock = self._eng()
         # Mesmo com `require_online=false`, o excluido nao pode receber de volta.
@@ -219,7 +207,6 @@ class ResgateOfflineTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("exclude_assignee", db._table_columns(conn, "pending_routes"))
         self.assertIn("offline_requeue_sec", db._table_columns(conn, "team_routing"))
         self.assertIn("form_window_margin_min", db._table_columns(conn, "team_routing"))
-        self.assertIn("payload", db._table_columns(conn, "bot_jobs"))
         self.assertIn("requeue_notice", db.templates(conn))
         self.assertEqual(db.settings(conn).get("offline_requeue_sec"), "120")
         self.assertEqual(db.settings(conn).get("form_window_margin_min"), "10")

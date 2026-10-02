@@ -440,8 +440,8 @@ flowchart TD
 - **Formulario NAO se re-roteia:** o formulario de validacao e um **link pessoal do analista**; move-lo para outra pessoa deixa o caso orfao e mexe no quadro dos dois (efeito observado em 28/09). O formulario fica com o dono ate o TTL de caso orfao (`route_assign_ttl_sec`) fechar o registro no ledger.
 - **Fila desabilitada:** o resgate nao cria rota nenhuma para uma fila desligada no painel (o bot nao atua nela: a rota nasceria e seria encerrada na hora, devolvendo o chat) — o caso fica como esta ate a fila voltar.
 - **Guardas do TOA:** formulario que ainda aparece com o dono offline dentro recusa o `move_chat` (`e=10`): o bot **nao adota** esse dono e **nao consome** o teto de `move_fails` (a rota espera ele sair); no chat, se o novo move for recusado, o bot **convida mesmo assim** (`reclaim_invite_only`).
-- **Manual:** o botao **Devolver a fila** (aba Carga) grava `bot_jobs(kind='requeue_offline', payload=<address>)` e o bot roda o MESMO caminho, ignorando o limite do tick (decisao humana).
-- **Configuracao:** Roteamento (liga/desliga + segundos; por time na linha do time), Templates (`requeue_notice`), Atividade (`case_reclaimed`, `reclaim_invite_only`, `reclaim_no_queue`, `reclaim_empty`) e a coluna **Offline ha** + alerta na aba Carga.
+- **Sem acao no painel:** o resgate roda sozinho no tick (ate 5 casos por tick); o painel so **configura** a regua (aba Roteamento: liga/desliga + segundos, por time na linha do time) e **mostra** o resultado.
+- **Configuracao:** Roteamento (liga/desliga + segundos; por time na linha do time), Templates (`requeue_notice`), Atividade (`case_reclaimed`, `reclaim_invite_only`, `reclaim_no_queue`) e a coluna **Offline ha** + alerta na aba Carga.
 
 ### 8.10 Analista entra no chat da fila: o caso e dele e o bot sai
 
@@ -612,7 +612,7 @@ flowchart TD
 |---|---|
 | `chats` | estado por `chat_id`: status, classificacao, retries, timestamps, script |
 | `bot_events` | log de eventos — **sem texto de conversa** |
-| `bot_jobs` | pedidos do painel, hoje `catalog_sync` |
+| `bot_jobs` | pedidos do painel: `catalog_sync` e `load_snapshot` |
 | `bot_settings` | parametros globais |
 | `bot_users` | usuarios do painel (`display_name`, `operator_address`, `group_id`, `last_login_at`) |
 
@@ -669,7 +669,7 @@ de atendimento **nao le** nenhuma dessas tabelas; `bot_migrate_rbac` (PHP) e
 | Fila de espera | `queued`, `queue_position`, `queued_assigned`, `queue_expired` |
 | Fila desabilitada / bot desligado | `queue_off`, `form_queue_off` (a espera e **encerrada** com o motivo `fila_desabilitada`/`bot_desligado` e o chat **sai em silencio**: `left`; o formulario deixa de ser oferecido) |
 | Alvo proibido | `self_target_blocked` (o alvo da entrega era o **proprio bot**: nada e enviado ao TOA) |
-| Analista offline (resgate) | `case_reclaimed` (caso devolvido a fila), `reclaim_invite_only` (chat: move recusado, so convida), `reclaim_no_queue` (caso sem fila), `reclaim_empty` (botao do painel sem caso aberto) |
+| Analista offline (resgate) | `case_reclaimed` (caso devolvido a fila), `reclaim_invite_only` (chat: move recusado, so convida), `reclaim_no_queue` (caso sem fila) |
 | Analista entra na fila | `chat_adopted` (analista do time entrou no chat que esperava: caso e dele e o bot sai) |
 
 ## 14. Status possiveis do chat

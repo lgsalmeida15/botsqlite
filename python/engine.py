@@ -3619,7 +3619,7 @@ class Engine:
             reason = "left"
         self._emit(reason, cid, q, status)
 
-    async def _reclaim_offline(self, force_address: str = "", limite: int = 5) -> int:
+    async def _reclaim_offline(self, limite: int = 5) -> int:
         """Devolve para a fila o CHAT preso com analista OFFLINE.
 
         O caso sai do ledger (`analista_offline` — solta cap, reserva e
@@ -3631,25 +3631,19 @@ class Engine:
         mexido (era o efeito de 28/09). O formulário fica com o dono até o TTL de
         caso órfão fechar o registro.
 
-        `force_address` (botao do painel) devolve agora os casos daquele analista,
-        ignorando o limite do tick e o `0` que desliga o resgate no time.
+        Roda sozinho no `tick_timeouts` (a cada tick), no maximo `limite` casos
+        por tick: nao ha acao no painel (o painel so configura a regua).
         """
         global_settings = self._team_settings(None, "chat")[1]
         if not bool(global_settings.get("offline_requeue_enabled", True)):
             return 0
-        if force_address:
-            candidatos = [
-                row for row in db.open_assignments(self.conn)
-                if _addr_eq(str(row.get("assignee") or ""), force_address)
-            ]
-        else:
-            sec = int(global_settings.get("offline_requeue_sec") or 0)
-            if sec <= 0:
-                return 0
-            candidatos = db.offline_open_assignments(self.conn, sec)
+        sec = int(global_settings.get("offline_requeue_sec") or 0)
+        if sec <= 0:
+            return 0
+        candidatos = db.offline_open_assignments(self.conn, sec)
         devolvidos = 0
         for row in candidatos:
-            if not force_address and devolvidos >= max(int(limite), 1):
+            if devolvidos >= max(int(limite), 1):
                 break
             cid = int(row["chat_id"])
             kind = routing.kind_of(row.get("kind"))
@@ -3664,7 +3658,7 @@ class Engine:
             team, settings_fila = self._team_settings(q, kind)
             if not bool(settings_fila.get("offline_requeue_enabled", True)):
                 continue
-            if not force_address and int(settings_fila.get("offline_requeue_sec") or 0) <= 0:
+            if int(settings_fila.get("offline_requeue_sec") or 0) <= 0:
                 # O time desligou o resgate (0 = nao devolve).
                 continue
             if not q:
@@ -3785,20 +3779,6 @@ class Engine:
             elif kind == "load_snapshot":
                 # Botao "Atualizar agora" da aba Carga: le as listas do TOA na hora.
                 await self.snapshot_load("painel")
-            elif kind == "requeue_offline":
-                # Botao "Devolver a fila agora" (aba Carga): devolve AGORA os casos
-                # do analista offline, pelo mesmo caminho do resgate automatico.
-                devolvidos = await self._reclaim_offline(
-                    force_address=str(job.get("payload") or "").strip()
-                )
-                if devolvidos == 0:
-                    db.log_event(
-                        self.conn, "reclaim_empty",
-                        detail=(
-                            f"job={jid}; nenhum caso de CHAT aberto para "
-                            f"{job.get('payload') or '—'} (formulario nao se re-roteia)"
-                        ),
-                    )
             else:
                 raise ValueError(f"job kind desconhecido: {kind}")
             db.finish_job(self.conn, jid, "done")

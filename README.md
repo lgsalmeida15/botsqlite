@@ -168,12 +168,12 @@ caso para a fila e re-roteia:
   para `classified` e segue avisando a posição na fila;
 - **formulário**: devolução silenciosa;
 - a rota nova carrega `exclude_assignee` = o antigo dono (não volta para ele, nem com `require_online=false`);
-- limite de **5 casos por tick**; o botão **Devolver à fila** (aba Carga) força na hora pelo mesmo caminho.
+- limite de **5 casos por tick**; o resgate roda sozinho no tick (não há ação no painel).
 
 Liga/desliga e segundos ficam na aba **Roteamento** (`offline_requeue_enabled`, `offline_requeue_sec`) e, por time,
 `offline_requeue_sec` na linha do time (**0 desliga**). A aba Carga mostra a coluna **Offline há** e o alerta
-“analista(s) offline com caso aberto”. Eventos: `case_reclaimed`, `reclaim_invite_only`, `reclaim_no_queue`,
-`reclaim_empty`.
+“analista(s) offline com caso aberto”. Eventos: `case_reclaimed`, `reclaim_invite_only`,
+`reclaim_no_queue`.
 
 ### Entrega robusta (FASE A)
 

@@ -793,6 +793,57 @@ function echo_pagination(string $pageKey, int $pageNum, int $total, array $filte
     echo '</div>';
 }
 
+/**
+ * Donut em SVG puro (sem CDN): uma fatia por item de $slices.
+ *
+ * @param array<int,array{0:string,1:int,2:string}> $slices [rótulo, valor, cor]
+ * @param string $centro  Número grande no meio do donut
+ * @param string $legenda Rótulo pequeno abaixo do número
+ */
+function dash_donut(array $slices, string $centro = '', string $legenda = ''): void
+{
+    $total = 0;
+    foreach ($slices as $fatia) {
+        $total += max(0, (int) $fatia[1]);
+    }
+    $cx = 70;
+    $cy = 70;
+    $raio = 54;
+    $volta = 2 * M_PI * $raio;
+    $andado = 0.0;
+    echo '<div class="dash-donut">';
+    echo '<svg viewBox="0 0 140 140" role="img" aria-label="' . h($legenda !== '' ? $legenda : 'gráfico') . '">';
+    echo '<circle cx="' . $cx . '" cy="' . $cy . '" r="' . $raio . '" fill="none" stroke="#e9ecef" stroke-width="20"></circle>';
+    if ($total > 0) {
+        foreach ($slices as $fatia) {
+            $valor = max(0, (int) $fatia[1]);
+            if ($valor === 0) {
+                continue;
+            }
+            // Cada fatia é um círculo com dasharray do tamanho do arco; o
+            // dashoffset negativo encosta a fatia onde a anterior terminou.
+            $arco = $volta * ($valor / $total);
+            echo '<circle cx="' . $cx . '" cy="' . $cy . '" r="' . $raio . '" fill="none" stroke="' . h((string) $fatia[2]) . '"'
+                . ' stroke-width="20" stroke-dasharray="' . round($arco, 2) . ' ' . round($volta - $arco, 2) . '"'
+                . ' stroke-dashoffset="' . round(-$andado, 2) . '" transform="rotate(-90 ' . $cx . ' ' . $cy . ')">'
+                . '<title>' . h((string) $fatia[0] . ': ' . $valor) . '</title></circle>';
+            $andado += $arco;
+        }
+    }
+    echo '<text class="dash-donut-num" x="' . $cx . '" y="68" text-anchor="middle">' . h($centro) . '</text>';
+    echo '<text class="dash-donut-lbl" x="' . $cx . '" y="86" text-anchor="middle">' . h($legenda) . '</text>';
+    echo '</svg>';
+    echo '<ul class="dash-legend">';
+    foreach ($slices as $fatia) {
+        $valor = max(0, (int) $fatia[1]);
+        $pct = $total > 0 ? (int) round($valor / $total * 100) : 0;
+        echo '<li><span class="dot" style="background:' . h((string) $fatia[2]) . '"></span>'
+            . h((string) $fatia[0]) . ' <strong>' . $valor . '</strong>'
+            . ' <span class="text-muted">(' . $pct . '%)</span></li>';
+    }
+    echo '</ul></div>';
+}
+
 function queue_picker(array $queues, array $owners, int $selfId, string $ownerKind): void
 {
     echo '<div class="queue-picker">';
@@ -906,13 +957,6 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && $page !== 'login') {
         if ($page === 'load' && $action === 'load_now') {
             // Botao "Atualizar agora": o bot le as listas do TOA na hora e grava.
             $pdo->exec("INSERT INTO bot_jobs (kind) VALUES ('load_snapshot')");
-            $postSynced = true;
-        }
-        if ($page === 'load' && $action === 'requeue_offline') {
-            // Botao "Devolver a fila agora": o bot devolve os casos daquele
-            // analista offline pelo MESMO caminho do resgate automatico.
-            $stJob = $pdo->prepare("INSERT INTO bot_jobs (kind, payload) VALUES ('requeue_offline', ?)");
-            $stJob->execute([trim((string) ($_POST['address'] ?? ''))]);
             $postSynced = true;
         }
         if ($page === 'operators' && $action === 'add_operator') {
@@ -2648,7 +2692,7 @@ if ($page === 'activity') {
         'chat_adopted' => 'analista entrou no chat da fila (caso adotado)',
         'reclaim_invite_only' => 'resgate: convite sem novo move',
         'reclaim_no_queue' => 'resgate: caso sem fila para devolver',
-        'reclaim_empty' => 'resgate: nenhum caso de chat para devolver (formulário não se re-roteia)',
+        'reclaim_empty' => '(removida) resgate: nenhum caso de chat para devolver',
         'form_aware_greeting' => '(removida) abertura: formulário em andamento',
         'form_aware_choice' => '(removida) abertura: escolha do técnico',
         'form_aware_wait' => '(removida) abertura: aguardava o analista do formulário',
@@ -3181,12 +3225,12 @@ if ($page === 'load') {
             echo '<div class="alert alert-warning py-2">' . (int) $offlineComCaso . ' analista(s) <strong>offline</strong> com caso aberto no bot (chats '
                 . (int) $chatsOffline . ', formulários ' . (int) $formsOffline . ') — o robô devolve para a fila depois de <strong>'
                 . (int) $loadOfflineSec . ' s</strong> (' . ($loadOfflineSec > 0 ? 'evento <code>case_reclaimed</code>' : 'resgate desligado')
-                . '). Use <strong>Devolver à fila</strong> para forçar agora.</div>';
+                . '). A devolução é automática pelo robô.</div>';
         }
         echo '<div class="table-responsive sticky-head"><table class="table table-slim table-hover align-middle bg-white mb-0">';
         echo '<thead><tr><th>Analista</th><th>Time</th><th>Online</th><th>Offline há</th><th class="text-end">TOA chat</th><th class="text-end">TOA form</th>'
             . '<th class="text-end">Casos</th><th class="text-end">Reservas</th>'
-            . '<th class="text-end">Form + velho</th><th>TOA</th><th>Leitura</th><th></th></tr></thead><tbody>';
+            . '<th class="text-end">Form + velho</th><th>TOA</th><th>Leitura</th></tr></thead><tbody>';
         foreach ($loadRows as $r) {
             $addr = (string) $r['address'];
             $nome = (string) ($r['name'] !== '' ? $r['name'] : $addr);
@@ -3229,16 +3273,7 @@ if ($page === 'load') {
             echo '<td class="text-end">' . ($ocioso > 0 ? h(number_format($ocioso, 0) . ' min') : '<span class="text-muted">—</span>') . '</td>';
             echo '<td>' . badge_state($toaOk, 'ok', 'falhou') . '</td>';
             echo '<td>' . h(fmt_dt($r['at'])) . '</td>';
-            // Botao manual: devolve agora os casos deste analista (robo: mesmo caminho).
-            $casosLedger = (int) $r['chats_ledger'] + (int) $r['forms_ledger'];
-            echo '<td class="text-end">';
-            if (!$online && $casosLedger > 0) {
-                echo '<form method="post" class="d-inline"><input type="hidden" name="csrf" value="' . h($csrf) . '">'
-                    . '<input type="hidden" name="action" value="requeue_offline">'
-                    . '<input type="hidden" name="address" value="' . h($addr) . '">'
-                    . '<button class="btn btn-sm btn-outline-danger" title="Devolver os casos deste analista para a fila agora">Devolver à fila</button></form>';
-            }
-            echo '</td></tr>';
+            echo '</tr>';
         }
         echo '</tbody></table></div>';
     }
@@ -3255,7 +3290,9 @@ if ($page === 'groups') {
 if ($page === 'dashboard') {
     $tzDash = new DateTimeZone('America/Sao_Paulo');
     $hojeDash = (new DateTimeImmutable('now', $tzDash))->format('Y-m-d');
-    $deDefault = (new DateTimeImmutable('-29 days', $tzDash))->format('Y-m-d');
+    // Padrao = HOJE: os cards do topo sao "do dia" (chats/forms atendidos). Os
+    // atalhos 7d/30d/90d (ou os campos De/Ate) mudam o recorte de toda a pagina.
+    $deDefault = $hojeDash;
     $deRaw = trim((string) ($_GET['de'] ?? $deDefault));
     $ateRaw = trim((string) ($_GET['ate'] ?? $hojeDash));
     $selDash = [];
@@ -3266,6 +3303,11 @@ if ($page === 'dashboard') {
         }
     }
     $selList = array_keys($selDash);
+    // Filtro global por ANALISTA (nome ou endereco): vale para os cards, o donut
+    // e a tabela. O curinga digitado pelo usuario sai antes (o `%` e do LIKE).
+    $nomeRaw = trim((string) ($_GET['nome'] ?? ''));
+    $nomeBusca = str_replace(['%', '_'], '', $nomeRaw);
+    $nomeLike = $nomeBusca !== '' ? '%' . $nomeBusca . '%' : '';
 
     $dashErr = '';
     $parseDay = static function (string $raw): ?DateTimeImmutable {
@@ -3303,31 +3345,38 @@ if ($page === 'dashboard') {
         $candQueues = [];
     }
 
-    page_header('Dashboard', 'Volume de classificacoes por categoria no periodo e resumo do formulario de validacao.', '');
+    page_header(
+        'Dashboard',
+        'Cards do dia (chats e formulários atendidos e as duas filas), operadores online x offline e o volume de classificações do período.',
+        ''
+    );
     echo '<div class="d-none">';
     echo '<h1 class="h3 mb-1">Dashboard</h1>';
-    echo '<p class="text-muted">Volume de classificações (evento “classificou”) por categoria no período e filas selecionadas. Gráfico gerado pelo próprio painel, sem bibliotecas externas. Abaixo, o resumo dos eventos do formulário de validação (recebidos, roteados, sem analista, sem time…).</p></div>';
+    echo '<p class="text-muted">Cards: <strong>TOTAL CHATS/DIA</strong> e <strong>TOTAL FORMS/DIA</strong> são o que os analistas atenderam no período (roteado pelo bot, transferido ou assumido); <strong>FILA DE CHAT</strong> são os chats com o chatbot agora e <strong>FILA FORMS</strong> são os formulários abertos sem operador (esperando na fila do time). O filtro de filas, o período e o nome do analista valem para os cards, o donut e a tabela. Abaixo, o gráfico de classificações por categoria e o resumo do formulário de validação — tudo gerado pelo próprio painel, sem bibliotecas externas.</p></div>';
 
+    $dashQueueOpts = [];
+    foreach ($candQueues as $cq) {
+        $qaOpt = (string) $cq['queue_address'];
+        $nomeOpt = trim((string) ($cq['queue_name'] ?? ''));
+        $dashQueueOpts[$qaOpt] = ($nomeOpt !== '' ? $nomeOpt . ' — ' : '') . $qaOpt;
+    }
     echo '<div class="card mb-3"><div class="card-body">';
     echo '<form method="get" class="row g-3 align-items-end">';
     echo '<input type="hidden" name="page" value="dashboard">';
-    echo '<div class="col-md-7"><label class="form-label">Filas — nenhuma marcada = todas</label><div class="queue-list border rounded p-2">';
-    if ($candQueues) {
-        foreach ($candQueues as $cq) {
-            $qaDash = (string) $cq['queue_address'];
-            $nomeDash = (string) ($cq['queue_name'] ?? '');
-            $qidDash = 'dq-' . preg_replace('/[^a-z0-9_:-]/i', '', $qaDash);
-            $checkedDash = isset($selDash[$qaDash]) ? ' checked' : '';
-            echo '<div class="form-check form-check-inline"><input class="form-check-input" type="checkbox" name="filas[]" value="' . h($qaDash) . '" id="' . h($qidDash) . '"' . $checkedDash . '>';
-            echo '<label class="form-check-label" for="' . h($qidDash) . '">' . h($nomeDash !== '' ? $nomeDash . ' — ' : '') . '<code>' . h($qaDash) . '</code></label></div>';
-        }
+    echo '<div class="col-12 col-md-5"><label class="form-label">Filas — nenhuma marcada = todas</label>';
+    if ($dashQueueOpts) {
+        ui_multiselect('filas', $dashQueueOpts, $selList, 'Todas as filas');
     } else {
-        echo '<span class="text-muted">Nenhuma fila com eventos de classificação ainda.</span>';
+        echo '<p class="text-muted small mb-0">Nenhuma fila com eventos de classificação ainda.</p>';
     }
-    echo '</div></div>';
-    echo '<div class="col-md-2"><label class="form-label">De</label><input type="date" class="form-control" name="de" value="' . h($deRaw) . '"></div>';
-    echo '<div class="col-md-2"><label class="form-label">Até</label><input type="date" class="form-control" name="ate" value="' . h($ateRaw) . '"></div>';
-    echo '<div class="col-auto"><button class="btn btn-primary">Filtrar</button></div>';
+    echo '</div>';
+    ui_date_range($deRaw, $ateRaw);
+    echo '<div class="col-12 col-md-3"><label class="form-label">Analista — nome ou endereço</label>';
+    echo '<input type="text" class="form-control form-control-sm" name="nome" value="' . h($nomeRaw) . '" placeholder="Ex.: Ana"></div>';
+    echo '<div class="col-12 col-md-auto"><button class="btn btn-primary btn-sm">Filtrar</button> ';
+    echo '<a class="btn btn-outline-secondary btn-sm" href="?page=dashboard">Limpar</a></div>';
+    echo '<div class="col-12"><div class="form-text mb-0">O filtro vale para os cards, o donut e a tabela de analistas. '
+        . 'Os cards <strong>Fila de chat</strong> e <strong>Fila Forms</strong> mostram o <em>agora</em>; os demais respeitam o período.</div></div>';
     echo '</form>';
     if ($dashErr !== '') {
         echo '<div class="alert alert-danger mt-3 mb-0">' . h($dashErr) . '</div>';
@@ -3383,6 +3432,320 @@ if ($page === 'dashboard') {
 
     if ($dashErr === '' && $de !== null && $ate !== null) {
         $legFila = $selList ? count($selList) . ' fila(s)' : 'todas as filas';
+        $legNome = $nomeBusca !== '' ? 'analista “' . $nomeBusca . '”' : 'todos os analistas';
+        $perLeg = $de->format('d/m/Y') . ' a ' . $ate->format('d/m/Y');
+        // Filtro por nome: resolve os ENDERECOS dos operadores que casam (nome da
+        // leitura, nome no time ou o proprio endereco). Sem isso o ledger, que
+        // guarda so o endereco, nao teria como responder ao filtro por nome.
+        $nomeConds = '';
+        $nomeParams = [];
+        if ($nomeBusca !== '') {
+            $addrsNome = [];
+            try {
+                $stNome = $pdo->prepare('SELECT address FROM analyst_load WHERE name LIKE ? OR address LIKE ?');
+                $stNome->execute([$nomeLike, $nomeLike]);
+                foreach ($stNome->fetchAll(PDO::FETCH_COLUMN) as $addrNome) {
+                    $addrsNome[(string) $addrNome] = true;
+                }
+                $stNome = $pdo->prepare('SELECT address FROM team_members WHERE name LIKE ? OR address LIKE ?');
+                $stNome->execute([$nomeLike, $nomeLike]);
+                foreach ($stNome->fetchAll(PDO::FETCH_COLUMN) as $addrNome) {
+                    $addrsNome[(string) $addrNome] = true;
+                }
+            } catch (Throwable $eNome) {
+                $addrsNome = [];
+            }
+            $addrsNome = array_keys($addrsNome);
+            if ($addrsNome) {
+                $nomeConds = 'a.assignee IN (' . implode(',', array_fill(0, count($addrsNome), '?')) . ')';
+                $nomeParams = $addrsNome;
+            } else {
+                $nomeConds = 'a.assignee LIKE ?';
+                $nomeParams = [$nomeLike];
+            }
+        }
+
+        // TOTAL CHATS/DIA e TOTAL FORMS/DIA saem do LEDGER do bot
+        // (route_assignments) no periodo: o bot entregou (transferencia/entrega),
+        // o tecnico assumiu na mao ou o item foi adotado na fila. Uma linha por
+        // caso entregue, aberto ou ja fechado — e o que responde por "atendidos".
+        $atendTot = ['chat' => 0, 'form' => 0];
+        $atendPor = [];
+        try {
+            $paramsAt = ['-3 hours', $de->format('Y-m-d'), $ate->format('Y-m-d')];
+            $condsAt = ["date(datetime(a.assigned_at, ?)) BETWEEN date(?) AND date(?)"];
+            $scopeAt = bot_scope_queue_where($pdo, 'a.queue_address', $paramsAt);
+            if ($scopeAt !== '') {
+                $condsAt[] = substr($scopeAt, 5);
+            }
+            if ($selList) {
+                $condsAt[] = 'a.queue_address IN (' . implode(',', array_fill(0, count($selList), '?')) . ')';
+                foreach ($selList as $qaAt) {
+                    $paramsAt[] = $qaAt;
+                }
+            }
+            if ($nomeConds !== '') {
+                $condsAt[] = $nomeConds;
+                foreach ($nomeParams as $pNome) {
+                    $paramsAt[] = $pNome;
+                }
+            }
+            $stAt = $pdo->prepare(
+                'SELECT a.assignee, a.kind, COUNT(*) AS n FROM route_assignments a WHERE '
+                . implode(' AND ', $condsAt) . ' GROUP BY a.assignee, a.kind'
+            );
+            $stAt->execute($paramsAt);
+            foreach ($stAt->fetchAll() as $rAt) {
+                $tipoAt = ((string) $rAt['kind']) === 'form' ? 'form' : 'chat';
+                $nAt = (int) $rAt['n'];
+                $atendTot[$tipoAt] += $nAt;
+                $addrAt = (string) $rAt['assignee'];
+                if (!isset($atendPor[$addrAt])) {
+                    $atendPor[$addrAt] = ['chat' => 0, 'form' => 0];
+                }
+                $atendPor[$addrAt][$tipoAt] += $nAt;
+            }
+        } catch (Throwable $eAt) {
+            $atendTot = ['chat' => 0, 'form' => 0];
+            $atendPor = [];
+        }
+        // FILA DE CHAT (agora): chats com o bot dentro — status vivo e `moved_at`
+        // nulo, o mesmo criterio do card "ChatBot — Em atendimento" da aba Carga.
+        $botAgora = 0;
+        $statusBotDash = bot_open_chat_statuses();
+        try {
+            $paramsBot = [];
+            $filtroBot = ' WHERE c.moved_at IS NULL AND c.status IN ('
+                . implode(',', array_fill(0, count($statusBotDash), '?')) . ')';
+            foreach ($statusBotDash as $stBot) {
+                $paramsBot[] = $stBot;
+            }
+            $filtroBot .= bot_scope_queue_where($pdo, 'c.queue_address', $paramsBot);
+            if ($selList) {
+                $filtroBot .= ' AND c.queue_address IN (' . implode(',', array_fill(0, count($selList), '?')) . ')';
+                foreach ($selList as $qaBot) {
+                    $paramsBot[] = $qaBot;
+                }
+            }
+            $stBotDash = $pdo->prepare('SELECT COUNT(*) FROM chats c' . $filtroBot);
+            $stBotDash->execute($paramsBot);
+            $botAgora = (int) $stBotDash->fetchColumn();
+        } catch (Throwable $eBot) {
+            $botAgora = 0;
+        }
+        // FILA FORMS (agora): formulario aberto e SEM operador (esperando na fila
+        // do time), o mesmo criterio do card "Fila de formulário" da aba Carga.
+        $filaFormAgora = 0;
+        try {
+            $paramsFilaForm = [];
+            $filtroFilaForm = " WHERE r.status = 'waiting' AND r.kind = 'form'"
+                . bot_scope_team_where($pdo, 'r.team_id', $paramsFilaForm);
+            if ($selList) {
+                $filtroFilaForm .= ' AND r.queue_address IN (' . implode(',', array_fill(0, count($selList), '?')) . ')';
+                foreach ($selList as $qaFil) {
+                    $paramsFilaForm[] = $qaFil;
+                }
+            }
+            $stFilaForm = $pdo->prepare('SELECT COUNT(*) FROM pending_routes r' . $filtroFilaForm);
+            $stFilaForm->execute($paramsFilaForm);
+            $filaFormAgora = (int) $stFilaForm->fetchColumn();
+        } catch (Throwable $eFilaForm) {
+            $filaFormAgora = 0;
+        }
+        // Linhas da tabela: a ultima leitura por analista (aba Carga), na mesma
+        // ordem de la — quem esta ativo no roteamento primeiro, maior carga no topo.
+        $dashRows = [];
+        try {
+            $paramsDashLoad = [];
+            $condsDashLoad = [];
+            $scopeDashLoad = bot_scope_team_where($pdo, 'l.team_id', $paramsDashLoad);
+            if ($scopeDashLoad !== '') {
+                $condsDashLoad[] = substr($scopeDashLoad, 5);
+            }
+            if ($selList) {
+                // O chat nao tem team_id: a fila escolhida entra pelos times dela.
+                $marcaDash = implode(',', array_fill(0, count($selList), '?'));
+                $condsDashLoad[] = 'l.team_id IN (SELECT team_id FROM team_queues WHERE queue_address IN (' . $marcaDash . '))';
+                foreach ($selList as $qaLoadDash) {
+                    $paramsDashLoad[] = $qaLoadDash;
+                }
+            }
+            if ($nomeBusca !== '') {
+                $condsDashLoad[] = '(l.name LIKE ? OR l.address LIKE ?)';
+                $paramsDashLoad[] = $nomeLike;
+                $paramsDashLoad[] = $nomeLike;
+            }
+            $stDashLoad = $pdo->prepare(
+                'SELECT l.*, t.name AS team_name, COALESCE(tm.active, 0) AS roteando'
+                . ' FROM analyst_load l'
+                . ' LEFT JOIN teams t ON t.id = l.team_id'
+                . ' LEFT JOIN team_members tm ON tm.team_id = l.team_id AND tm.address = l.address'
+                . ($condsDashLoad ? ' WHERE ' . implode(' AND ', $condsDashLoad) : '')
+                . ' ORDER BY (CASE WHEN COALESCE(tm.active, 0) = 1 THEN 0 ELSE 1 END),'
+                . ' (l.chats_toa + l.forms_toa) DESC, l.form_ocioso_min DESC, l.name'
+            );
+            $stDashLoad->execute($paramsDashLoad);
+            foreach ($stDashLoad->fetchAll() as $rLoadDash) {
+                $addrLoadDash = (string) $rLoadDash['address'];
+                $nomeLoadDash = trim((string) $rLoadDash['name']);
+                $dashRows[$addrLoadDash] = [
+                    'address' => $addrLoadDash,
+                    'name' => $nomeLoadDash !== '' ? $nomeLoadDash : $addrLoadDash,
+                    'team' => (string) ($rLoadDash['team_name'] ?? ''),
+                    'online' => (int) $rLoadDash['online'] === 1,
+                    'online_ok' => (int) ($rLoadDash['online_ok'] ?? 0) === 1,
+                    'toa_chat' => (int) $rLoadDash['chats_toa'],
+                    'toa_form' => (int) $rLoadDash['forms_toa'],
+                    'casos' => (int) $rLoadDash['casos_total'],
+                    'presente' => (int) $rLoadDash['form_presente_toa'] === 1,
+                    'toa_ok' => (int) $rLoadDash['toa_ok'] === 1,
+                    'form_velho' => (float) $rLoadDash['form_ocioso_min'],
+                    'leitura' => (string) $rLoadDash['at'],
+                    'roteando' => (int) ($rLoadDash['roteando'] ?? 0) === 1,
+                    'fora_leitura' => false,
+                ];
+            }
+        } catch (Throwable $eLoadDash) {
+            $dashRows = [];
+        }
+        // Quem atendeu no periodo mas nao esta na ultima leitura continua na
+        // tabela: sem isso a coluna de atendidos nao fecharia com os cards.
+        foreach (array_keys($atendPor) as $addrExtra) {
+            if (isset($dashRows[$addrExtra])) {
+                continue;
+            }
+            $timeExtra = '';
+            try {
+                $stTimeExtra = $pdo->prepare(
+                    'SELECT t.name FROM team_members tm JOIN teams t ON t.id = tm.team_id'
+                    . ' WHERE tm.address = ? ORDER BY tm.team_id LIMIT 1'
+                );
+                $stTimeExtra->execute([$addrExtra]);
+                $timeExtra = (string) ($stTimeExtra->fetchColumn() ?: '');
+            } catch (Throwable $eTimeExtra) {
+                $timeExtra = '';
+            }
+            $dashRows[$addrExtra] = [
+                'address' => $addrExtra,
+                'name' => $addrExtra,
+                'team' => $timeExtra,
+                'online' => false,
+                'online_ok' => false,
+                'toa_chat' => 0,
+                'toa_form' => 0,
+                'casos' => 0,
+                'presente' => false,
+                'toa_ok' => false,
+                'form_velho' => 0.0,
+                'leitura' => '',
+                'roteando' => false,
+                'fora_leitura' => true,
+            ];
+        }
+
+        // Donut: ONLINE x OFFLINE pela ultima leitura de presenca do TOA. Leitura
+        // de presenca que falhou nao vira "offline" (o alerta da aba Carga faz a
+        // mesma distincao): entra como "sem leitura".
+        $dashOn = 0;
+        $dashOff = 0;
+        $dashSem = 0;
+        foreach ($dashRows as $rDonut) {
+            if (!$rDonut['online_ok']) {
+                $dashSem++;
+            } elseif ($rDonut['online']) {
+                $dashOn++;
+            } else {
+                $dashOff++;
+            }
+        }
+        $fatiasDonut = [['Online', $dashOn, '#198754'], ['Offline', $dashOff, '#b02a37']];
+        if ($dashSem > 0) {
+            $fatiasDonut[] = ['Sem leitura', $dashSem, '#adb5bd'];
+        }
+        // Cards do topo. "Atendidos" = ledger do periodo; as duas filas = agora.
+        echo '<div class="row g-3 mb-3">';
+        $cardsDash = [
+            ['TOTAL CHATS/DIA', (string) $atendTot['chat'], 'bg-dark', 'Chats com analista no período: roteado pelo bot, transferido ou assumido.'],
+            ['TOTAL FORMS/DIA', (string) $atendTot['form'], 'bg-primary', 'Formulários de validação com analista no período: roteado ou assumido.'],
+            ['FILA DE CHAT', (string) $botAgora, 'bg-warning text-dark', 'Chats com o chatbot agora (bot dentro do chat, sem analista).'],
+            ['FILA FORMS', (string) $filaFormAgora, 'bg-info text-dark', 'Formulários abertos sem operador (esperando na fila do time).'],
+        ];
+        foreach ($cardsDash as $cD) {
+            echo '<div class="col-6 col-xl-3"><div class="card h-100"><div class="card-body py-2">';
+            echo '<div class="text-muted small">' . h($cD[0]) . '</div>';
+            echo '<div class="fs-3"><span class="badge ' . h($cD[2]) . '">' . h($cD[1]) . '</span></div>';
+            echo '<div class="text-muted small">' . h($cD[3]) . '</div>';
+            echo '</div></div></div>';
+        }
+        echo '</div>';
+        // Donut de operadores (online x offline) ao lado da tabela de detalhe.
+        echo '<div class="row g-3 mb-3">';
+        echo '<div class="col-12 col-lg-4"><div class="card h-100"><div class="card-body">';
+        echo '<h2 class="h6">Operadores — online x offline</h2>';
+        echo '<p class="text-muted small mb-2">Última leitura de presença por analista — ' . h($legFila) . ', ' . h($legNome) . '.</p>';
+        dash_donut($fatiasDonut, (string) count($dashRows), 'analista(s)');
+        echo '<p class="text-muted small mb-0">Quem está <strong>inativo</strong> no roteamento não recebe item novo; '
+            . '<strong>sem leitura</strong> é presença que falhou na coleta — o analista não vira “offline” por isso.</p>';
+        echo '</div></div></div>';
+        // Tabela de detalhe: uma linha por analista com o retrato do TOA (agora) e o
+        // que ele atendeu no periodo (ledger do bot).
+        echo '<div class="col-12 col-lg-8"><div class="card h-100"><div class="card-body">';
+        echo '<h2 class="h6">Analistas — carga no TOA e atendidos</h2>';
+        if (!$dashRows) {
+            echo '<p class="text-muted mb-0">Nenhum analista para esses filtros.</p>';
+        } else {
+            $totToaChat = 0;
+            $totToaForm = 0;
+            $totAtChat = 0;
+            $totAtForm = 0;
+            echo '<div class="table-responsive sticky-head"><table class="table table-slim table-hover align-middle bg-white mb-0">';
+            echo '<thead><tr><th>Analista</th><th>Time</th><th>Status</th>'
+                . '<th class="text-end">TOA chat</th><th class="text-end">TOA form</th>'
+                . '<th class="text-end">Em atend.</th><th class="text-end">Form + velho</th>'
+                . '<th>Leitura</th><th class="text-end">Atendidos (chat/form)</th></tr></thead><tbody>';
+            foreach ($dashRows as $addrTab => $rTab) {
+                $atChat = (int) ($atendPor[$addrTab]['chat'] ?? 0);
+                $atForm = (int) ($atendPor[$addrTab]['form'] ?? 0);
+                $emAtend = (int) $rTab['toa_chat'] + (int) $rTab['toa_form'];
+                $ociosoTab = (float) $rTab['form_velho'];
+                $totToaChat += (int) $rTab['toa_chat'];
+                $totToaForm += (int) $rTab['toa_form'];
+                $totAtChat += $atChat;
+                $totAtForm += $atForm;
+                echo '<tr' . ($rTab['roteando'] ? '' : ' class="text-muted"') . '>';
+                echo '<td><strong>' . h((string) $rTab['name']) . '</strong>';
+                if (!$rTab['roteando']) {
+                    echo ' <span class="badge text-bg-warning" title="Inativo no roteamento: nao recebe item novo">inativo</span>';
+                }
+                echo '<div class="text-muted small"><code>' . h((string) $addrTab) . '</code></div></td>';
+                echo '<td>' . h((string) $rTab['team']) . '</td>';
+                echo '<td>' . badge_state((bool) $rTab['online'], 'sim', 'não');
+                if (!$rTab['online_ok']) {
+                    echo ' <span class="badge bg-secondary" title="Leitura de presenca sem resultado">sem leitura</span>';
+                }
+                echo '</td>';
+                echo '<td class="text-end">' . (int) $rTab['toa_chat'] . '</td>';
+                echo '<td class="text-end">' . (int) $rTab['toa_form']
+                    . ($rTab['presente'] ? ' <span class="badge bg-info text-dark">presente</span>' : '') . '</td>';
+                echo '<td class="text-end"><span class="badge ' . ($emAtend > 0 ? 'bg-secondary' : 'bg-light text-dark')
+                    . '" title="TOA chat + TOA form: o que o operador tem aberto no TOA agora">' . $emAtend . '</span></td>';
+                echo '<td class="text-end">' . ($ociosoTab > 0 ? h(number_format($ociosoTab, 0) . ' min') : '<span class="text-muted">—</span>') . '</td>';
+                echo '<td>' . ($rTab['leitura'] !== ''
+                    ? h(fmt_dt((string) $rTab['leitura'])) . ' ' . badge_state((bool) $rTab['toa_ok'], 'ok', 'falhou')
+                    : '<span class="text-muted">fora da leitura</span>') . '</td>';
+                echo '<td class="text-end">' . $atChat . ' / ' . $atForm
+                    . ' <span class="text-muted small">(' . ($atChat + $atForm) . ')</span></td>';
+                echo '</tr>';
+            }
+            echo '</tbody></table></div>';
+            echo '<p class="text-muted small mb-0 mt-2">Total do <em>agora</em>: TOA chat <strong>' . $totToaChat
+                . '</strong>, TOA form <strong>' . $totToaForm . '</strong>, em atendimento <strong>' . ($totToaChat + $totToaForm)
+                . '</strong>. Atendidos no período <strong>' . h($perLeg) . '</strong>: chats <strong>' . $totAtChat
+                . '</strong> e formulários <strong>' . $totAtForm . '</strong> (ledger do bot). '
+                . 'A tabela se atualiza sozinha.</p>';
+        }
+        echo '</div></div></div>';
+        echo '</div>';
         echo '<div class="card"><div class="card-body">';
         echo '<h2 class="h6 mb-0">Classificações por categoria — ' . h($de->format('d/m/Y')) . ' a ' . h($ate->format('d/m/Y')) . ' (' . h($legFila) . ')</h2>';
         echo '<p class="text-muted mb-2 small">Total no período: ' . $grand . '</p>';

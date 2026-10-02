@@ -236,11 +236,64 @@ $posInativo = strpos($htmlCarga, 'u:inativo@claro.com');
 ok($posAna !== false && $posInativo !== false && $posAna < $posInativo, 'aba load: inativo no roteamento vai para o fim da tabela');
 ok(strpos($htmlCarga, '>inativo</span>') !== false, 'aba load: selo de inativo no roteamento');
 
-// Resgate por analista offline: coluna, alerta e botao manual na aba Carga.
+// Resgate por analista offline: coluna e alerta ficam na aba Carga (relatorio).
+// O botao manual saiu: a devolucao e automatica, o painel so configura a regua.
 ok(strpos($htmlCarga, '<th>Offline há</th>') !== false, 'aba load: coluna Offline há');
 ok(strpos($htmlCarga, 'analista(s) <strong>offline</strong> com caso aberto') !== false, 'aba load: alerta de offline com caso aberto');
-ok(strpos($htmlCarga, 'value="requeue_offline"') !== false, 'aba load: botao Devolver a fila (job requeue_offline)');
-ok(strpos($htmlCarga, 'Devolver à fila') !== false, 'aba load: rotulo do botao manual');
+ok(strpos($htmlCarga, 'A devolução é automática') !== false, 'aba load: alerta diz que a devolucao e automatica');
+ok(strpos($htmlCarga, 'value="requeue_offline"') === false, 'aba load: botao Devolver a fila removido');
+ok(strpos($htmlCarga, 'Devolver à fila') === false, 'aba load: rotulo do botao manual removido');
+ok(strpos($htmlCarga, 'Leitura</th><th></th>') === false, 'aba load: cabecalho da tabela sem coluna extra');
+// Tabela alinhada: 11 <th> no cabecalho = 11 <td> em cada linha (a "Leitura"
+// e a ultima coluna depois de sair o botao manual).
+$iniTh = strpos($htmlCarga, '<th>Analista</th>');
+$fimTh = $iniTh === false ? false : strpos($htmlCarga, '</tr></thead>', $iniTh);
+ok(
+    $iniTh !== false && $fimTh !== false && substr_count(substr($htmlCarga, $iniTh, $fimTh - $iniTh), '<th') === 11,
+    'aba load: 11 colunas no cabecalho da tabela'
+);
+$iniTd = $posAna === false ? false : strrpos(substr($htmlCarga, 0, $posAna), '<tr');
+$fimTd = $iniTd === false ? false : strpos($htmlCarga, '</tr>', $iniTd);
+ok(
+    $iniTd !== false && $fimTd !== false && substr_count(substr($htmlCarga, $iniTd, $fimTd - $iniTd), '<td') === 11,
+    'aba load: 11 celulas por linha (alinhado ao cabecalho)'
+);
+
+// Aba Dashboard: cards do topo, donut de operadores (online x offline), tabela
+// de analistas e o filtro por nome — SVG puro, sem bibliotecas externas.
+$htmlDash = (string) ($htmls['dashboard'] ?? '');
+ok(strpos($htmlDash, 'TOTAL CHATS/DIA') !== false, 'aba dashboard: card TOTAL CHATS/DIA');
+ok(strpos($htmlDash, 'TOTAL FORMS/DIA') !== false, 'aba dashboard: card TOTAL FORMS/DIA');
+ok(strpos($htmlDash, '>FILA DE CHAT<') !== false, 'aba dashboard: card FILA DE CHAT');
+ok(strpos($htmlDash, '>FILA FORMS<') !== false, 'aba dashboard: card FILA FORMS');
+ok(strpos($htmlDash, 'class="dash-donut"') !== false, 'aba dashboard: donut de operadores (SVG puro)');
+ok(strpos($htmlDash, 'class="dash-legend"') !== false, 'aba dashboard: legenda do donut');
+ok(strpos($htmlDash, '<span class="dot"') !== false, 'aba dashboard: legenda com as cores do donut');
+ok(strpos($htmlDash, 'online x offline') !== false, 'aba dashboard: rotulo do donut');
+ok(strpos($htmlDash, 'Analistas') !== false, 'aba dashboard: tabela de analistas');
+ok(strpos($htmlDash, 'name="nome"') !== false, 'aba dashboard: filtro por analista (nome/endereco)');
+ok(strpos($htmlDash, 'Ex.: Ana') !== false, 'aba dashboard: exemplo do filtro por nome');
+ok(strpos($htmlDash, 'Devolver') === false, 'aba dashboard: sem botao manual de devolucao');
+
+/** Renderiza o dashboard com filtros extras (argv[3] do harness). */
+function render_dashboard(string $extra, int $uid): array
+{
+    $cmd = escapeshellarg(PHP_BINARY) . ' ' . escapeshellarg(__DIR__ . DIRECTORY_SEPARATOR . '_panel_render.php')
+        . ' dashboard ' . escapeshellarg((string) $uid) . ' ' . escapeshellarg($extra) . ' 2>&1';
+    $out = [];
+    $code = 0;
+    exec($cmd, $out, $code);
+    return [implode("\n", $out), $code];
+}
+
+// Filtro por nome: volta no campo e restringe a tabela (a leitura do Inativo sai).
+[$htmlDashNome, $codeDashNome] = render_dashboard('nome=Ana', $uid);
+ok($codeDashNome === 0, 'aba dashboard (filtro por nome): renderizou sem erro');
+ok(strpos($htmlDashNome, 'value="Ana"') !== false, 'aba dashboard: nome digitado volta no campo');
+ok(
+    strpos($htmlDashNome, 'u:ana@claro.com') !== false && strpos($htmlDashNome, 'u:inativo@claro.com') === false,
+    'aba dashboard: filtro por nome restringe a tabela ao analista'
+);
 
 // Ajustes do resgate no Roteamento: globais + por time (linha de cada time).
 $htmlRoutingOff = (string) ($htmls['routing'] ?? '');
