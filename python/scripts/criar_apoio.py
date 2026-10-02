@@ -255,6 +255,7 @@ async def run(ctx: dict, http_post=None, http_get=None) -> dict:
     answers = ctx.get("answers") if isinstance(ctx.get("answers"), dict) else {}
     raw_id = str(answers.get("atividade") or "").strip()
     tecnico = str(answers.get("login_apoio") or "").strip()
+    nome = str(ctx.get("nome_solicitante") or answers.get("_nome_solicitante") or "").strip()
     try:
         tarefa_id = int(raw_id)
     except ValueError:
@@ -273,7 +274,7 @@ async def run(ctx: dict, http_post=None, http_get=None) -> dict:
 
     post = http_post or _post_json
     get = http_get or _get_json
-    payload = {"tarefa_id": tarefa_id, "tecnico": tecnico}
+    payload = {"tarefa_id": tarefa_id, "tecnico": tecnico, "nome_solicitante": nome}
 
     if not resume_uid:
         posted = False

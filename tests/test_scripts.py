@@ -159,12 +159,45 @@ class CriarApoioTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r["message"], criar_apoio.SUCCESS_MESSAGE)
         self.assertEqual(order[0], "persist")
         self.assertEqual(order[1], "post")
-        self.assertEqual(captured["payload"], {"tarefa_id": 42, "tecnico": "tec.apoio"})
+        self.assertEqual(
+            captured["payload"],
+            {"tarefa_id": 42, "tecnico": "tec.apoio", "nome_solicitante": ""},
+        )
         self.assertEqual(captured["headers"]["x-api-key"], "sekret")
         self.assertEqual(captured["headers"]["x-modo"], "sync")
         self.assertEqual(captured["headers"]["x-uuid"], captured["uid"])
         self.assertNotIn("sekret", r["message"])
         self.assertNotIn("sekret", r["detail"])
+
+    async def test_nome_solicitante_no_payload(self):
+        captured = {}
+
+        def fake_post(url, payload, headers, *a, **k):
+            captured["payload"] = payload
+            return 200, {"status": "SUCESSO"}
+
+        with patch.dict(os.environ, ENV, clear=False):
+            r = await criar_apoio.run(
+                {"answers": ANSWERS, "nome_solicitante": "Maria Gestora"},
+                http_post=fake_post,
+            )
+        self.assertTrue(r["ok"])
+        self.assertEqual(captured["payload"]["nome_solicitante"], "Maria Gestora")
+
+    async def test_nome_solicitante_cai_no_answers(self):
+        captured = {}
+
+        def fake_post(url, payload, headers, *a, **k):
+            captured["payload"] = payload
+            return 200, {"status": "SUCESSO"}
+
+        with patch.dict(os.environ, ENV, clear=False):
+            r = await criar_apoio.run(
+                {"answers": {**ANSWERS, "_nome_solicitante": "Joao Gestor"}},
+                http_post=fake_post,
+            )
+        self.assertTrue(r["ok"])
+        self.assertEqual(captured["payload"]["nome_solicitante"], "Joao Gestor")
 
     async def test_409_gera_novo_uuid_e_repete(self):
         uuids = []

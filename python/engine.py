@@ -1499,6 +1499,14 @@ class Engine:
             if not result.get("allowed"):
                 await self._deny_script(cid, row, slug, result)
                 return
+        # Nome do autor do chat (capturado na abertura) vai junto do script: o
+        # criar_apoio envia como `nome_solicitante`. Fica no estado interno do
+        # wizard (chave `_`) para sobreviver ao resume (o reinicio de um script
+        # pelo menu "corrigir" continua zerando as respostas).
+        inicio: dict = {}
+        if slug == "criar_apoio":
+            nome = form_open.requester_key(self._queue_chat_snapshot(cid, row), self.own)[2].strip()
+            inicio = {"_nome_solicitante": nome}
         now = datetime.now(timezone.utc)
         db.upsert_chat(
             self.conn, cid,
@@ -1507,7 +1515,7 @@ class Engine:
             option_id=opt.get("id"),
             script_slug=slug,
             script_field_index=0,
-            script_answers="{}",
+            script_answers=json.dumps(inicio),
             retries=0,
             last_prompt_at=now,
         )
@@ -1884,13 +1892,18 @@ class Engine:
                 last_prompt_at=now,
             )
             row = self.conn.execute("SELECT * FROM chats WHERE chat_id = ?", (cid,)).fetchone() or row
+        answers = _script_answers(row)
+        nome = form_open.requester_key(self._queue_chat_snapshot(cid, row), self.own)[2].strip()
+        if not nome:
+            nome = str(answers.get("_nome_solicitante") or "").strip()
         ctx = {
             "chat_id": cid,
             "queue_address": row.get("queue_address"),
-            "answers": _script_answers(row),
+            "answers": answers,
             "option": opt,
             "persist_job": lambda uid: self._persist_script_uuid(cid, uid),
             "started_at": row.get("script_started_at") or started,
+            "nome_solicitante": nome,
         }
         if resume:
             uid = str(row.get("script_uuid") or "").strip()

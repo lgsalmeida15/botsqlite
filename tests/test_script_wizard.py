@@ -191,6 +191,46 @@ class ScriptWizardTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.loads(chat["script_answers"] or "{}"), {})
         self.assertIn("Qual ID da atividade?", sock.sent_texts()[-1])
 
+    async def test_nome_do_autor_vai_no_payload(self):
+        from python.engine import MEM
+
+        conn = mem_conn()
+        seed_queue_menu(conn)
+        seed_apoio_leaf(conn)
+        eng, sock = self._eng(conn)
+        MEM[10] = {
+            "started_addr": "u:tec@claro.com",
+            "queue_address": "h:q1",
+            "raw": {
+                "chat_id": 10,
+                "person": "Maria Gestora",
+                "started_addr": "u:tec@claro.com",
+                "helpdesk_address": "h:q1",
+            },
+        }
+        await eng.handle_reply(10, awaiting(conn), "1")
+        await eng.handle_reply(10, row_of(conn), "1")
+        chat = row_of(conn)
+        # O nome do autor fica guardado no estado interno do wizard.
+        self.assertEqual(
+            json.loads(chat["script_answers"])["_nome_solicitante"], "Maria Gestora"
+        )
+        await self._answer_form(eng, conn)
+        conf = sock.sent_texts()[-1]
+        self.assertIn("Confirme as informações:", conf)
+        self.assertNotIn("nome_solicitante", conf)
+        captured = {}
+
+        def fake_post(url, payload, headers, *a, **k):
+            captured["payload"] = payload
+            return 200, {"status": "SUCESSO"}
+
+        with patch.dict(os.environ, ENV_APOIO, clear=False), patch(
+            "python.scripts.criar_apoio._post_json", side_effect=fake_post
+        ):
+            await eng.handle_reply(10, row_of(conn), "1")
+        self.assertEqual(captured["payload"]["nome_solicitante"], "Maria Gestora")
+
     async def test_digito_invalido_na_confirmacao(self):
         conn = mem_conn()
         seed_queue_menu(conn)
