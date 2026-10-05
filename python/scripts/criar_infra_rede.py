@@ -7,9 +7,9 @@ import json
 import uuid
 from datetime import datetime, timezone
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener, urlopen
 
-from python.config import env
+from python.config import env, is_internal_api
 from python.scripts.criar_apoio import parse_started_at
 
 SLUG = "criar_infra_rede"
@@ -36,6 +36,15 @@ MAX_STATUS_GETS = 4
 DETAIL_MAX = 800
 _SECRET_HEADER_KEYS = frozenset({"x-api-key", "api-key", "apikey", "api_key"})
 _PAYLOAD_KEYS = ("motivo", "cidade", "endereco", "equipamento", "rede", "tecnico")
+# API interna nao usa proxy do ambiente (proxy local do VS Code devolvia 503).
+# O webhook externo do HUB continua usando o caminho padrao (com proxy).
+_OPENER_DIRETO = build_opener(ProxyHandler({}))
+
+
+def _open_http(req: Request, timeout: float):
+    if is_internal_api(req.full_url):
+        return _OPENER_DIRETO.open(req, timeout=timeout)
+    return urlopen(req, timeout=timeout)
 
 
 def _ok(detail: str) -> dict:
@@ -138,7 +147,7 @@ def _post_json(url: str, payload: dict, headers: dict, timeout: float = HTTP_TIM
     for k, v in headers.items():
         req.add_header(k, v)
     try:
-        with urlopen(req, timeout=timeout) as resp:
+        with _open_http(req, timeout) as resp:
             return _read_http(resp)
     except HTTPError as e:
         raw = b""
@@ -156,7 +165,7 @@ def _get_json(url: str, headers: dict, timeout: float = HTTP_TIMEOUT) -> tuple[i
     for k, v in headers.items():
         req.add_header(k, v)
     try:
-        with urlopen(req, timeout=timeout) as resp:
+        with _open_http(req, timeout) as resp:
             return _read_http(resp)
     except HTTPError as e:
         raw = b""
