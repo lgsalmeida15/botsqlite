@@ -29,7 +29,8 @@ SUCCESS_MESSAGE = (
 ERROR_MESSAGE = "Erro ao gerar Infra de Rede automática, direcionando para um atendente."
 BUDGET_SEC = 180.0
 POLL_SEC = 30.0
-HTTP_TIMEOUT = 15.0
+HTTP_TIMEOUT = 60.0
+RETRY_SLEEP = 3.0
 MAX_CONFLICT = 3
 MAX_STATUS_GETS = 4
 DETAIL_MAX = 800
@@ -82,6 +83,14 @@ def _detail_api(code, body) -> str:
     if not snippet or snippet in ("{}", "[]", "null"):
         return prefix
     return f"{prefix} {snippet}"[:DETAIL_MAX]
+
+
+def _join_tries(tries: list, suffix: str = "") -> str:
+    """Resposta de cada tentativa de POST, na ordem, cortada no limite do detail."""
+    out = "; ".join(tries)
+    if suffix:
+        out = f"{out} | {suffix}" if out else suffix
+    return out[:DETAIL_MAX] or "http_error"
 
 
 def _as_body(raw) -> dict:
@@ -274,35 +283,36 @@ async def run(ctx: dict, http_post=None, http_get=None) -> dict:
     get = http_get or _get_json
 
     if not resume_uid:
-        posted = False
-        last_fail = ""
-        for _ in range(MAX_CONFLICT):
+        tries: list = []
+        for attempt in range(1, MAX_CONFLICT + 1):
             timeout = _http_timeout(started)
             if timeout <= 0:
-                return _fail("timeout")
+                return _fail(_join_tries(tries, "timeout"))
             headers = _headers(key, uid, post=True)
             if post is _post_json:
                 code, body = await asyncio.to_thread(_post_json, post_url, payload, headers, timeout)
             else:
                 code, body = _unpack(await _call_post(post, post_url, payload, headers, timeout))
-            posted = True
+            tries.append(f"#{attempt} {_detail_api(code, body)}")
             if code == 409:
-                last_fail = _detail_api(code, body)
+                # UUID ja utilizado: gera outro e repete imediatamente.
                 uid = str(uuid.uuid4())
                 await _persist(ctx, uid)
                 continue
             st = _api_status(body)
-            if st == "SUCESSO" or (code == 200 and st == "SUCESSO"):
+            if st == "SUCESSO":
                 return _ok("http 200")
             if st == "ERRO":
-                return _fail(_detail_api(code, body))
+                return _fail(_join_tries(tries))
             if st == "PENDENTE" or (code == 200 and not st):
                 return await _poll_status(get, status_url, key, uid, started)
-            if code is None:
-                return _fail(_detail_api(None, body))
-            return _fail(_detail_api(code, body))
-        if posted:
-            return _fail(last_fail or "http 409")
-        return _fail("http_error")
+            transient = code is None or (isinstance(code, int) and code >= 500)
+            if not transient:
+                return _fail(_join_tries(tries))
+            if attempt < MAX_CONFLICT:
+                if _remaining(started) <= RETRY_SLEEP:
+                    return _fail(_join_tries(tries, "timeout"))
+                await asyncio.sleep(RETRY_SLEEP)
+        return _fail(_join_tries(tries))
 
     return await _poll_status(get, status_url, key, uid, started)

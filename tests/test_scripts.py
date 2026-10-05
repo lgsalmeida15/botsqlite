@@ -224,21 +224,31 @@ class CriarApoioTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(persisted[1], uuids[1])
 
     async def test_http_500_transfere(self):
+        calls = []
+
         def fake_post(url, payload, headers, *a, **k):
+            calls.append(1)
             return 500, {}
 
-        with patch.dict(os.environ, ENV, clear=False):
+        with patch.dict(os.environ, ENV, clear=False), patch(
+            "python.scripts.criar_apoio.asyncio.sleep", new_callable=AsyncMock
+        ):
             r = await criar_apoio.run({"answers": ANSWERS}, http_post=fake_post)
         self.assertFalse(r["ok"])
         self.assertEqual(r["action"], "ask_and_transfer")
         self.assertEqual(r["message"], criar_apoio.ERROR_MESSAGE)
-        self.assertEqual(r["detail"], "http 500")
+        self.assertIn("http 500", r["detail"])
+        self.assertIn("#1", r["detail"])
+        self.assertIn("#3", r["detail"])
+        self.assertEqual(len(calls), 3)
 
     async def test_http_500_body_no_detail(self):
         def fake_post(url, payload, headers, *a, **k):
             return 500, {"detail": "falha xyz"}
 
-        with patch.dict(os.environ, ENV, clear=False):
+        with patch.dict(os.environ, ENV, clear=False), patch(
+            "python.scripts.criar_apoio.asyncio.sleep", new_callable=AsyncMock
+        ):
             r = await criar_apoio.run({"answers": ANSWERS}, http_post=fake_post)
         self.assertFalse(r["ok"])
         self.assertEqual(r["action"], "ask_and_transfer")
@@ -248,13 +258,73 @@ class CriarApoioTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("x-api-key", r["detail"])
 
     async def test_rede_transfere(self):
+        calls = []
+
         def fake_post(url, payload, headers, *a, **k):
+            calls.append(1)
             return None, {}
 
-        with patch.dict(os.environ, ENV, clear=False):
+        with patch.dict(os.environ, ENV, clear=False), patch(
+            "python.scripts.criar_apoio.asyncio.sleep", new_callable=AsyncMock
+        ) as sleep:
             r = await criar_apoio.run({"answers": ANSWERS}, http_post=fake_post)
         self.assertEqual(r["action"], "ask_and_transfer")
-        self.assertEqual(r["detail"], "http_error")
+        self.assertIn("http_error", r["detail"])
+        self.assertIn("#3 http_error", r["detail"])
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(sleep.call_count, 2)
+
+    async def test_retry_recupera_apos_timeout_mesmo_uuid(self):
+        uuids = []
+
+        def fake_post(url, payload, headers, *a, **k):
+            uuids.append(headers.get("x-uuid"))
+            if len(uuids) == 1:
+                return None, {}
+            return 200, {"status": "SUCESSO"}
+
+        with patch.dict(os.environ, ENV, clear=False), patch(
+            "python.scripts.criar_apoio.asyncio.sleep", new_callable=AsyncMock
+        ) as sleep:
+            r = await criar_apoio.run({"answers": ANSWERS}, http_post=fake_post)
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["action"], "reply_and_close")
+        self.assertEqual(len(uuids), 2)
+        self.assertEqual(uuids[0], uuids[1])
+        self.assertEqual(sleep.call_count, 1)
+
+    async def test_retry_recupera_apos_503(self):
+        calls = []
+
+        def fake_post(url, payload, headers, *a, **k):
+            calls.append(1)
+            if len(calls) == 1:
+                return 503, {}
+            return 200, {"status": "SUCESSO"}
+
+        with patch.dict(os.environ, ENV, clear=False), patch(
+            "python.scripts.criar_apoio.asyncio.sleep", new_callable=AsyncMock
+        ):
+            r = await criar_apoio.run({"answers": ANSWERS}, http_post=fake_post)
+        self.assertTrue(r["ok"])
+        self.assertEqual(len(calls), 2)
+
+    async def test_retry_esgotado_lista_tentativas(self):
+        calls = []
+
+        def fake_post(url, payload, headers, *a, **k):
+            calls.append(1)
+            return None, {}
+
+        with patch.dict(os.environ, ENV, clear=False), patch(
+            "python.scripts.criar_apoio.asyncio.sleep", new_callable=AsyncMock
+        ):
+            r = await criar_apoio.run({"answers": ANSWERS}, http_post=fake_post)
+        self.assertFalse(r["ok"])
+        self.assertEqual(len(calls), 3)
+        for tag in ("#1", "#2", "#3"):
+            self.assertIn(tag, r["detail"])
+        self.assertNotIn("sekret", r["detail"])
 
     async def test_body_erro_transfere(self):
         def fake_post(url, payload, headers, *a, **k):
@@ -420,7 +490,9 @@ class CriarInfraRedeTest(unittest.IsolatedAsyncioTestCase):
         def fake_post(url, payload, headers, *a, **k):
             return 500, {"detail": "falha xyz"}
 
-        with patch.dict(os.environ, {**ENV, **ENV_INFRA}, clear=False):
+        with patch.dict(os.environ, {**ENV, **ENV_INFRA}, clear=False), patch(
+            "python.scripts.criar_infra_rede.asyncio.sleep", new_callable=AsyncMock
+        ):
             r = await criar_infra_rede.run({"answers": ANSWERS_INFRA}, http_post=fake_post)
         self.assertFalse(r["ok"])
         self.assertEqual(r["action"], "ask_and_transfer")
