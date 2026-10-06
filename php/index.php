@@ -288,12 +288,29 @@ function option_prepare_fields(
 function pdo_friendly_error(PDOException $e): string
 {
     $code = (string) $e->getCode();
-    $msg = $e->getMessage();
-    if ($code === '23000' || $code === '23505' || strpos($msg, 'UNIQUE') !== false || strpos($msg, '23505') !== false) {
-        return 'Já existe um registro com esses dados (fila em outro menu/time ou número de opção repetido).';
+    $msg = strtoupper($e->getMessage());
+    // Codigo do DRIVER (`errorInfo[1]`): no MySQL o duplicado e 1062 e a FK e
+    // 1451/1452 — os dois chegam com SQLSTATE 23000, entao o codigo do driver e
+    // o unico jeito de nao chamar violacao de FK de "registro duplicado".
+    $driver = 0;
+    if (isset($e->errorInfo[1])) {
+        $driver = (int) $e->errorInfo[1];
     }
-    if ($code === '23503' || strpos($msg, 'FOREIGN KEY') !== false || strpos($msg, '23503') !== false) {
+    $fk = in_array($driver, [1451, 1452], true)
+        || $code === '23503'
+        || strpos($msg, 'FOREIGN KEY') !== false
+        || strpos($msg, '23503') !== false;
+    $duplicado = $driver === 1062
+        || $code === '23000' || $code === '23505'
+        || strpos($msg, 'DUPLICATE ENTRY') !== false
+        || strpos($msg, 'UNIQUE') !== false
+        || strpos($msg, '23505') !== false;
+    // A FK vem primeiro: e o caso em que o 23000 dos dois motores engana.
+    if ($fk) {
         return 'Não foi possível excluir: ainda há registros ligados a este item.';
+    }
+    if ($duplicado) {
+        return 'Já existe um registro com esses dados (fila em outro menu/time ou número de opção repetido).';
     }
     return 'Não foi possível salvar. Tente de novo.';
 }
@@ -3442,12 +3459,18 @@ if ($page === 'dashboard') {
         if ($nomeBusca !== '') {
             $addrsNome = [];
             try {
-                $stNome = $pdo->prepare('SELECT address FROM analyst_load WHERE name LIKE ? OR address LIKE ?');
+                $stNome = $pdo->prepare(
+                    'SELECT address FROM analyst_load WHERE ' . bot_like_ci('name')
+                    . ' LIKE ? OR ' . bot_like_ci('address') . ' LIKE ?'
+                );
                 $stNome->execute([$nomeLike, $nomeLike]);
                 foreach ($stNome->fetchAll(PDO::FETCH_COLUMN) as $addrNome) {
                     $addrsNome[(string) $addrNome] = true;
                 }
-                $stNome = $pdo->prepare('SELECT address FROM team_members WHERE name LIKE ? OR address LIKE ?');
+                $stNome = $pdo->prepare(
+                    'SELECT address FROM team_members WHERE ' . bot_like_ci('name')
+                    . ' LIKE ? OR ' . bot_like_ci('address') . ' LIKE ?'
+                );
                 $stNome->execute([$nomeLike, $nomeLike]);
                 foreach ($stNome->fetchAll(PDO::FETCH_COLUMN) as $addrNome) {
                     $addrsNome[(string) $addrNome] = true;
@@ -3460,7 +3483,7 @@ if ($page === 'dashboard') {
                 $nomeConds = 'a.assignee IN (' . implode(',', array_fill(0, count($addrsNome), '?')) . ')';
                 $nomeParams = $addrsNome;
             } else {
-                $nomeConds = 'a.assignee LIKE ?';
+                $nomeConds = bot_like_ci('a.assignee') . ' LIKE ?';
                 $nomeParams = [$nomeLike];
             }
         }
@@ -3571,7 +3594,7 @@ if ($page === 'dashboard') {
                 }
             }
             if ($nomeBusca !== '') {
-                $condsDashLoad[] = '(l.name LIKE ? OR l.address LIKE ?)';
+                $condsDashLoad[] = '(' . bot_like_ci('l.name') . ' LIKE ? OR ' . bot_like_ci('l.address') . ' LIKE ?)';
                 $paramsDashLoad[] = $nomeLike;
                 $paramsDashLoad[] = $nomeLike;
             }

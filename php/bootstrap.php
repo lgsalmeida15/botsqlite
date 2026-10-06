@@ -1,6 +1,10 @@
 <?php
 declare(strict_types=1);
 
+// Fachada de banco: `sqlite` (padrao) ou `mysql` (secao 5 do sqliteformysql.md).
+// O `BotPDO` traduz no choke point — o painel segue escrito no dialeto SQLite.
+require_once __DIR__ . '/db.php';
+
 function bot_env(string $key, ?string $default = null): ?string
 {
     static $env = null;
@@ -60,15 +64,12 @@ function bot_pdo(): PDO
     if ($pdo instanceof PDO) {
         return $pdo;
     }
-    $path = bot_sqlite_path();
-    $dir = dirname($path);
-    if (!is_dir($dir) && !mkdir($dir, 0775, true) && !is_dir($dir)) {
-        throw new RuntimeException('Não foi possível criar a pasta do SQLite: ' . $dir);
-    }
-    $pdo = new PDO('sqlite:' . $path, null, null, [
-        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
-        PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
-    ]);
+    // Abre pelo backend configurado (`DB_BACKEND`); o caminho do arquivo SQLite
+    // so e usado quando o backend e `sqlite`.
+    $pdo = bot_db_abre(bot_sqlite_path());
+    // Os tres PRAGMAs valem no SQLite e o tradutor os converte no MySQL:
+    // `foreign_keys` -> `SET FOREIGN_KEY_CHECKS`, `busy_timeout` -> tempo de
+    // espera por lock da sessao e `journal_mode` (que nao existe) sai fora.
     $pdo->exec('PRAGMA foreign_keys = ON');
     $pdo->exec('PRAGMA journal_mode = WAL');
     $pdo->exec('PRAGMA busy_timeout = 5000');
@@ -94,14 +95,10 @@ function bot_ensure_schema(PDO $pdo): void
     if (bot_table_exists($pdo, 'menu_options')) {
         bot_migrate_submenu($pdo);
     }
-    $sql = preg_replace('/^\s*--.*$/m', '', $sql);
-    foreach (preg_split('/;\s*/', $sql) as $stmt) {
-        $stmt = trim($stmt);
-        if ($stmt === '') {
-            continue;
-        }
-        $pdo->exec($stmt);
-    }
+    // O script sai inteiro pelo `bot_executa_script`: no MySQL ele desliga a
+    // checagem de FK durante o DDL (as tabelas nascem fora da ordem das FKs) e
+    // tira o `PRAGMA foreign_keys = ON` do schema (seria o erro 1824 no meio).
+    bot_executa_script($pdo, $sql);
     bot_migrate_submenu($pdo);
     bot_migrate_rbac($pdo);
     bot_migrate_ask($pdo);
@@ -392,13 +389,19 @@ function bot_migrate_delivery(PDO $pdo): void
         $pdo->exec('CREATE INDEX IF NOT EXISTS delivery_attempts_at_idx ON delivery_attempts (at DESC)');
         $pdo->exec('CREATE INDEX IF NOT EXISTS delivery_attempts_chat_idx ON delivery_attempts (chat_id, id)');
     }
-    // Saneia duplicatas antigas antes de criar o indice (bases em uso).
+    // Saneamento: mantem a rota ativa mais antiga por (kind, chat_id).
+    // O `EXISTS` antigo lia a propria `pending_routes` de dentro do UPDATE, o que
+    // o SQLite aceita e o MySQL recusa (erro 1093, "target table ... in FROM
+    // clause"): a tabela derivada `rotas_ativas` e materializada antes do UPDATE
+    // nos dois motores, e o `MIN(id)` por grupo deixa uma so rota ativa.
     $pdo->exec(
-        "UPDATE pending_routes SET status = 'cancelled', detail = 'duplicata saneada na migracao'"
+        "UPDATE pending_routes SET status = 'cancelled',"
+        . " detail = 'duplicata saneada na migracao'"
         . " WHERE status NOT IN ('done', 'failed', 'cancelled')"
-        . ' AND EXISTS (SELECT 1 FROM pending_routes r2 WHERE r2.kind = pending_routes.kind'
-        . ' AND r2.chat_id = pending_routes.chat_id AND r2.status NOT IN (\'done\', \'failed\', \'cancelled\')'
-        . ' AND r2.id < pending_routes.id)'
+        . ' AND id NOT IN (SELECT id FROM ('
+        . '   SELECT MIN(id) AS id FROM pending_routes'
+        . "    WHERE status NOT IN ('done', 'failed', 'cancelled')"
+        . '    GROUP BY kind, chat_id) AS rotas_ativas)'
     );
     $pdo->exec(
         "CREATE UNIQUE INDEX IF NOT EXISTS pending_routes_active ON pending_routes (kind, chat_id)"

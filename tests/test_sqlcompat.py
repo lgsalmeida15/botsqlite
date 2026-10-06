@@ -48,6 +48,10 @@ _CHAVE = re.compile(r"\b(?:PRIMARY\s+KEY|UNIQUE|FOREIGN\s+KEY|KEY|INDEX)\s*\(([^
 _CASO = re.compile(r"\bTHEN\s+(\w+)\s+END", re.I)
 _SO_COLUNA = re.compile(r"^\w+(?:\s+(?:ASC|DESC))?$", re.I)
 _DDL_NO_PY = re.compile(r"\bCREATE\s+(?:TABLE|(?:UNIQUE\s+)?INDEX)\b", re.I)
+_FK = re.compile(r"FOREIGN\s+KEY\s*\((\w+)\)\s*REFERENCES\s+(\w+)\s*\((\w+)\)", re.I)
+_COLACAO_NA_COLUNA = re.compile(
+    r"(?m)^\s*`?(?P<col>\w+)`?\s+\w+(?:\(\d+\))?\s+COLLATE\s+utf8mb4_bin\b", re.I
+)
 
 
 def _corpo(sql: str) -> str:
@@ -71,6 +75,21 @@ def _colunas_da_chave(texto: str) -> list[str]:
         if _SO_COLUNA.match(limpo):
             fora.append(limpo.split()[0])
     return fora
+
+
+def _colunas_bin(sql: str) -> set[str]:
+    """Colunas que sairam com `COLLATE utf8mb4_bin` no `CREATE TABLE` (4.6.8)."""
+    return {casado.group("col") for casado in _COLACAO_NA_COLUNA.finditer(sql)}
+
+
+def _criados_por_tabela(comandos: list[str]) -> dict[str, str]:
+    """`CREATE TABLE` **traduzido** por nome de tabela (o resto do script fica fora)."""
+    tabelas: dict[str, str] = {}
+    for comando in comandos:
+        achado = _TABELA.search(comando)
+        if achado:
+            tabelas[achado.group(1)] = sqlcompat.translate(comando)[0]
+    return tabelas
 
 
 def _tipos_das_tabelas(comandos: list[str]) -> dict[str, dict[str, str]]:
@@ -423,6 +442,56 @@ class MarcadorTest(unittest.TestCase):
         self.assertEqual(sqlcompat.convert_params((True,)), [1])
 
 
+class IgualdadeNulaTest(unittest.TestCase):
+    """`x IS ?` -> `x <=> %s`: a igualdade que nao perde NULL (regra 26).
+
+    O SQLite aceita `IS` com valor (nao so `IS NULL`) e o MySQL nao: sem a regra
+    a consulta de `db.queue_position` (`db.py:1263`) morre com 1064 no boot.
+    """
+
+    def test_is_com_valor_vira_null_safe(self):
+        sql, params = sqlcompat.translate(
+            "SELECT COUNT(*) AS n FROM pending_routes"
+            " WHERE status = 'waiting' AND id < ? AND (team_id IS ?) AND kind = 'chat'",
+            (828, 1),
+        )
+        self.assertIn("(team_id <=> %s)", sql)
+        self.assertEqual(params, [828, 1])
+
+    def test_is_com_null_tambem_vira_null_safe(self):
+        sql, params = sqlcompat.translate("SELECT 1 FROM t WHERE team_id IS ?", (None,))
+        self.assertEqual(sql, "SELECT 1 FROM t WHERE team_id <=> %s")
+        self.assertEqual(params, [None])
+
+    def test_is_not_com_parametro_nega_o_null_safe(self):
+        sql, params = sqlcompat.translate("SELECT 1 FROM t WHERE team_id IS NOT ?", (3,))
+        self.assertEqual(sql, "SELECT 1 FROM t WHERE NOT (team_id <=> %s)")
+        self.assertEqual(params, [3])
+
+    def test_is_null_e_is_not_null_seguem_como_estao(self):
+        sql, params = sqlcompat.translate(
+            "SELECT 1 FROM t WHERE a IS NULL AND b IS NOT NULL", None
+        )
+        self.assertEqual(sql, "SELECT 1 FROM t WHERE a IS NULL AND b IS NOT NULL")
+        self.assertIsNone(params)
+
+    def test_is_em_literal_ou_comentario_nao_e_tocado(self):
+        sql, _ = sqlcompat.translate(
+            "SELECT 1 FROM t WHERE nome = 'x IS ?' AND nome2 = ? -- y IS ?", ("a",)
+        )
+        self.assertIn("nome = 'x IS ?'", sql)
+        self.assertIn("-- y IS ?", sql)
+
+    def test_is_com_coluna_entre_crases(self):
+        """A mascara apaga o conteudo entre crases: a regra nao pode pular a coluna."""
+        sql, _ = sqlcompat.translate("SELECT 1 FROM t WHERE `team_id` IS ?", (1,))
+        self.assertEqual(sql, "SELECT 1 FROM t WHERE `team_id` <=> %s")
+
+    def test_is_com_operador_composto_falha_alto(self):
+        with self.assertRaises(sqlcompat.SqlCompatError):
+            sqlcompat.translate("SELECT 1 FROM t WHERE `t`.`c` IS ?", (1,))
+
+
 class DmlTest(unittest.TestCase):
     """Upsert e concatenacao do SQLite para o do MySQL (5.2)."""
 
@@ -506,11 +575,56 @@ class DdlTest(unittest.TestCase):
         self.assertNotIn("datetime('now')", sql)
 
     def test_chave_texto_vira_varchar(self):
+        """`TEXT` em chave vira `VARCHAR(191)` e a chave leva a colacao `_bin`.
+
+        O `=`/`UNIQUE` do SQLite e *case-sensitive*: sem `COLLATE utf8mb4_bin` o
+        destino (`ai_ci`) trataria `Ana` e `ana` como a mesma chave (4.6.8/5.5c).
+        """
         sql, _ = sqlcompat.translate(
             "CREATE TABLE queues (address TEXT PRIMARY KEY, name TEXT NOT NULL)"
         )
-        self.assertIn("address VARCHAR(191) PRIMARY KEY", sql)
+        self.assertIn("address VARCHAR(191) COLLATE utf8mb4_bin PRIMARY KEY", sql)
         self.assertIn("name TEXT NOT NULL", sql)
+        self.assertNotIn("name TEXT COLLATE", sql)
+
+    def test_colacao_bin_nas_tres_origens_de_igualdade(self):
+        """Chave, filha de FK e a lista do 5.5c levam `COLLATE utf8mb4_bin`.
+
+        `detail` fica no default (`ai_ci`): o 4.6.8 so marca igualdade/chave, e a
+        busca `LIKE '%termo%'` do painel conta com o `ai_ci`.
+        """
+        sql, _ = sqlcompat.translate(
+            "CREATE TABLE t (\n"
+            "   id INTEGER PRIMARY KEY AUTOINCREMENT,\n"
+            "   address TEXT NOT NULL,\n"
+            "   status TEXT NOT NULL DEFAULT 'waiting',\n"
+            "   queue_address TEXT NOT NULL REFERENCES queues(address),\n"
+            "   detail TEXT NOT NULL DEFAULT '',\n"
+            "   UNIQUE (address)\n"
+            ")"
+        )
+        self.assertIn("address TEXT COLLATE utf8mb4_bin NOT NULL", sql)
+        self.assertIn("status TEXT COLLATE utf8mb4_bin NOT NULL DEFAULT ('waiting')", sql)
+        self.assertIn("queue_address TEXT COLLATE utf8mb4_bin NOT NULL", sql)
+        self.assertIn("detail TEXT NOT NULL DEFAULT ('')", sql)
+        self.assertNotIn("detail TEXT COLLATE", sql)
+
+    def test_colacao_do_alter_so_na_coluna_de_igualdade(self):
+        """`ALTER ... ADD COLUMN` da migracao do `db.py` tambem recebe a colacao.
+
+        `queue_operators.source` (lista do 5.5c) nasce por `ALTER` em banco antigo;
+        sem a regra a coluna do banco migrado ficaria `ai_ci` e divergiria do
+        schema novo. A coluna fora da lista fica intocada.
+        """
+        sql, _ = sqlcompat.translate(
+            "ALTER TABLE queue_operators ADD COLUMN source TEXT NOT NULL DEFAULT 'toa'"
+        )
+        self.assertIn("ADD COLUMN source TEXT COLLATE utf8mb4_bin NOT NULL DEFAULT ('toa')", sql)
+        sql, _ = sqlcompat.translate(
+            "ALTER TABLE analyst_load ADD COLUMN casos_toa_keys TEXT NOT NULL DEFAULT ''"
+        )
+        self.assertIn("casos_toa_keys TEXT NOT NULL DEFAULT ('')", sql)
+        self.assertNotIn("casos_toa_keys TEXT COLLATE", sql)
 
     def test_default_de_texto_ganha_parenteses(self):
         sql, _ = sqlcompat.translate(
@@ -542,7 +656,7 @@ class DdlTest(unittest.TestCase):
             "   value TEXT NOT NULL\n"
             ")"
         )
-        self.assertIn("`key` VARCHAR(191) PRIMARY KEY", sql)
+        self.assertIn("`key` VARCHAR(191) COLLATE utf8mb4_bin PRIMARY KEY", sql)
         self.assertIn("PRIMARY KEY", sql)
         self.assertNotIn("PRIMARY `KEY`", sql)
 
@@ -622,7 +736,9 @@ class DdlTest(unittest.TestCase):
         nenhuma**: a referencia sumia em silencio (medido: 31 tabelas, 0 FKs).
         Agora cada uma vira `CONSTRAINT fk_<tabela>_<coluna> FOREIGN KEY` no fim
         do corpo, e a coluna `INTEGER` da ponta filha vira `BIGINT` (o id do
-        SQLite nasce `BIGINT NOT NULL AUTO_INCREMENT`).
+        SQLite nasce `BIGINT NOT NULL AUTO_INCREMENT`). A ponta filha de **texto**
+        tambem leva `COLLATE utf8mb4_bin`: o InnoDB exige a mesma colacao das duas
+        pontas (erro 3780) e o pai de uma FK de texto e sempre chave.
         """
         sql, _ = sqlcompat.translate(
             "CREATE TABLE menu_queues (\n"
@@ -635,7 +751,7 @@ class DdlTest(unittest.TestCase):
         )
         self.assertIn("menu_id BIGINT NOT NULL", sql)
         self.assertNotIn("INTEGER", sql)
-        self.assertIn("queue_address VARCHAR(191) NOT NULL", sql)
+        self.assertIn("queue_address VARCHAR(191) COLLATE utf8mb4_bin NOT NULL", sql)
         self.assertIn(
             "CONSTRAINT fk_menu_queues_menu_id FOREIGN KEY (menu_id)"
             " REFERENCES menus(id) ON DELETE CASCADE",
@@ -731,7 +847,9 @@ class SchemaCompletoTest(unittest.TestCase):
     def test_chaves_de_texto_viraram_varchar(self):
         criados = [c for c in self.comandos if "PRIMARY KEY" in c.upper()]
         traduzidos = [sqlcompat.translate(c)[0] for c in criados]
-        self.assertTrue(any("VARCHAR(191) PRIMARY KEY" in sql for sql in traduzidos))
+        self.assertTrue(
+            any("VARCHAR(191) COLLATE utf8mb4_bin PRIMARY KEY" in sql for sql in traduzidos)
+        )
 
     def test_pragma_de_fk_do_schema_sai_no_mysql(self):
         """O `schema.sql` mantem o PRAGMA (o SQLite precisa dele) e o MySQL nao.
@@ -759,6 +877,49 @@ class SchemaCompletoTest(unittest.TestCase):
                 if sqlcompat._ITEM_DE_TABELA.match(item):
                     continue
                 self.assertNotIn("REFERENCES", item.upper(), sql[:60])
+
+    def test_colacao_bin_na_pk_do_queue_operators(self):
+        """O `queue_operators` do gate da Fase 5 nasce com a PK `_bin` (era o 1062).
+
+        A origem real guarda `u:N5932208@clarosa` e `u:n5932208@clarosa` na **mesma**
+        fila: o `=` do SQLite e BINARY e aceita as duas, o `utf8mb4_0900_ai_ci` do
+        MySQL colapsa as duas na chave primaria — `Duplicate entry
+        'u:N5932208@clarosa' for key 'queue_operators.PRIMARY'` (erro 1062) no
+        `LOAD DATA`/`INSERT` da migracao.
+        """
+        por_tabela = _criados_por_tabela(self.comandos)
+        operadores = por_tabela["queue_operators"]
+        self.assertIn("queue_address VARCHAR(191) COLLATE utf8mb4_bin NOT NULL", operadores)
+        self.assertIn("address VARCHAR(191) COLLATE utf8mb4_bin NOT NULL", operadores)
+        self.assertIn("PRIMARY KEY (queue_address, address)", operadores)
+        self.assertIn(
+            "address VARCHAR(191) COLLATE utf8mb4_bin PRIMARY KEY", por_tabela["queues"]
+        )
+        self.assertIn(
+            "`key` VARCHAR(191) COLLATE utf8mb4_bin PRIMARY KEY", por_tabela["bot_settings"]
+        )
+        # Coluna comum segue no default: o `LIKE` do painel depende do `ai_ci`.
+        self.assertNotIn("COLLATE", por_tabela["teams"])
+
+    def test_colacao_das_pontas_de_fk_bate(self):
+        """Toda FK entre colunas de texto tem a mesma colacao nas duas pontas.
+
+        O InnoDB recusa o par com colacoes diferentes (erro 3780: filha `ai_ci`
+        contra pai `_bin` falha). Pai de FK de texto e sempre chave, entao a filha
+        tem de sair `_bin` junto — e e isso que a regra das tres origens garante.
+        """
+        por_tabela = _criados_por_tabela(self.comandos)
+        bin_por_tabela = {t: _colunas_bin(sql) for t, sql in por_tabela.items()}
+        total = 0
+        for tabela, sql in por_tabela.items():
+            for filha, pai, referenciada in _FK.findall(sql):
+                total += 1
+                self.assertEqual(
+                    filha in bin_por_tabela[tabela],
+                    referenciada in bin_por_tabela.get(pai, set()),
+                    "%s.%s -> %s.%s" % (tabela, filha, pai, referenciada),
+                )
+        self.assertGreater(total, 20)
 
     def test_contagem_de_fk_bate_com_o_schema(self):
         """Cada `REFERENCES` inline do schema virou um `FOREIGN KEY` explicito.
@@ -1220,6 +1381,55 @@ class FachadaTest(unittest.TestCase):
         self.assertEqual([lote[0] for lote in lotes], [1, 2])
         for lote in lotes:
             self.assertTrue(perto(lote[1]), lote)
+
+    def test_execute_com_is_parametro_manda_null_safe(self):   # db.py:1263
+        self.bruta.colunas = ("n",)
+        self.bruta.linhas = []
+        self.conn.execute(
+            "SELECT COUNT(*) AS n FROM pending_routes"
+            " WHERE status = 'waiting' AND id < ? AND (team_id IS ?) AND kind = 'chat'",
+            (828, 1),
+        )
+        sql, params = self.bruta.recebidos[-1]
+        self.assertEqual(
+            sql,
+            "SELECT COUNT(*) AS n FROM pending_routes WHERE status = 'waiting'"
+            " AND id < %s AND (team_id <=> %s) AND kind = 'chat'",
+        )
+        self.assertEqual(tuple(params), (828, 1))
+
+    def test_executemany_simples_usa_o_lote_do_driver(self):
+        antes = len(self.bruta.recebidos)
+        self.conn.executemany(
+            "INSERT INTO group_teams (group_id, team_id) VALUES (?, ?)", [(1, 2), (1, 3)]
+        )
+        novos = self.bruta.recebidos[antes:]
+        self.assertEqual(len(novos), 1)                        # um lote, nao duas linhas
+        sql, lotes = novos[0]
+        self.assertEqual(sql, "INSERT INTO group_teams (group_id, team_id) VALUES (%s, %s)")
+        self.assertEqual(lotes, [(1, 2), (1, 3)])
+
+    def test_executemany_com_agora_fora_do_values_vai_linha_a_linha(self):  # db.py:937
+        """O atalho `RE_INSERT_VALUES` do PyMySQL so aceita marcador no `VALUES`."""
+        antes = len(self.bruta.recebidos)
+        self.conn.executemany(
+            "INSERT INTO queues (address, name) VALUES (?, ?)\n"
+            "   ON CONFLICT (address) DO UPDATE\n"
+            "   SET name = COALESCE(NULLIF(excluded.name, ''), queues.name),\n"
+            "       last_seen = datetime('now')",
+            [("h:a", "A"), ("h:b", "B")],
+        )
+        novos = self.bruta.recebidos[antes:]
+        self.assertEqual(len(novos), 2)                        # linha a linha
+        for sql, params in novos:
+            self.assertEqual(
+                " ".join(sql.split()),
+                "INSERT INTO queues (address, name) VALUES (%s, %s) AS new"
+                " ON DUPLICATE KEY UPDATE name = COALESCE(NULLIF(new.name, ''),"
+                " queues.name), last_seen = %s",
+            )
+            self.assertEqual(len(params), 3)                   # 2 do VALUES + o agora
+        self.assertEqual([params[0] for _, params in novos], ["h:a", "h:b"])
 
     def test_executescript_comando_a_comando(self):
         antes = len(self.bruta.recebidos)

@@ -1,4 +1,5 @@
 .env
+.env.prod-*
 .session.json
 .bot.lock
 .chrome-profile/

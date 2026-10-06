@@ -485,7 +485,9 @@ _CREATE_TABELA = re.compile(
     re.I,
 )
 _ITEM_DE_TABELA = re.compile(
-    r"^\s*(?:CONSTRAINT|PRIMARY\s+KEY|UNIQUE|FOREIGN\s+KEY|CHECK|KEY|INDEX)\b", re.I
+    r"^\s*(?:CONSTRAINT\s+[A-Za-z_][\w$]*\s+)?"
+    r"(?:PRIMARY\s+KEY|UNIQUE|FOREIGN\s+KEY|CHECK|KEY|INDEX)\s*\(",
+    re.I,
 )
 _COLUNA_FK = re.compile(r"^\s*(?P<col>[A-Za-z_][\w$]*)\b")
 _REFERENCES_INLINE = re.compile(
@@ -546,6 +548,187 @@ def _fk_de_coluna(sql: str) -> str:
     if not fks:
         return sql
     return "%s\n  %s\n%s" % (sql[: abre + 1], ",\n  ".join(itens + fks), sql[fecha:])
+
+
+# ------------------------------------------- colacao das colunas (4.6.8 / 5.5c)
+#
+# O `=` e os `UNIQUE` do SQLite sao *case-sensitive* (comparacao BINARY) e o
+# default do MySQL nao e (`utf8mb4_0900_ai_ci`). Sem `utf8mb4_bin` o destino
+# colapsa chaves que so diferem na caixa e a carga morre em 1062 — como na
+# origem real, onde `queue_operators` guarda `u:N5932208@clarosa` e
+# `u:n5932208@clarosa` na mesma fila (duas linhas no SQLite, uma so no
+# `ai_ci`: `Duplicate entry ... for key 'queue_operators.PRIMARY'`).
+
+_COLACAO_BIN = "COLLATE utf8mb4_bin"
+# 5.5(c): colunas de igualdade que **nao** sao chave (a lista e a do doc; as
+# chaves entram pela propria declaracao, sem lista).
+_COLUNAS_DE_IGUALDADE = frozenset(
+    (
+        "login",
+        "slug",
+        "address",
+        "queue_address",
+        "case_key",
+        "perm_key",
+        "status",
+        "kind",
+        "source",
+        "result",
+        "op",
+    )
+)
+_TIPO_DE_TEXTO = r"(?:VARCHAR|TEXT|CHAR|NVARCHAR|CLOB)(?:\s*\(\s*\d+\s*\))?"
+# O nome da coluna pode vir cru (`case_key`) ou escapado pelo
+# `_escapa_identificadores` (`` `key` `` do `bot_settings`) — e o nome real so
+# existe no texto **nao mascarado**, porque a mascara apaga o interior das crases.
+_IDENTIFICADOR = r"(?:`(?P<citado>[^`]+)`|(?P<declarado>[A-Za-z_][\w$]*))"
+_NOME_DE_COLUNA = re.compile("^" + _IDENTIFICADOR + r"(?:\s+|$)")
+_COLUNA_TEXTO = re.compile(
+    "^" + _IDENTIFICADOR + r"\s+(?P<tipo>%s)" % _TIPO_DE_TEXTO, re.I
+)
+_CHAVE_DE_TABELA = re.compile(
+    r"^\s*(?:CONSTRAINT\s+[A-Za-z_][\w$]*\s+)?"
+    r"(?:PRIMARY\s+KEY|UNIQUE(?:\s+(?:KEY|INDEX))?(?:\s+[A-Za-z_][\w$]*)?|FOREIGN\s+KEY"
+    r"|(?:KEY|INDEX)(?:\s+[A-Za-z_][\w$]*)?)\s*\((?P<colunas>[^)]*)\)",
+    re.I,
+)
+_CHAVE_NA_COLUNA = re.compile(r"\b(?:PRIMARY\s+KEY|UNIQUE)\b", re.I)
+_COLACAO = re.compile(r"\bCOLLATE\b", re.I)
+_ADD_COLUNA = re.compile(
+    r"\bADD\s+COLUMN\s+(?P<col>`?[A-Za-z_][\w$]*`?)\s+(?P<tipo>%s)" % _TIPO_DE_TEXTO,
+    re.I,
+)
+
+
+
+def _sem_comentario(item: str) -> int:
+    """Indice em que a definicao do item comeca (pula comentario/espaco).
+
+    Os corpos do `schema.sql` tem comentario no meio dos itens (`pending_routes`
+    explica `case_key`, `chats` explica `linked_form_chat_id`): sem pular esse
+    texto o nome da coluna nao seria lido e a coluna de igualdade passaria sem
+    `COLLATE`. A mascara ja trocou o comentario por espaco (preservando o
+    `\\n`), entao basta medir o quanto sobra a esquerda.
+    """
+    mascarado = _mask(item)
+    return len(mascarado) - len(mascarado.lstrip())
+
+
+def _coluna_do_item(item: str) -> str:
+    """Nome (minusculo) da coluna que abre o item vazio quando nao e coluna."""
+    casado = _NOME_DE_COLUNA.match(item[_sem_comentario(item) :])
+    if not casado:
+        return ""
+    return (casado.group("citado") or casado.group("declarado")).lower()
+
+
+def _colunas_de_igualdade(corpo: str, mask: str) -> set[str]:
+    """Colunas de texto que precisam de `utf8mb4_bin` (4.6.8 + 5.5(c)).
+
+    Tres origens, pelo mesmo motivo (fidelidade ao `=` e ao `UNIQUE` do SQLite):
+
+    * o nome esta na lista de colunas de igualdade do 5.5(c);
+    * a coluna e chave da tabela (`PRIMARY KEY`/`UNIQUE`, inclusive composta);
+    * a coluna e ponta **filha** de FK: o InnoDB exige a **mesma** colacao nas
+      duas pontas (erro 3780) e o pai de uma FK de texto e sempre chave.
+    """
+    nomes: set[str] = set()
+    for item in _split_args(corpo, mask):
+        definicao = item.strip()
+        if not definicao:
+            continue
+        mascarado = _mask(definicao)[_sem_comentario(definicao) :]
+        if _ITEM_DE_TABELA.match(mascarado):
+            chave = _CHAVE_DE_TABELA.match(mascarado)
+            for pedaco in chave.group("colunas").split(",") if chave else []:
+                coluna = _NOME_DE_COLUNA.match(pedaco.strip())
+                if coluna:
+                    nome = coluna.group("citado") or coluna.group("declarado")
+                    nomes.add(nome.lower())
+            continue
+        nome = _coluna_do_item(definicao)
+        if not nome:
+            continue
+        if (
+            nome in _COLUNAS_DE_IGUALDADE
+            or _CHAVE_NA_COLUNA.search(mascarado)
+            or _REFERENCES_INLINE.search(mascarado)
+        ):
+            nomes.add(nome)
+    return nomes
+
+
+def _colacao_de_igualdade(sql: str) -> str:
+    """`COLLATE utf8mb4_bin` nas colunas de igualdade/chave (4.6.8, 5.5c).
+
+    Roda **depois** do `_TEXTO_CHAVE` (que troca `TEXT` por `VARCHAR(191)` nas
+    chaves: `TEXT COLLATE ... PRIMARY KEY` nao casaria mais o regex dele) e
+    escreve o `COLLATE` logo depois do tipo, que e a ordem canonica do MySQL
+    (`VARCHAR(191) COLLATE utf8mb4_bin PRIMARY KEY`) — o `NOT NULL`/`DEFAULT`/
+    `CHECK` inline da coluna continua intacto.
+
+    Sao dois caminhos porque o schema nasce de dois jeitos: o `CREATE TABLE`
+    (schema novo) e o `ALTER TABLE ... ADD COLUMN` das migracoes de banco antigo
+    do `db.py` (que nao passa pelo `CREATE`).
+    """
+    if _CREATE_TABELA.search(sql):
+        return _colacao_no_create(sql)
+    return _colacao_no_alter(sql)
+
+
+def _colacao_no_create(sql: str) -> str:
+    """`CREATE TABLE`: chave (`PRIMARY KEY`/`UNIQUE`), filha de FK e lista 5.5(c)."""
+    cabeca = _CREATE_TABELA.search(sql)
+    abre = cabeca.start("abre")
+    mask = _mask(sql)
+    fecha = _match_paren(mask, abre)
+    corpo = sql[abre + 1 : fecha]
+    nomes = _colunas_de_igualdade(corpo, mask[abre + 1 : fecha])
+    if not nomes:
+        return sql
+    itens: list[str] = []
+    mudou = False
+    for item in _split_args(corpo, mask[abre + 1 : fecha]):
+        limpo = item.strip()
+        if not limpo:
+            continue
+        inicio = _sem_comentario(limpo)
+        alvo = _COLUNA_TEXTO.match(limpo[inicio:])
+        if alvo and _coluna_do_item(limpo) in nomes and not _COLACAO.search(_mask(limpo)):
+            fim = inicio + alvo.end("tipo")
+            limpo = "%s %s%s" % (limpo[:fim], _COLACAO_BIN, limpo[fim:])
+            mudou = True
+        itens.append(limpo)
+    if not mudou:
+        return sql
+    return "%s\n  %s\n%s" % (sql[: abre + 1], ",\n  ".join(itens), sql[fecha:])
+
+
+def _colacao_no_alter(sql: str) -> str:
+    """`ALTER TABLE ... ADD COLUMN` de coluna de igualdade ganha a colacao.
+
+    A migracao de banco antigo do `db.py` cria colunas fora do `CREATE TABLE`
+    (por ex. `queue_operators.source`, que esta na lista do 5.5c): sem isto a
+    coluna nascida por `ALTER` ficaria `ai_ci` e divergiria do schema novo. Sem
+    lista de chaves a mao, so o nome da coluna decide — e o unico sinal
+    disponivel.
+    """
+    if not _ADD_COLUNA.search(_mask(sql)):
+        return sql
+    mask = _mask(sql)
+    itens: list[str] = []
+    mudou = False
+    for item in _split_args(sql, mask):
+        limpo = item.strip()
+        achado = _ADD_COLUNA.search(_mask(limpo))
+        if achado and achado.group("col").lower() in _COLUNAS_DE_IGUALDADE:
+            fim = achado.end("tipo")
+            limpo = "%s %s%s" % (limpo[:fim], _COLACAO_BIN, limpo[fim:])
+            mudou = True
+        itens.append(limpo)
+    if not mudou:
+        return sql
+    return ", ".join(itens)
 
 
 # ------------------------------------------------------------ indices (secao 5.3)
@@ -629,6 +812,7 @@ def _rewrite_ddl(sql: str) -> str:
         lambda m: "RENAME TABLE %s TO %s" % (m.group("tabela"), m.group("novo")), sql
     )
     sql = _TEXTO_CHAVE.sub(_texto_para_varchar, sql)
+    sql = _colacao_de_igualdade(sql)
     sql = _DEFAULT_TEXTO.sub(r"DEFAULT ('\1')", sql)
     return _adiciona_fk(_rewrite_indices(_fk_de_coluna(sql)))
 
@@ -846,6 +1030,45 @@ def _rewrite_concat(sql: str) -> str:
     return sql
 
 
+# O SQLite usa `IS` onde o MySQL so aceita `<=>`: `x IS ?` vale tambem quando o
+# valor e NULL (e o `=` do MySQL devolveria NULL, filtrando a linha).
+_IS_PARAM = re.compile(
+    r"(?P<esq>`[^`]+`|[A-Za-z_][\w.$]*\s*\([^()]*\)|[A-Za-z_][\w.$]*|\([^()]*\))"
+    r"\s+IS\s+(?P<negado>NOT\s+)?(?P<dir>\?)",
+    re.I,
+)
+
+
+def _rewrite_is(sql: str) -> str:
+    """`x IS ?` -> `x <=> %s` (regra 26: igualdade que nao perde NULL).
+
+    `IS NULL` e `IS NOT NULL` ficam como estao - o MySQL entende os dois, e so o
+    lado direito vindo por parametro precisa da reescrita (`x IS 3` nao e o mesmo
+    teste que `x IS NULL`). O operando a esquerda aceito e coluna, identificador
+    entre crases, chamada de funcao ou parenteses fechados; qualquer outra coisa
+    falha alto em vez de virar SQL torto.
+    """
+    mask = _mask(sql)
+    for casado in reversed(list(_IS_PARAM.finditer(sql))):
+        ini, fim = casado.span()
+        # `_mask` apaga o CONTEUDO de literais, comentarios e do que vem entre
+        # crases: comparar so o inicio basta (a crase de uma coluna continua na
+        # mascara; ja um `IS ?` dentro de `'...'` ou de comentario comeca em espaco).
+        if mask[ini] != sql[ini]:
+            continue
+        antes = sql[ini - 1] if ini else ""
+        if antes.isalnum() or antes in "_$.)":
+            raise SqlCompatError(
+                "`IS ?` com operador a esquerda composto: escreva `<=> ?` direto "
+                "na consulta: %r" % sql[max(0, ini - 24):fim + 8]
+            )
+        troca = "%s <=> %s" % (casado.group("esq"), casado.group("dir"))
+        if casado.group("negado"):
+            troca = "NOT (%s)" % troca
+        sql = sql[:ini] + troca + sql[fim:]
+    return sql
+
+
 def _placeholders(sql: str) -> str:
     """`?` -> `%s`, so fora de literal/comentario (regra 1)."""
     mask = _mask(sql)
@@ -972,6 +1195,7 @@ def translate(sql: str, params: Sequence[Any] | None = None) -> tuple[str, list[
     if "||" in _mask(sql):
         sql = _rewrite_concat(sql)
     sql = _escapa_identificadores(sql)
+    sql = _rewrite_is(sql)
     sql = _placeholders(sql)
     _confere_params(sql, dados)
     return sql, dados
@@ -1081,6 +1305,36 @@ def _driver_obrigatorio():
     return _pymysql
 
 
+# ------------------------------------------------- executemany (lote no driver)
+
+_RE_GRUPO_VALUES = re.compile(
+    r"^\s*(?:INSERT|REPLACE)\b.*?\bVALUES?\s*(?P<grupo>\([^()]*\))", re.I | re.S
+)
+
+
+def _marcadores(texto: str) -> int:
+    """Conta os `%s` de verdade de um SQL ja traduzido (`%%` e literal)."""
+    return texto.replace("%%", "").count("%s")
+
+
+def _atalho_do_driver(texto: str, lote: Sequence[Any]) -> bool:
+    """True quando o atalho de lote do PyMySQL (`RE_INSERT_VALUES`) pode ser usado.
+
+    Num `INSERT ... VALUES (...)` o driver nao repassa `(sql, args)` ao servidor:
+    ele acha o grupo do `VALUES` e monta `prefixo + grupo % linha + ON DUPLICATE...`,
+    ou seja, entrega **a linha inteira** so para esse grupo. Isso so fecha quando
+    todos os `%s` da instrucao estao dentro do grupo; quando o tradutor injeta
+    parametro fora dele (o "agora" do `SET last_seen = ...` ou um `LIKE` do `WHERE`),
+    o `%`-formatting do driver estoura no cliente com "not all arguments converted
+    during string formatting" (medido no boot local, MySQL 8.0.44). Fora desse
+    caso quem executa linha a linha e a propria fachada.
+    """
+    casado = _RE_GRUPO_VALUES.match(texto)
+    if not casado:
+        return False
+    return len(lote) == _marcadores(casado.group("grupo")) == _marcadores(texto)
+
+
 class _MySQLCursor:
     """Cursor com a cara do `sqlite3.Cursor` (linha de `dict` por padrao)."""
 
@@ -1114,7 +1368,14 @@ class _MySQLCursor:
             _, novos = translate(sql, linha)       # o "agora" e por linha
             lotes.append(tuple(novos or ()))
         self._ignorado = False
-        self._bruto.executemany(texto, lotes)
+        if _atalho_do_driver(texto, lotes[0]):
+            self._bruto.executemany(texto, lotes)
+            return self
+        total = 0
+        for lote in lotes:                         # linha a linha (parametro fora do VALUES)
+            self._bruto.execute(texto, lote or None)
+            total += int(self._bruto.rowcount or 0)
+        self._bruto.rowcount = total
         return self
 
     def executescript(self, script):

@@ -362,6 +362,10 @@ CREATE TABLE IF NOT EXISTS analyst_load (
   form_ocioso_min REAL NOT NULL DEFAULT 0,
   form_presente_toa INTEGER NOT NULL DEFAULT 0,
   toa_ok INTEGER NOT NULL DEFAULT 0,
+  -- Chaves de caso lidas do TOA nesta volta (servem a afinidade por analista):
+  -- a coluna nasce aqui e nao so nas migracoes, senao a carga de origem para o
+  -- MySQL morreria em 1054 (drift de coluna legada).
+  casos_toa_keys TEXT NOT NULL DEFAULT '',
   detail TEXT NOT NULL DEFAULT ''
 );
 

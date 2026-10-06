@@ -1,10 +1,12 @@
 # botsqlite → MySQL 8 — plano de mudança completo (fase a fase)
 
-**Status:** EM EXECUCAO — Fase 1 (shim + testes), o DDL da Fase 2 e o nucleo do boot da Fase 4
-estao feitos e medidos: suite Python **487 casos / 0 falhas** e boot real validado em MySQL 8.0.44
-local (**31 tabelas / 30 FKs**, FK viva, `ensure_schema` idempotente). Falta: migrador
-(`bin/migrar_sqlite_para_mysql.py`), painel PHP (Fase 3), ensaio com dados reais (Fase 5) e cutover
-(Fase 6). Nada foi aplicado na base corporativa `chat_bot_toa`.
+**Status:** EM EXECUCAO — Fases 1, 2 e 3 concluidas e medidas: suite Python **501 casos / 0 falhas**,
+DDL + carga de **31/31 tabelas** sem 1054 (`--check` = 0 diferenca) e o painel PHP operando em MySQL
+8.0.44 (**MYSQL PAINEL OK**: 13 abas, gravacao, colacao e filtros de data). A **Fase 4 esta em ensaio**
+(bot real em `DB_BACKEND=mysql`): o boot E2E expos dois erros de runtime que o SQLite escondia —
+armadilhas 28 e 29 — ja corrigidos no tradutor (regra 26 + caminho linha-a-linha do `executemany`,
+4.2), com o boot subindo limpo e a suite reexecutada em 501/0. Falta: ensaio com dados
+reais (Fase 5) e cutover (Fase 6). Nada foi aplicado na base corporativa `chat_bot_toa`.
 **Alvo:** bot Python + painel PHP operando 100% em **MySQL 8.0.44** (servidor corporativo
 `10.70.107.52`, base `chat_bot_toa`), **mantendo** a suíte de testes rodando **offline** (SQLite
 em memória / arquivo temporário) na máquina de desenvolvimento.
@@ -34,9 +36,9 @@ em memória / arquivo temporário) na máquina de desenvolvimento.
 - Bot Python gravando/lendo **apenas MySQL** em produção.
 - Painel PHP acessando o **mesmo** MySQL (base `chat_bot_toa`).
 - Migrar os dados existentes do SQLite (`data/helptoa.sqlite`) para o MySQL sem perda.
-- **Todos** os testes Python (**24 arquivos / 487 casos** — medidos agora, todos verdes; 23 deles
+- **Todos** os testes Python (**24 arquivos / 501 casos** — medidos agora, todos verdes; 23 deles
   são os que já existiam) e as
-  suítes PHP (10 arquivos + `tests/_panel_render.php`) continuam
+  suítes PHP (12 arquivos + `tests/_panel_render.php`) continuam
   rodando **localmente e offline** contra SQLite, sem tocar no banco corporativo.
 
 **Não-objetivos (agora)**
@@ -105,8 +107,8 @@ Descoberta **read-only** via ODBC (sem cliente MySQL instalado localmente):
 | `wait_timeout` | **300 s** | o bot é de longa duração → precisa de `ping()`/reconexão na camada de conexão |
 | `lower_case_table_names` | **0** | nomes de tabela/coluna são *case-sensitive* → os nomes atuais (minúsculos) devem ser preservados |
 | Base `chat_bot_toa` | existe e está **vazia** | não é preciso dropar nada; migração pode semear do zero |
-| Permissões do usuário | `ALL PRIVILEGES` na base, **sem `CREATE DATABASE`** | o banco de **teste** precisa ser criado pelo DBA |
-| Driver MySQL local (PHP) | `pdo_mysql` **não carregado** | Fase 0 deve habilitar em `C:\tools\php83\php.ini` |
+| Permissões do usuário | `ALL PRIVILEGES` **só** em `chat\_bot\_toa` (`SHOW GRANTS`: `USAGE ON *.*` + `ALL ON chat\_bot\_toa.*`); a base `botsqlite_test` **não** aparece no `SHOW DATABASES` dele | conectar com essa credencial em base de teste dá **1044** (`Access denied ... to database 'botsqlite_test'`) — não é limite de conexões. Por isso o gate da Fase 2/3 roda em um **MySQL 8 local de teste** (`127.0.0.1:3307`, datadir `C:\tools\mysql-data`) |
+| Driver MySQL local (PHP) | `pdo_mysql` **habilitado** em `C:\tools\php83\php.ini` (linha 954, 06/10/2026) | era o unico bloqueio do painel em MySQL; o DLL ja vinha na pasta `ext` |
 | Driver MySQL local (Python) | **nenhum** instalado | Fase 0 instala `PyMySQL` (PyPI:443 alcançável) |
 | Driver ODBC | presente (usado para inspecionar) | permite auditorias sem instalar cliente MySQL |
 
@@ -165,6 +167,11 @@ Classes internas:
   `close()`, `ping()`; aceita `.row_factory` (ignorado, o retorno já é `dict`).
 - `_MySQLCursor`: `execute()`, `executemany()`, `fetchone/fetchall/fetchmany`, `__iter__`,
   `rowcount`, `lastrowid`, `description`, `close()`, `arraysize`.
+  O `executemany` tem **dois caminhos**: usa o lote do driver (que cola `(…),(…),(…)` via
+  `RE_INSERT_VALUES`) só quando **todo** `%s` está dentro do grupo do `VALUES`; se o tradutor
+  injetou parâmetro **fora** dele (o `datetime('now')` do `ON DUPLICATE KEY`), o lote do driver
+  não existe — o `postfix` é concatenado sem formatação — e a fachada executa **linha a linha**
+  (armadilha 29). O `INSERT` do migrador (`INSERT IGNORE … VALUES (…)`) continua no lote.
 
 **Contrato de compatibilidade com o código atual (não negociável):**
 
@@ -399,10 +406,16 @@ python bin/migrar_sqlite_para_mysql.py --only chats,pending_routes,route_assignm
   `INSERT IGNORE`/`REPLACE` nas tabelas de chave natural e reporta conflitos.
 - Ao final, reajusta `AUTO_INCREMENT` de cada tabela para `MAX(id)+1` (necessário porque a seed
   de `permission_groups` grava `id=1` explícito).
+- **Drift de coluna legada (corrigido em 06/10/2026).** A lista de colunas da carga sai do
+  **destino** (`information_schema.columns`), não da origem: coluna que só existe na origem entra
+  como `AVISO` no relatório e fica fora do `INSERT`, em vez de derrubar a tabela inteira com
+  **1054**. Eram duas: `bot_jobs.payload` (código morto — segue fora, com aviso) e
+  `analyst_load.casos_toa_keys` (coluna **viva**, usada por `db.py::_migrate_load`): essa entrou no
+  `schema.sql`, então agora é criada junto com a tabela e a cópia acontece normal.
 
 ### 4.10 Testes locais (Python + PHP) — o que muda e o que **não** muda
 
-**Não muda:** nenhum dos 24 arquivos Python (487 casos) / 10 suítes PHP passa a exigir MySQL. O default
+**Não muda:** nenhum dos 24 arquivos Python (501 casos) / 12 suites PHP passa a exigir MySQL. O default
 `DB_BACKEND=sqlite` é o que garante isso.
 
 **Muda (obrigatório):**
@@ -482,7 +495,7 @@ regras 3–6 podem *consumir* um parâmetro (o modificador de data) e inserir ou
 | 5 | `datetime('now', '-' \|\| ? \|\| ' seconds')` | `%s` + valor calculado, com o `?` **consumido** | o parâmetro sai da lista devolvida (5.4) |
 | 6 | `datetime('now', ?)` (modificador vindo por parâmetro) | idem | `db.py:1335` e `test_form_aware.py:39` |
 | 7 | `datetime(<col>)` (1 arg, coluna) | `<col>` (identidade) | a coluna já está no formato canônico `YYYY-MM-DD HH:MM:SS` (decisão 4.6.1) |
-| 8 | `datetime(<col>, ?)` (offset por param) | `CONVERT_TZ(<col>, '+00:00', ?)` | offset **numérico** (`-03:00`) → não exige `mysql.time_zone*` |
+| 8 | `datetime(<col>, ?)` | `CONVERT_TZ(<col>, '+00:00', ?)` | offset **numérico** (`-03:00`) → não exige `mysql.time_zone*`. **Painel (Fase 3):** o `?` do painel é o **modificador** `'-3 hours'`, não um offset → `DATE_ADD(<col>, INTERVAL ? SECOND)`, com o parâmetro virando segundos (-10800) no `execute` |
 | 9 | `date(<expr>)` | `DATE(<expr>)` | idempotente no formato texto |
 | 10 | `\| \|` entre literais/colunas | `CONCAT(...)` | só o caso `'a:' \|\| case_key` precisa; os demais são o item 3–5 |
 | 11 | `INSERT OR IGNORE INTO t` | `INSERT IGNORE INTO t` | |
@@ -500,10 +513,13 @@ regras 3–6 podem *consumir* um parâmetro (o modificador de data) e inserir ou
 | 23 | `TEXT`/`BLOB` **inline** seguido de `PRIMARY KEY`/`UNIQUE` | `VARCHAR(191) …` | 1170. Só o caso *inline* da `CREATE TABLE`: chave **composta** (`PRIMARY KEY (a, b)`), `CREATE INDEX` e `REFERENCES` inline **não** são convertidos — a coluna tem de nascer `VARCHAR` (trava o lint da 5.7) |
 | 24 | `DEFAULT '<literal>'` em coluna `TEXT` | `DEFAULT ('<literal>')` | 1101: em `TEXT` só é aceito default **de expressão**; a regra cobre `''`, `'{}'`, `'toa'`… (5.5.b) |
 | 25 | identificador `key` (coluna, tabela, alias) | `` `key` `` | 1064; **não** toca `PRIMARY KEY`, `FOREIGN KEY`, `UNIQUE KEY`, `ON DUPLICATE KEY UPDATE`, `PARTITION` nem literais/`'… key'` dentro de comentário |
+| 26 | `x IS ?` (valor comparado vindo por parâmetro) | `x <=> %s` | 1064. O `IS` do SQLite é igualdade *null-safe*; o do MySQL só aceita `NULL`/`TRUE`/`FALSE`, e como o PyMySQL inlineia o parâmetro a query vira `IS 1`. `<=>` é a igualdade null-safe do MySQL (`IS NOT ?` → `NOT (x <=> %s)`), então a semântica é preservada; `IS NULL`/`IS NOT NULL` seguem intactos e operando à esquerda composto falha alto. Site: `db.py:1263` (`queue_position`) |
 
 **Ordem importa:** fazer 1/2 por último, depois que 3–22 já geraram SQL novo (senão `%` e `?`
 novos seriam reprocessados indevidamente). Regra prática: **primeiro as regras de "vocabulário"
-(3–22), depois as de "pontuação" (1–2)**.
+(3–22), depois as de "pontuação" (1–2)**. Exceção: a **26** roda **antes** da 1 — ela *consome* o
+`?` do usuário e devolve `%s` pronto; se rodasse depois, a 1 já teria convertido o `?` e o padrão
+não casaria mais.
 
 ### 5.2 Upserts (`ON CONFLICT` → `ON DUPLICATE KEY UPDATE`) — 16 sites
 
@@ -651,6 +667,15 @@ recebem `COLLATE utf8mb4_0900_ai_ci` explicito (ou `LOWER()` nos dois lados) par
 busca que nao liga para maiusculas. `case_key LIKE 'u:%'` (`db.py:391`,
 `bootstrap.php:309/313`) fica `_bin` de proposito: literal e valores sao minusculos.
 
+Implementado em `sqlcompat._colacao_de_igualdade`, por dois caminhos: `_colacao_no_create` (ve a
+chave da tabela - `PRIMARY KEY`/`UNIQUE`, inclusive composta -, a ponta **filha** de FK e a lista
+acima) e `_colacao_no_alter` (o `ALTER TABLE ... ADD COLUMN` das migracoes de banco antigo do
+`db.py`, onde so o nome da coluna decide). Medido na base real (`botsqlite_test`): **82** colunas
+na consulta 2.4 (chave ou `_bin`), **0** par de FK com colacao divergente (3780) e os **101**
+pares de linhas de `queue_operators` que so diferem por caixa convivendo sob `_bin` - sob `ai_ci`
+cada par colapsa em um so e a PK `(queue_address, address)` recusa a segunda linha com **1062
+Duplicate entry**, que era o erro que matava a carga.
+
 **d) Sessao da conexao (o handshake completo):**
 
 ```sql
@@ -680,6 +705,11 @@ VALUES (1, ...)` faz o contador ir para 2 (automatico no InnoDB). Depois da migr
 
 **g) `lower_case_table_names=0`.** Os nomes ja sao minusculos (`chats`, `bot_settings`...):
 manter exatamente assim e nunca citar como `Chats`/`Bot_Settings`.
+
+**h) `preg_match` com `$offset` (so no port do painel).** Diferente de `substr`, o `^` continua
+ancorado no **inicio do sujeito** quando se passa um offset: o passo que procura o `)` da diferenca de
+`julianday` precisou de **`\G`** (`/\G\s*\)\s*\*\s*86400/i`). Sem isso o SQL valido do painel
+(`(julianday(s.at) - julianday(MAX(e.at))) * 86400`) estourava como "julianday solto".
 
 ### 5.6 DML: erro 1093 (subquery que lê a própria tabela alvo)
 
@@ -799,6 +829,8 @@ não passa por vacuidade (a amostra ruim tem de ser acusada): chave composta, `C
 | 25 | Valor sintetico do lint 1093 que nao serve as formas de `datetime(...)` do projeto -> o lint estoura (`float('-60 seconds')`) em vez de acusar SQL ruim | `tests/test_sqlcompat.py::_params_do_lint` | valor numerico sem unidade (`"60"`): `float()` na concatenada, `modifier_seconds()` na direta; a forma com offset so repassa | Fase 1 (`TempoTest.test_valor_do_lint_atravessa_as_tres_formas`) |
 | 26 | `PRAGMA foreign_keys = ON` **dentro** do `schema.sql` religa a checagem no meio do `executescript` e desfaz o `OFF` do boot -> **1824** (`Failed to open the referenced table 'permission_groups'`) na primeira FK fora de ordem (`bot_users` e a tabela #1 e referencia `permission_groups`, que nasce so na #25) | `schema.sql:4` + `db.ensure_schema` | `sqlcompat.sem_pragma_fk()` tira o PRAGMA do script **só** no MySQL (o SQLite continua usando); a sessao fica OFF durante a criacao e ON no `finally` | Fase 2 (boot real: 31 tabelas / 30 FKs; `tmp_bak/fk_check.py` e `tmp_bak/boot_mysql.py`) |
 | 27 | Backend decidido no **import** do `db` antes do `load_env()`: com `DB_BACKEND=mysql` no `.env` o `_BACKEND_MYSQL` fica `False` (sem `PRAGMA foreign_keys = OFF`, excecoes do `sqlite3` no `except` do bot) | `python/db.py` (import) x ordem em `python/main.py:161` e `run.py` | `load_env()` antes de importar o `db` (`main.py`/`run.py`) + `db._resolve_backend()` reavaliado no import **e** em `connect()` | Fase 2 (`test_backend_do_db_se_realinha_depois_do_import`) |
+| 28 | `x IS ?` (valor por parâmetro) → **1064** (`IS 1`): o `IS` do MySQL só compara com `NULL`/`TRUE`/`FALSE` | `db.py:1263` (`queue_position`, chamada pelo tick de rotas a cada 5 s) | `x <=> %s` (regra 26); operando à esquerda composto falha alto em vez de gerar SQL inválido | Fase 4/5 (boot real: `tmp_bak/bot-20261006-161042.err` registrou o 1064 a cada 5 s) |
+| 29 | Parâmetro **fora do grupo do `VALUES`** + `executemany` → `TypeError: not all arguments converted during string formatting`: o atalho `RE_INSERT_VALUES` do PyMySQL entrega a linha inteira só para o grupo do `VALUES` (o `postfix` nem é formatado) | `db.py:937`/`945` (`ingest_search_contact`: `last_seen = datetime('now')` no `ON DUPLICATE KEY UPDATE`) | a fachada só usa o lote do driver quando todo `%s` está no `VALUES`; fora disso executa linha a linha (4.2) | Fase 4/5 (boot real; o driver falso dos testes **não** emula o atalho) |
 
 ---
 
@@ -889,36 +921,67 @@ SELECT table_name, constraint_name, column_name, referenced_table_name
   FROM information_schema.key_column_usage
  WHERE table_schema = DATABASE() AND referenced_table_name IS NOT NULL;
 -- 2.4 colunas-chave: tipo (nada de TEXT/BLOB) e colacao (as chaves em utf8mb4_bin)
-SELECT table_name, column_name, column_type, collation, is_nullable, column_default
+--      (`collation` nao existe em `information_schema.columns`: o nome e `COLLATION_NAME`;
+--       com `collation` a consulta morre em **1054 Unknown column 'collation'**)
+SELECT table_name, column_name, column_type, COLLATION_NAME, is_nullable, column_default
   FROM information_schema.columns
- WHERE table_schema = DATABASE() AND (column_key <> '' OR collation LIKE '%\_bin')
+ WHERE table_schema = DATABASE() AND (column_key <> '' OR COLLATION_NAME LIKE '%\_bin')
  ORDER BY table_name, ordinal_position;
 -- 2.5 defaults de data (tem de aparecer UTC_TIMESTAMP, nunca NOW/CURRENT_TIMESTAMP)
 SELECT table_name, column_name, column_default FROM information_schema.columns
  WHERE table_schema = DATABASE() AND column_default LIKE '%timestamp%';
 ```
 
-### Fase 3 - painel PHP
+### Fase 3 - painel PHP — **CONCLUIDA (06/10/2026)**
 
 **Objetivo:** o painel funcionar nos dois backends **sem reescrever as ~117 queries** do `index.php`
-(o `BotPDO`/`BotStatement` traduz no choke point).
-**Arquivos:** `php/db.php` (novo: `bot_db_backend`, `BotPDO`, `BotStatement`), `php/bootstrap.php`
-(troca do PDO, `information_schema` no lugar de `sqlite_master`/`PRAGMA`, migracoes),
-`php/index.php` (upserts, datas, `rowCount`), `php/pages/groups.php`, `bin/create-user.php`,
-`tests/test_mysql_painel.php` (novo, gated).
-**Passos:**
-1. `php -l` em cada arquivo alterado.
-2. Rodar a suite PHP completa com o default (`sqlite`).
-3. Com `DB_BACKEND=mysql MYSQL_TEST=1 MYSQL_TEST_DATABASE=botsqlite_test`, rodar
-   `php tests/test_mysql_painel.php`: login, **cada aba**, busca por nome com maiuscula/minuscula
-   (colacao), filtros de data (`-03:00`), salvar globais/time/membro, cadastrar usuario e conferir
-   a mensagem de "X linha(s)".
+(o `BotPDO`/`BotStatement` traduz no choke point). **Feito.**
+**Arquivos:** `php/db.php` (NOVO, 1400 linhas: `bot_db_backend`, `bot_mysql_config`, `BotPDO`,
+`BotStatement`, o tradutor `bot_sql_traduz` e `bot_like_ci`), `php/bootstrap.php` (`require` da
+fachada, `bot_pdo()` -> `bot_db_abre()`, `ensure_schema` via `bot_executa_script`, 1093 do
+`bot_migrate_delivery`), `php/index.php` (4 `LIKE` com `COLLATE` + erro de constraint por codigo do
+driver), `tests/_panel_render.php` (modo MySQL gated), `tests/test_mysql_painel.php` (NOVO, gated),
+`tests/test_sqlcompat_php.php` (NOVO, offline, 42 checagens).
 
-**GATE:** 10 arquivos PHP com `exit 0` no SQLite; smoke MySQL com **todas** as abas renderizando e
-salvando; nenhuma excecao `SQLSTATE`.
-**Nao avance se:** alguma aba der erro de sintaxe SQL, o login falhar, a busca por nome perder
-resultado com maiuscula/minuscula (colacao) ou os filtros de data voltarem 3 h deslocados.
+**Como ficou (o que difere do plano):**
+
+1. **`prepare()`/`query()`/`exec()` do `BotPDO` traduzem e a `BotStatement` resolve o plano de
+   parametros no `execute`.** O `datetime(<coluna>, ?)` do painel recebe o **modificador**
+   (`'-3 hours'`), nao um offset `'-03:00'`: o SQL sai `DATE_ADD(<coluna>, INTERVAL ? SECOND)` e o
+   parametro e convertido para segundos (-10800) na hora de executar. O `CONVERT_TZ` da regra 8 fica
+   para offset **literal** no SQL (que o painel nao usa).
+2. **`php -l` + 3 suites de painel:** o `_panel_render.php` decide o modo por `SQLITE_PATH` (suites
+   SQLite, backend fixado em `sqlite`) e, sem ele, por `MYSQL_TEST=1` + `MYSQL_TEST_DATABASE` (nome
+   com "test" obrigatorio). Um `MYSQL_TEST=1` esquecido no terminal nao contamina as suites de SQLite.
+3. **Paridade de DDL comprovada:** o `schema.sql` inteiro (54 comandos) sai **byte a byte igual** ao
+   do `sqlcompat.translate` (comparacao direta dos dois tradutores) — mesma colacao `utf8mb4_bin`,
+   mesmas FKs explicitas, mesmos indices funcionais.
+4. **Bug achado no port:** no PHP, `preg_match($p, $sujeito, $m, 0, $offset)` mantem o `^` ancorado no
+   inicio do SUJEITO (nao no offset): o passo do `julianday` precisou de `\G`. Sem isso o
+   `julianday(s.at) - julianday(MAX(e.at))` da aba Dashboard estourava.
+
+**Medicoes (MySQL 8.0.44 local, base `botsqlite_test`, 31 tabelas / 209 876 `bot_events`):**
+`php tests/test_mysql_painel.php` -> **MYSQL PAINEL OK** (46 checagens): 13 abas rendem sem
+`SQLSTATE`/warning, busca por nome **minusculo achando address com MAIUSCULA** (a colacao das colunas
+`_bin`), filtro de data com o deslocamento de 3 h conferido na virada do dia local, `POST add_member`
+gravando, `rowCount()` com semantica de linhas casadas e 30 FKs no destino. Suites: **12 arquivos PHP
+com `exit 0`** (SQLite, com e sem `MYSQL_TEST` no ambiente) e a suite Python inteira (24 arquivos,
+491 casos).
+
+**GATE:** atendido — 12 arquivos PHP com `exit 0` no SQLite; smoke MySQL com **todas** as abas
+renderizando e salvando; nenhuma excecao `SQLSTATE`.
 **Rollback:** `DB_BACKEND=sqlite` no `.env` (o caminho MySQL nao e tocado quando o backend e sqlite).
+
+**Ordem dos gates:** o smoke **grava** na base de teste (usuario, time, membro, fila e dois
+`bot_events`), entao o `--check` do migrador tem de rodar **antes** dele — ou a carga e refeita depois.
+Com a base recem-carregada, `--check` = 0 diferenca; depois do smoke, as 4 tabelas semeadas divergem
+por desenho (o teste precisaria de linhas proprias para exercitar busca, data e gravacao).
+
+**Dependencia de ambiente (nao esta no repo):** o painel em MySQL exige `extension=pdo_mysql` no
+`php.ini` (no Windows o DLL ja vem na pasta `ext`, so descomentar) e um MySQL 8 alcancavel com a base
+de teste e **privilegio** nela. Foi exatamente ali que apareceu o **1044** das pendencias: a credencial
+de `.env` (`F104751`) tem `ALL PRIVILEGES` so em `chat\_bot\_toa`; a base de teste do gate roda em um
+servidor local separado (`127.0.0.1:3307`), com `root` de teste.
 
 ### Fase 4 - bot Python
 
@@ -931,10 +994,22 @@ linha 508 + `%` nos `LIKE`), `python/engine.py` (fechamento da sessao por thread
 2. Boot com `DB_BACKEND=sqlite` e conferir no log qual backend foi escolhido.
 3. `MYSQL_TEST=1 MYSQL_TEST_DATABASE=botsqlite_test python tests/test_mysql_upserts.py`.
 
-**GATE:** **487 casos / 0 falhas**; boot logando backend `sqlite`; os 16 upserts validados no
+**GATE:** **501 casos / 0 falhas**; boot logando backend `sqlite`; os 16 upserts validados no
 MySQL de teste.
 **Nao avance se:** qualquer caso falhar, o log mostrar backend errado, ou sobrar
 `sqlite3`/`PRAGMA`/`julianday` em caminho MySQL (`grep` de conferencia).
+
+**Achados do ensaio (06/10/2026, boot real com `DB_BACKEND=mysql`, base `botsqlite_test`):** o log
+(`tmp_bak/bot-20261006-161042.err`) mostrou dois erros de **runtime** que a suite nao pegava — o
+`1064` de `x IS ?` (armadilha 28, agora regra 26) e o `TypeError` do `executemany` com parametro
+fora do grupo do `VALUES` (armadilha 29, caminho linha-a-linha em 4.2). Os dois nasceram do driver
+**falso** dos testes, que nao emula o inlineamento do PyMySQL nem o atalho `RE_INSERT_VALUES`; os
+testes novos fecham esse ponto cego (`IgualdadeNulaTest` + os de `executemany` em
+`tests/test_sqlcompat.py`). Com as correcoes: boot E2E limpo (`search_contact: 278 operadores em
+82 filas`, zero `ERROR`/`Traceback`), `db.queue_position` respondendo contra o MySQL real (fila
+`811/812/815` -> posicao `1/2/3`) e a suite em **501 casos / 0 falhas** (eram 491: +10 dos testes
+novos). Probes em `tmp_bak/` (`probe_queue_position.py`, `probe_mysql_real.py`).
+
 **Rollback:** `DB_BACKEND=sqlite`.
 
 ### Fase 5 - ensaio de integracao com dados reais (copia)
@@ -975,7 +1050,7 @@ nunca foi tocado).
 5. Subir o painel (conferir login e as abas) e depois o bot.
 6. Monitorar 30-60 min: log do bot, `SHOW PROCESSLIST`, contagens.
 
-**GATE:** `--check` = 0 diferenca logo apos a carga; painel e bot operando; log limpo; **487/0** + 10
+**GATE:** `--check` = 0 diferenca logo apos a carga; painel e bot operando; log limpo; **501/0** + 12
 suites verdes no repositorio.
 **Nao avance se:** o `--check` divergir, o login falhar ou aparecer excecao de SQL no log do bot.
 **Rollback (1 linha):** parar os dois, `DB_BACKEND=sqlite`, subir de novo. O arquivo SQLite
@@ -1013,6 +1088,8 @@ minutos) se perde - por isso a janela de observacao do passo 6 e curta e vigiada
 | Colacao `_bin` deixar uma busca do painel "sensivel a maiuscula" | fidelidade ao `=` do SQLite e aos `UNIQUE` | `COLLATE utf8mb4_0900_ai_ci` nos 4 `LIKE` de busca por nome/endereco |
 | Sem retry automatico de reconexao no meio de um tick | o tick seguinte refaz o trabalho (o codigo ja tolera) | `ping()` no inicio do tick + log de `is_disconnect` |
 | Dump com dados reais versionado por engano | `.gitignore` ja cobre `.env`/`data/*.sqlite*` | conferir o `.gitignore` antes do primeiro `git add` (4.11) |
+| Credencial de producao **sem privilegio na base de teste** -> `1044` (medido) | o usuario do `.env` tem `ALL PRIVILEGES` so em `chat\_bot\_toa`; nao e limite de conexoes | base de teste em servidor separado (`127.0.0.1:3307`) + `MYSQL_TEST=1`, que **forca** o MySQL e recusa base sem "test" no nome (`php/db.php::bot_mysql_config`) |
+| `MYSQL_TEST=1` esquecido no terminal | poderia apontar o painel para outra base | a trava do nome ("test") no `bot_mysql_config` + o harness fixando `DB_BACKEND=sqlite` quando recebe `SQLITE_PATH` |
 
 **Fora de escopo (nao faz parte desta mudanca):** replicacao/HA, troca de driver por
 SQLAlchemy/ORM, cache Redis, migracao dos eventos historicos de `analytics_events` para
@@ -1026,8 +1103,8 @@ queries para "SQL 100% ANSI".
 | # | Afirmacao | Como verificar |
 |---|---|---|
 | 1 | O default e SQLite e nada mudou para quem nao tem MySQL | `DB_BACKEND` ausente no `.env` -> `python run.py` loga backend `sqlite` |
-| 2 | Os 487 casos Python (24 arquivos) e as 10 suites PHP seguem verdes | `Get-ChildItem tests\test_*.py \| % { python $_.FullName }`; idem `.php` |
-| 3 | O tradutor cobre as 22 regras de 5.1 + upserts (5.2) + indices funcionais (5.3) | `python tests/test_sqlcompat.py` |
+| 2 | Os 501 casos Python (24 arquivos) e as 12 suites PHP seguem verdes | `Get-ChildItem tests\test_*.py \| % { python $_.FullName }`; idem `.php` |
+| 3 | O tradutor cobre as 26 regras de 5.1 + upserts (5.2) + indices funcionais (5.3) | `python tests/test_sqlcompat.py` |
 | 4 | O DDL MySQL cria as 31 tabelas com indices, FKs e defaults UTC | consultas 2.1-2.5 do §7 na base real |
 | 5 | Os 5 indices parciais viraram funcionais e continuam barrando duplicata ativa | consulta 2.2 (`EXPRESSION`) + teste de duplicata |
 | 6 | Nenhuma coluna de chave e `TEXT`/`BLOB` | consulta 2.4 -> tudo `varchar(...)` |

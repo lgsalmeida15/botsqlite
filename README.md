@@ -7,9 +7,9 @@ Este diretório é um subprojeto autônomo (pode ir para um repositório separad
 ## Requisitos
 
 - Python 3.10+ com `pip` (Playwright + Chromium)
-- PHP 7.4.3+ com extensão `pdo_sqlite` (obrigatória). `mbstring` é **opcional**: o painel não depende dela (o corte de texto usa `ui_clip`, com alternativa própria quando a extensão não está habilitada)
+- PHP 7.4.3+ com extensão `pdo_sqlite` (obrigatória) e `pdo_mysql` (só para o banco em MySQL). `mbstring` é **opcional**: o painel não depende dela (o corte de texto usa `ui_clip`, com alternativa própria quando a extensão não está habilitada)
 - Bot e painel no mesmo host, com escrita na pasta `data/`
-- Para o banco em **MySQL 8.0.19+**: `PyMySQL` (já em `requirements.txt`) no lado Python. O painel PHP em MySQL é a Fase 3 do plano `sqliteformysql.md` e ainda não está ligado
+- Para o banco em **MySQL 8.0.19+**: `PyMySQL` (já em `requirements.txt`) no lado Python e a extensão `pdo_mysql` no PHP. O bot e o painel falam os dois backends; a migração de dados é `bin/migrar_sqlite_para_mysql.py` (ver [sqliteformysql.md](sqliteformysql.md))
 
 ## Configuração
 
@@ -40,19 +40,20 @@ No padrão (`sqlite`) o arquivo é criado na primeira conexão (bot ou painel); 
 
 ### Banco: SQLite (padrão) ou MySQL 8
 
-O **bot Python** fala os dois backends; o default continua **SQLite** e nada muda para quem não configura nada.
+O **bot Python** e o **painel PHP** falam os dois backends; o default continua **SQLite** e nada muda para quem não configura nada.
 
 | | `DB_BACKEND=sqlite` (padrão) | `DB_BACKEND=mysql` |
 |---|---|---|
-| Conexão | arquivo em `SQLITE_PATH`, com `PRAGMA foreign_keys/WAL/busy_timeout` | `PyMySQL` + tradução do dialeto em `python/sqlcompat.py` |
+| Conexão do bot | arquivo em `SQLITE_PATH`, com `PRAGMA foreign_keys/WAL/busy_timeout` | `PyMySQL` + tradução do dialeto em `python/sqlcompat.py` |
+| Conexão do painel | mesmo arquivo, `PDO('sqlite:...')` | `PDO('mysql:...')` + tradução em `php/db.php` (`BotPDO`/`BotStatement`) |
 | DDL | `schema.sql` como está | **o mesmo** `schema.sql`, traduzido no `execute` |
 | Datas | `datetime('now')` | `UTC_TIMESTAMP()` (sessão em `time_zone='+00:00'`) |
-| Testes | suite completa offline | os mesmos testes, sem tocar no banco remoto |
+| Testes | suite completa offline | as mesmas suites; o smoke de MySQL é opt-in (`MYSQL_TEST=1`) |
 
-- O código continua escrito em dialeto SQLite e a tradução acontece no *choke point* (`python/sqlcompat.py`): `?`→`%s`, `ON CONFLICT`→`ON DUPLICATE KEY UPDATE`, `AUTOINCREMENT`→`AUTO_INCREMENT`, `PRAGMA`→`SET`, índice parcial→coluna gerada + índice único, `TEXT` das colunas de chave→`VARCHAR(191)`.
+- O código continua escrito em dialeto SQLite e a tradução acontece no *choke point* (`python/sqlcompat.py` no bot, `php/db.php` no painel): `ON CONFLICT`→`ON DUPLICATE KEY UPDATE`, `AUTOINCREMENT`→`AUTO_INCREMENT`, `PRAGMA`→`SET`, índice parcial→índice funcional, `TEXT` das colunas de chave→`VARCHAR(191)` + `COLLATE utf8mb4_bin`, `LIKE` de busca por nome com `COLLATE utf8mb4_0900_ai_ci`, `IS ?` do SQLite (igualdade *null-safe*)→`<=>`.
 - As FKs precisam ser de **tabela** (`CONSTRAINT ... FOREIGN KEY`): o MySQL **descarta em silêncio** o `REFERENCES` escrito na coluna e o `ON DELETE` nunca dispararia. O `schema.sql` cria as tabelas fora da ordem das FKs, então o boot cria com a checagem desligada (`FOREIGN_KEY_CHECKS=0`) e religa no fim.
-- Credenciais do MySQL: `IP_MYSQL`, `PORTA_MYSQL`, `USUARIO_MYSQL`, `SENHA_MYSQL`, `DATABASE_MYSQL` (mesmos nomes no painel PHP). Faltando valor com `DB_BACKEND=mysql`, o boot para com a lista exata das chaves.
-- **Painel PHP:** hoje só SQLite — a bifurcação do painel é a Fase 3 de [sqliteformysql.md](sqliteformysql.md).
+- Credenciais do MySQL: `IP_MYSQL`, `PORTA_MYSQL`, `USUARIO_MYSQL`, `SENHA_MYSQL`, `DATABASE_MYSQL` (os mesmos nomes no bot e no painel). Faltando valor com `DB_BACKEND=mysql`, o boot para com a lista exata das chaves.
+- **Trocar de backend é uma linha** no `.env` (`DB_BACKEND=mysql`) + reiniciar o bot e o painel. Os dois precisam apontar para a **mesma** base: painel em SQLite com o bot em MySQL são dois bancos diferentes (o painel não enxerga o que o bot grava).
 
 Crie o usuário do painel:
 
@@ -262,6 +263,36 @@ Uma fila desabilitada para chat **continua** roteando formulário: o que manda �
 Documentacao visual do fluxo completo - atendimento, menu, roteamento por caso, formulario de validacao, timers e banco: [docs/desenho-bot.md](docs/desenho-bot.md).
 
 Fluxogramas do atendimento como ele esta hoje, para imprimir ou apresentar: [docs/fluxograma-atendimento.html](docs/fluxograma-atendimento.html) e [docs/fluxograma-atendimento.pdf](docs/fluxograma-atendimento.pdf).
+
+## Testes
+
+Nada toca servidor por padrão: as suites rodam offline (SQLite em arquivo temporário).
+
+```bash
+# Python: 24 arquivos, 501 casos
+Get-ChildItem tests\test_*.py | % { python $_.FullName }        # Linux: for t in tests/test_*.py; do python "$t"; done
+
+# PHP: 12 arquivos (exit 0 = verde)
+Get-ChildItem tests\*.php | % { php $_.FullName }
+```
+
+O **smoke de MySQL** do painel é opt-in e só roda em base de teste (nome com `test`):
+
+```bash
+set MYSQL_TEST=1
+set MYSQL_TEST_DATABASE=botsqlite_test
+set IP_MYSQL=127.0.0.1
+set PORTA_MYSQL=3307
+set USUARIO_MYSQL=usuario
+set SENHA_MYSQL=senha
+php tests\test_mysql_painel.php
+```
+
+Sem `MYSQL_TEST` o arquivo sai com 0 e não abre conexão nenhuma. Com `MYSQL_TEST=1` o painel **força** o
+backend MySQL (`php/db.php::bot_db_backend`) e recusa base cujo nome não contenha `test` — a trava existe
+para um `MYSQL_TEST=1` esquecido no terminal nunca apontar para a produção. As suites de painel em SQLite
+continuam intocadas nesse modo: o harness `tests/_panel_render.php` fixa `DB_BACKEND=sqlite` quando recebe
+`SQLITE_PATH`.
 
 ## O que não vai para o Git
 
