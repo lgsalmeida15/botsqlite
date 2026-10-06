@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS menus (
 
 CREATE TABLE IF NOT EXISTS menu_queues (
   menu_id INTEGER NOT NULL REFERENCES menus(id) ON DELETE CASCADE,
-  queue_address TEXT NOT NULL REFERENCES queues(address) ON DELETE CASCADE,
+  queue_address VARCHAR(191) NOT NULL REFERENCES queues(address) ON DELETE CASCADE,
   PRIMARY KEY (menu_id, queue_address),
   UNIQUE (queue_address)
 );
@@ -64,7 +64,7 @@ CREATE TABLE IF NOT EXISTS teams (
 
 CREATE TABLE IF NOT EXISTS team_members (
   team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
-  address TEXT NOT NULL,
+  address VARCHAR(191) NOT NULL,
   name TEXT NOT NULL DEFAULT '',
   sort_order INTEGER NOT NULL DEFAULT 0,
   active INTEGER NOT NULL DEFAULT 1,
@@ -75,7 +75,7 @@ CREATE TABLE IF NOT EXISTS team_members (
 
 CREATE TABLE IF NOT EXISTS team_queues (
   team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
-  queue_address TEXT NOT NULL REFERENCES queues(address) ON DELETE CASCADE,
+  queue_address VARCHAR(191) NOT NULL REFERENCES queues(address) ON DELETE CASCADE,
   PRIMARY KEY (team_id, queue_address),
   UNIQUE (queue_address)
 );
@@ -83,7 +83,7 @@ CREATE TABLE IF NOT EXISTS team_queues (
 CREATE TABLE IF NOT EXISTS menu_options (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   menu_id INTEGER REFERENCES menus(id) ON DELETE CASCADE,
-  queue_address TEXT REFERENCES queues(address) ON DELETE CASCADE,
+  queue_address VARCHAR(191) REFERENCES queues(address) ON DELETE CASCADE,
   sort_order INTEGER NOT NULL,
   label TEXT NOT NULL,
   classification TEXT NOT NULL DEFAULT '',
@@ -118,8 +118,8 @@ CREATE TABLE IF NOT EXISTS menu_option_questions (
 );
 
 CREATE TABLE IF NOT EXISTS queue_operators (
-  queue_address TEXT NOT NULL REFERENCES queues(address) ON DELETE CASCADE,
-  address TEXT NOT NULL,
+  queue_address VARCHAR(191) NOT NULL REFERENCES queues(address) ON DELETE CASCADE,
+  address VARCHAR(191) NOT NULL,
   name TEXT NOT NULL DEFAULT '',
   source TEXT NOT NULL DEFAULT 'toa',
   PRIMARY KEY (queue_address, address)
@@ -127,7 +127,7 @@ CREATE TABLE IF NOT EXISTS queue_operators (
 
 CREATE TABLE IF NOT EXISTS menu_option_targets (
   option_id INTEGER NOT NULL REFERENCES menu_options(id) ON DELETE CASCADE,
-  address TEXT NOT NULL,
+  address VARCHAR(191) NOT NULL,
   name TEXT NOT NULL DEFAULT '',
   PRIMARY KEY (option_id, address)
 );
@@ -139,8 +139,8 @@ CREATE TABLE IF NOT EXISTS bot_settings (
 
 CREATE TABLE IF NOT EXISTS chats (
   chat_id INTEGER PRIMARY KEY,
-  queue_address TEXT REFERENCES queues(address),
-  status TEXT NOT NULL,
+  queue_address VARCHAR(191) REFERENCES queues(address),
+  status VARCHAR(191) NOT NULL,
   classification TEXT,
   option_id INTEGER REFERENCES menu_options(id) ON DELETE SET NULL,
   menu_node_id INTEGER REFERENCES menu_options(id) ON DELETE SET NULL,
@@ -161,7 +161,7 @@ CREATE TABLE IF NOT EXISTS chats (
   script_answers TEXT NOT NULL DEFAULT '{}',
   script_uuid TEXT NOT NULL DEFAULT '',
   script_started_at TEXT,
-  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  updated_at VARCHAR(191) NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE INDEX IF NOT EXISTS chats_status_idx ON chats (status);
@@ -169,11 +169,11 @@ CREATE INDEX IF NOT EXISTS chats_classified_idx ON chats (updated_at) WHERE clas
 
 CREATE TABLE IF NOT EXISTS bot_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  at TEXT NOT NULL DEFAULT (datetime('now')),
+  at VARCHAR(191) NOT NULL DEFAULT (datetime('now')),
   chat_id INTEGER,
-  queue_address TEXT,
+  queue_address VARCHAR(191),
   queue_enabled INTEGER,
-  reason TEXT NOT NULL,
+  reason VARCHAR(191) NOT NULL,
   detail TEXT NOT NULL DEFAULT ''
 );
 
@@ -245,7 +245,7 @@ CREATE TABLE IF NOT EXISTS team_routing (
 -- Roteamento por membro do time (NULL = herda o cap do time/global).
 CREATE TABLE IF NOT EXISTS team_member_routing (
   team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
-  address TEXT NOT NULL,
+  address VARCHAR(191) NOT NULL,
   weight INTEGER NOT NULL DEFAULT 0,
   cap_chat INTEGER,
   cap_form INTEGER,
@@ -260,13 +260,13 @@ CREATE TABLE IF NOT EXISTS team_member_routing (
 -- Retry assíncrono do roteamento (hoje só formulário), drenado pelo tick.
 CREATE TABLE IF NOT EXISTS pending_routes (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  kind TEXT NOT NULL CHECK (kind IN ('chat', 'form')),
+  kind VARCHAR(191) NOT NULL CHECK (kind IN ('chat', 'form')),
   chat_id INTEGER NOT NULL,
   queue_address TEXT,
   team_id INTEGER,
   attempts INTEGER NOT NULL DEFAULT 0,
-  next_try_at TEXT,
-  status TEXT NOT NULL DEFAULT 'waiting'
+  next_try_at VARCHAR(191),
+  status VARCHAR(191) NOT NULL DEFAULT 'waiting'
     CHECK (status IN ('waiting', 'done', 'failed', 'cancelled')),
   detail TEXT NOT NULL DEFAULT '',
   expires_at TEXT,
@@ -299,7 +299,7 @@ CREATE INDEX IF NOT EXISTS pending_routes_due ON pending_routes (status, next_tr
 -- instrumentacao e da medicao de timeout/sem eco (toa.command devolve o `r`).
 CREATE TABLE IF NOT EXISTS delivery_attempts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  at TEXT NOT NULL DEFAULT (datetime('now')),
+  at VARCHAR(191) NOT NULL DEFAULT (datetime('now')),
   kind TEXT NOT NULL DEFAULT '',
   chat_id INTEGER,
   route_id INTEGER,
@@ -367,7 +367,7 @@ CREATE TABLE IF NOT EXISTS analyst_load (
 
 CREATE TABLE IF NOT EXISTS analyst_load_history (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  at TEXT NOT NULL DEFAULT (datetime('now')),
+  at VARCHAR(191) NOT NULL DEFAULT (datetime('now')),
   address TEXT NOT NULL,
   chats_toa INTEGER NOT NULL DEFAULT 0,
   forms_toa INTEGER NOT NULL DEFAULT 0,
@@ -387,13 +387,13 @@ CREATE TABLE IF NOT EXISTS route_assignments (
   chat_id INTEGER NOT NULL UNIQUE,
   queue_address TEXT,
   team_id INTEGER,
-  assignee TEXT NOT NULL,
-  case_key TEXT NOT NULL DEFAULT '',
+  assignee VARCHAR(191) NOT NULL,
+  case_key VARCHAR(191) NOT NULL DEFAULT '',
   requester_addr TEXT NOT NULL DEFAULT '',
   requester_name TEXT NOT NULL DEFAULT '',
   identity_source TEXT NOT NULL DEFAULT 'address',
   assigned_at TEXT NOT NULL DEFAULT (datetime('now')),
-  closed_at TEXT,
+  closed_at VARCHAR(191),
   -- Motivo do fechamento (chat_removed, stale_boot, form_done, ttl, manual):
   -- sem isso o case podia "sumir" do ledger sem explicacao.
   close_reason TEXT NOT NULL DEFAULT ''
@@ -469,7 +469,7 @@ CREATE TABLE IF NOT EXISTS permission_groups (
 
 CREATE TABLE IF NOT EXISTS group_permissions (
   group_id INTEGER NOT NULL REFERENCES permission_groups(id) ON DELETE CASCADE,
-  perm_key TEXT NOT NULL,
+  perm_key VARCHAR(191) NOT NULL,
   PRIMARY KEY (group_id, perm_key)
 );
 
@@ -481,7 +481,7 @@ CREATE TABLE IF NOT EXISTS user_teams (
 
 CREATE TABLE IF NOT EXISTS user_queues (
   user_id INTEGER NOT NULL REFERENCES bot_users(id) ON DELETE CASCADE,
-  queue_address TEXT NOT NULL REFERENCES queues(address) ON DELETE CASCADE,
+  queue_address VARCHAR(191) NOT NULL REFERENCES queues(address) ON DELETE CASCADE,
   PRIMARY KEY (user_id, queue_address)
 );
 
@@ -497,7 +497,7 @@ CREATE TABLE IF NOT EXISTS group_teams (
 
 CREATE TABLE IF NOT EXISTS group_queues (
   group_id INTEGER NOT NULL REFERENCES permission_groups(id) ON DELETE CASCADE,
-  queue_address TEXT NOT NULL REFERENCES queues(address) ON DELETE CASCADE,
+  queue_address VARCHAR(191) NOT NULL REFERENCES queues(address) ON DELETE CASCADE,
   PRIMARY KEY (group_id, queue_address)
 );
 

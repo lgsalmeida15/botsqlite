@@ -72,6 +72,47 @@ def env(key: str, default: str | None = None) -> str | None:
     return os.environ.get(key, default)
 
 
+MYSQL_KEYS = ("IP_MYSQL", "PORTA_MYSQL", "USUARIO_MYSQL", "SENHA_MYSQL", "DATABASE_MYSQL")
+
+
+def db_backend() -> str:
+    """Backend do banco: `sqlite` (padrao) ou `mysql`.
+
+    O bot continua escrito em dialeto SQLite; com `DB_BACKEND=mysql` o
+    `db.connect()` entrega a conexao traduzida por `sqlcompat`. O rollback e
+    trocar a linha do `.env` de volta para `sqlite` (ou remover a chave).
+    """
+    valor = (env("DB_BACKEND") or "sqlite").strip().lower()
+    return "mysql" if valor == "mysql" else "sqlite"
+
+
+def mysql_missing_keys() -> list[str]:
+    """Chaves do MySQL declaradas no `.env` mas ainda sem valor."""
+    return [k for k in MYSQL_KEYS if not (env(k) or "").strip()]
+
+
+def mysql_dsn() -> dict:
+    """Credenciais do MySQL do `.env` (nomes iguais aos que o painel PHP usa).
+
+    Levanta `RuntimeError` quando falta valor: o erro aparece no boot com a lista
+    exata das chaves, em vez de um "access denied" generico do driver.
+    """
+    faltando = mysql_missing_keys()
+    if faltando:
+        raise RuntimeError(
+            "DB_BACKEND=mysql mas o .env esta sem valor em: " + ", ".join(faltando)
+        )
+    porta = (env("PORTA_MYSQL") or "3306").strip() or "3306"
+    return {
+        "host": (env("IP_MYSQL") or "").strip(),
+        "port": int(porta),
+        "user": (env("USUARIO_MYSQL") or "").strip(),
+        "password": env("SENHA_MYSQL") or "",
+        "database": (env("DATABASE_MYSQL") or "").strip(),
+        "charset": "utf8mb4",
+    }
+
+
 def sqlite_path() -> Path:
     rel = env("SQLITE_PATH", "data/helptoa.sqlite") or "data/helptoa.sqlite"
     p = Path(rel)

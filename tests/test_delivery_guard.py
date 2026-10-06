@@ -145,3 +145,7 @@ class TravaNoBancoTest(unittest.TestCase):
         self.assertIsNone(segundo)
         db.release_delivery(conn, int(primeiro["id"]), "token-a")
         self.assertIsNotNone(db.claim_delivery(conn, "form", 99, "h:q1", 1, "token-b"))
+
+
+if __name__ == "__main__":
+    unittest.main()

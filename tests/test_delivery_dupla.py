@@ -122,3 +122,7 @@ class DuplaEntregaTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(convidados[0], convidados[1])
         self.assertEqual(convidados[0], routes(conn)[0]["invite_target"])
         self.assertEqual(sock.names().count("move_chat"), 0)
+
+
+if __name__ == "__main__":
+    unittest.main()

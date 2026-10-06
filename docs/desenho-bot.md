@@ -9,7 +9,7 @@
 flowchart LR
   TEC[Tecnico no TOA] --> TOA[TOA - Community Helpdesk via WebSocket]
   TOA --> BOT[Daemon Python - Playwright + WS]
-  BOT --> DB[(SQLite - data/helptoa.sqlite)]
+  BOT --> DB[(SQLite - data/helptoa.sqlite / MySQL 8)]
   DB --> PAINEL[Painel PHP - php/index.php]
   PAINEL --> DB
   BOT -->|move_chat + invite_to_chat| TOA
@@ -30,12 +30,13 @@ flowchart LR
 | `python/engine.py` | **cerebro**: assumir chat, abertura form-aware, menu, scripts, classificacao, transferencia, formulario, roteamento |
 | `python/routing.py` | motor puro de decisao: heranca de ajustes, filtros, estrategia e detalhe de diagnostico |
 | `python/form_open.py` | deteccao do formulario, **identidade do solicitante** e **correlacao com o chat do tecnico** |
-| `python/db.py` | SQLite: acesso, migracoes, **ledger de casos**, jobs |
+| `python/db.py` | acesso, migracoes, **ledger de casos**, jobs (backend decidido por `config.db_backend()`) |
+| `python/sqlcompat.py` | tradutor SQLite → MySQL no *choke point* + fachada de conexao (so age no backend `mysql`) |
 | `python/resource_profile.py` | valida perfil de gestor do operador nos scripts |
 | `python/scripts/` | scripts de atendimento (`criar_apoio`, `criar_infra_rede`, `criar_acesso_hub`) + `registry.py` + `manifest.json` + `bases/` |
 | `schema.sql` | DDL aplicada tanto pelo Python quanto pelo PHP |
 | `php/index.php` + `php/bootstrap.php` | painel: abas, acoes POST, render e migracoes |
-| `tests/` | 274 testes Python + 9 suites PHP |
+| `tests/` | 487 testes Python (24 arquivos, rodam offline em SQLite) + 10 suites PHP |
 
 ## 3. Entrada de um chat: assumir ou ignorar
 
@@ -571,7 +572,7 @@ flowchart TD
   confirmacao atual (dentro do `reply_timeout_sec`) e a rota de transferencia enfileirada segue
   sendo drenada pelo tick.
 
-## 11. Banco de dados: 30 tabelas e o papel de cada uma
+## 11. Banco de dados: 31 tabelas e o papel de cada uma
 
 ### Catalogo do TOA
 
@@ -603,6 +604,7 @@ flowchart TD
 | `team_member_routing` | peso e caps por membro |
 | `route_assignments` | **ledger dos casos**: quem atende cada solicitante, `case_key`, contato do solicitante e `closed_at` |
 | `pending_routes` | **fila de espera**: retry do formulario (`kind=form`), fila do chat com posicao (`kind=chat`, `expires_at`, `last_position`) e trava anti-duplicidade |
+| `delivery_attempts` | **medicao de cada entrega**: operacao, alvo, `r` do TOA, resultado (`ok`/`timeout`/`error`) e latencia |
 | `analyst_load` | **medicao por analista** (aba Carga): ultima leitura das listas do TOA (chats x formularios), ledger, reservas, `form_ocioso_min`, `form_presente_toa`, `toa_ok` |
 | `analyst_load_history` | historico curto das leituras (podado por `analyst_load_keep`) |
 
@@ -631,6 +633,28 @@ de atendimento **nao le** nenhuma dessas tabelas; `bot_migrate_rbac` (PHP) e
 `_migrate_rbac` (Python) sao espelhos e rodam duas migracoes uma unica vez cada:
 `rbac_seeded` (promove usuarios legados a Super Admin) e `rbac_scope_groups`
 (copia `user_*` -> `group_*`).
+
+### Dois backends: SQLite (padrao) e MySQL 8
+
+O DDL e **um so** (`schema.sql`) e o dialeto tambem: o codigo continua escrito em SQLite e o
+`python/sqlcompat.py` traduz na hora do `execute` (*choke point*). Quem escolhe o backend e
+`config.db_backend()` (`DB_BACKEND` no `.env`; padrao **`sqlite`**).
+
+| | `DB_BACKEND=sqlite` (padrao) | `DB_BACKEND=mysql` |
+|---|---|---|
+| Conexao | `sqlite3` direto + `PRAGMA foreign_keys/WAL/busy_timeout` | `PyMySQL` + traducao no `sqlcompat.connect()` |
+| DDL | `schema.sql` como esta | o **mesmo** `schema.sql` traduzido (FK de coluna -> `CONSTRAINT`, `AUTOINCREMENT` -> `AUTO_INCREMENT`, colunas de chave `TEXT` -> `VARCHAR(191)`) |
+| Datas | `datetime('now')` | `UTC_TIMESTAMP()` (sessao em `time_zone='+00:00'`) |
+| `PRAGMA` | valem | viram `SET`/`SELECT`; o `PRAGMA foreign_keys` do proprio script **sai** (`sem_pragma_fk`) |
+| Testes | suite completa, offline | os mesmos testes, sem tocar no banco remoto |
+
+- O boot (`db.ensure_schema`) cria as tabelas com a checagem de FK **desligada** — o `schema.sql`
+  cria na ordem em que foi escrito, que **nao** e a ordem das FKs (`bot_users` e a tabela #1 e
+  referencia `permission_groups`, que nasce so na #25) — e religa no fim.
+- As FKs tem de ser de **tabela** (`CONSTRAINT ... FOREIGN KEY`): o MySQL **descarta em silencio**
+  o `REFERENCES` escrito na coluna (medido: 30 FKs antes/depois do tratamento, 0 sem ele).
+- Painel PHP: a bifurcacao (`php/db.php` com `BotPDO`/`BotStatement`) e a **Fase 3** do plano
+  `sqliteformysql.md`; hoje o painel so abre SQLite.
 
 
 ## 12. Onde cada coisa se configura no painel
@@ -738,6 +762,12 @@ php tests/test_delivery_schema.php
 php tests/test_form_aware_schema.php
 php tests/test_load_schema.php
 php tests/test_panel_render.php
+
+# Suite Python completa (24 arquivos) - cada um roda sozinho, no backend padrao (sqlite)
+Get-ChildItem tests\test_*.py | ForEach-Object { python $_.FullName }
+
+# Backend que o bot usaria agora (le o .env)
+python -c "from python.config import load_env, db_backend; load_env(); print(db_backend())"
 ```
 
 ---

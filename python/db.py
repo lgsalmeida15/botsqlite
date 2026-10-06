@@ -6,11 +6,37 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
-from .config import sqlite_path, ROOT
+from . import sqlcompat
+from .config import sqlite_path, ROOT, db_backend
 
 log = logging.getLogger("helptoa")
 
 SCHEMA_PATH = ROOT / "schema.sql"
+
+# Excecoes na forma do backend ativo (secao 2.2): o codigo do bot captura
+# `db.IntegrityError`, nunca a classe do driver.
+_BACKEND_MYSQL = False
+
+
+def _resolve_backend() -> None:
+    """Realinha o backend ativo com o `DB_BACKEND` do ambiente (secao 2.2).
+
+    O import do modulo nao pode ser o juiz: o `.env` entra DEPOIS (o
+    `python/main.py` chama `load_env()`, mas ele proprio ja importou este
+    modulo, e o `run.py` importa o `main` antes de tudo). Se o backend ficasse
+    decidido no import, com `DB_BACKEND=mysql` o `ensure_schema` perderia o
+    `PRAGMA foreign_keys = OFF` (erro 1824 nas FKs fora de ordem do
+    `schema.sql`) e o bot capturaria a excecao do driver errado. Por isso quem
+    abre a conexao (`connect()`) reavalia; o import so deixa o padrao.
+    """
+    global _BACKEND_MYSQL, IntegrityError, OperationalError, ProgrammingError
+    _BACKEND_MYSQL = db_backend() == sqlcompat.MYSQL
+    IntegrityError = sqlcompat.IntegrityError if _BACKEND_MYSQL else sqlite3.IntegrityError
+    OperationalError = sqlcompat.OperationalError if _BACKEND_MYSQL else sqlite3.OperationalError
+    ProgrammingError = sqlcompat.ProgrammingError if _BACKEND_MYSQL else sqlite3.ProgrammingError
+
+
+_resolve_backend()
 
 
 def _dict_factory(cursor: sqlite3.Cursor, row: sqlite3.Row) -> dict:
@@ -18,13 +44,16 @@ def _dict_factory(cursor: sqlite3.Cursor, row: sqlite3.Row) -> dict:
 
 
 def connect():
-    path = sqlite_path()
-    conn = sqlite3.connect(str(path), timeout=5.0, check_same_thread=False)
-    conn.row_factory = _dict_factory
-    conn.isolation_level = None
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA journal_mode = WAL")
-    conn.execute("PRAGMA busy_timeout = 5000")
+    """Abre a conexao do backend configurado (`DB_BACKEND`; padrao `sqlite`).
+
+    Este e o unico ponto de conexao do bot: com `sqlite` devolve o mesmo
+    `sqlite3.Connection` com os PRAGMAs de sempre; com `mysql` a fachada do
+    `sqlcompat` traduz o dialeto aqui, sem o resto do codigo saber a diferenca.
+    O backend e reavaliado aqui (`_resolve_backend`): o `.env` pode ter chegado
+    depois do import deste modulo.
+    """
+    _resolve_backend()
+    conn = sqlcompat.connect(sqlite_path=sqlite_path(), row_factory=_dict_factory)
     ensure_schema(conn)
     return conn
 
@@ -47,7 +76,23 @@ def ensure_schema(conn) -> None:
     if "menu_options" in _table_names(conn):
         _migrate_submenu(conn)
     sql = SCHEMA_PATH.read_text(encoding="utf-8")
-    conn.executescript(sql)
+    # O `schema.sql` cria as tabelas na ordem em que foram escritas, que nao e a
+    # ordem das FKs (`menu_options` referencia `transfer_targets`, que nasce
+    # depois). O MySQL exige a tabela referenciada no instante do `CREATE`, mas
+    # com `foreign_key_checks=0` deixa passar; no SQLite o PRAGMA equivalente
+    # nao muda nada de util aqui, entao ele fica so no MySQL.
+    if _BACKEND_MYSQL:
+        conn.commit()                       # o SET nao vale com transacao aberta
+        conn.execute("PRAGMA foreign_keys = OFF")
+        # O `PRAGMA foreign_keys = ON` do proprio script (linha 4, para o
+        # SQLite) religaria a checagem no meio do `executescript` e desfaria o
+        # OFF acima: no MySQL quem manda e o `finally` la embaixo.
+        sql = sqlcompat.sem_pragma_fk(sql)
+    try:
+        conn.executescript(sql)
+    finally:
+        if _BACKEND_MYSQL:
+            conn.execute("PRAGMA foreign_keys = ON")
     _migrate_submenu(conn)
     _migrate_rbac(conn)
     _migrate_ask(conn)
@@ -112,22 +157,26 @@ def _migrate_submenu(conn) -> None:
         """CREATE UNIQUE INDEX IF NOT EXISTS menu_options_per_menu_child
            ON menu_options (menu_id, parent_id, sort_order) WHERE menu_id IS NOT NULL AND parent_id IS NOT NULL"""
     )
-    row = conn.execute(
-        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'menu_options'"
-    ).fetchone()
-    sql = (row or {}).get("sql") or ""
+    # O texto do `CREATE TABLE` nao tem dialeto comum: `sqlite_master` no
+    # SQLite, `SHOW CREATE TABLE` no MySQL. O shim resolve por backend.
+    sql = sqlcompat.table_ddl(conn, "menu_options")
     if sql and "run_script" not in sql:
         _rebuild_menu_options_check(conn)
 
 
 def _rebuild_menu_options_check(conn) -> None:
+    # Fecha o que estava pendente antes de mexer em FK: o MySQL ignora
+    # `FOREIGN_KEY_CHECKS` dentro de transacao aberta (e o driver nao e
+    # autocommit), entao sem isto o `DROP TABLE` do rebuild falharia com as
+    # tabelas que referenciam `menu_options`. No SQLite (autocommit) e no-op.
+    conn.commit()
     conn.execute("PRAGMA foreign_keys = OFF")
     conn.execute("BEGIN")
     conn.execute(
         """CREATE TABLE menu_options_new (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             menu_id INTEGER REFERENCES menus(id) ON DELETE CASCADE,
-            queue_address TEXT REFERENCES queues(address) ON DELETE CASCADE,
+            queue_address VARCHAR(191) REFERENCES queues(address) ON DELETE CASCADE,
             sort_order INTEGER NOT NULL,
             label TEXT NOT NULL,
             classification TEXT NOT NULL DEFAULT '',
@@ -316,15 +365,18 @@ def _migrate_delivery(conn) -> None:
     if "route_assignments" in _table_names(conn) and "close_reason" not in _table_columns(conn, "route_assignments"):
         conn.execute("ALTER TABLE route_assignments ADD COLUMN close_reason TEXT NOT NULL DEFAULT ''")
     # Saneamento: mantem a rota ativa mais antiga por (kind, chat_id).
+    # O `EXISTS` antigo lia a propria `pending_routes` de dentro do UPDATE, o que
+    # o SQLite aceita e o MySQL recusa (erro 1093, "target table ... in FROM
+    # clause"): a tabela derivada `rotas_ativas` e materializada antes do UPDATE
+    # nos dois motores, e o `MIN(id)` por grupo deixa uma so rota ativa.
     conn.execute(
         """UPDATE pending_routes SET status = 'cancelled',
                   detail = 'duplicata saneada na migracao'
             WHERE status NOT IN ('done', 'failed', 'cancelled')
-              AND EXISTS (SELECT 1 FROM pending_routes r2
-                           WHERE r2.kind = pending_routes.kind
-                             AND r2.chat_id = pending_routes.chat_id
-                             AND r2.status NOT IN ('done', 'failed', 'cancelled')
-                             AND r2.id < pending_routes.id)"""
+              AND id NOT IN (SELECT id FROM (
+                    SELECT MIN(id) AS id FROM pending_routes
+                     WHERE status NOT IN ('done', 'failed', 'cancelled')
+                     GROUP BY kind, chat_id) AS rotas_ativas)"""
     )
     conn.execute(
         """CREATE UNIQUE INDEX IF NOT EXISTS pending_routes_active
@@ -470,7 +522,7 @@ def _migrate_load(conn) -> None:
         conn.execute(
             """CREATE TABLE analyst_load_history (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 at TEXT NOT NULL DEFAULT (datetime('now')),
+                 at VARCHAR(191) NOT NULL DEFAULT (datetime('now')),
                  address TEXT NOT NULL,
                  chats_toa INTEGER NOT NULL DEFAULT 0,
                  forms_toa INTEGER NOT NULL DEFAULT 0,
@@ -599,10 +651,16 @@ def offline_open_assignments(conn, min_offline_sec: float) -> list[dict]:
 
 
 def load_trim_history(conn, keep: int = 200) -> int:
-    """Mantem so as `keep` leituras mais recentes do historico."""
+    """Mantem so as `keep` leituras mais recentes do historico.
+
+    A subconsulta virou tabela derivada: ler a propria tabela do `DELETE` e
+    valido no SQLite e erro 1093 no MySQL.
+    """
     cur = conn.execute(
         """DELETE FROM analyst_load_history
-            WHERE id NOT IN (SELECT id FROM analyst_load_history ORDER BY id DESC LIMIT ?)""",
+            WHERE id NOT IN (SELECT id FROM (
+                  SELECT id FROM analyst_load_history
+                   ORDER BY id DESC LIMIT ?) AS recentes)""",
         (int(max(keep, 1)),),
     )
     return int(cur.rowcount or 0)

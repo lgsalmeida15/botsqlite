@@ -160,3 +160,7 @@ class RecuperacaoTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sock.names().count("invite_to_chat"), 1)
         self.assertEqual(len(db.open_assignments(conn)), 1)
 
+
+if __name__ == "__main__":
+    unittest.main()
+

@@ -7,8 +7,15 @@ import signal
 import sys
 import time
 from .auth import SessionNotReady, close_browser, ensure_logged_in, launch_browser, page_on_origin
-from .config import ROOT, env, load_env
-from . import db
+from .config import ROOT, db_backend, env, load_env
+
+# O `.env` entra ANTES do `db`: o modulo decide as excecoes do backend no import
+# (`db.IntegrityError`) e o `run.py` importa este arquivo - com o `db` dentro -
+# antes de qualquer `load_env()`. Sem isto o `DB_BACKEND=mysql` do `.env` nao
+# valeria para o DDL do `ensure_schema` nem para o `except` do bot.
+load_env()
+
+from . import db  # noqa: E402
 from .engine import Engine
 from .resume import BrowserStale, should_recycle
 from .toa import ToaSocket
@@ -95,7 +102,7 @@ async def run_once(conn, page, state: dict):
                 try:
                     if db.conn_closed(engine.conn):
                         engine.conn = db.connect()
-                        log.info("SQLite reconectado (timer)")
+                        log.info("%s reconectado (timer)", db_backend())
                     await engine.tick_timeouts()
                     await engine.tick_routes()
                     await engine.process_pending_jobs()
@@ -164,6 +171,7 @@ async def amain() -> None:
     stop = asyncio.Event()
     _bind_stop(stop)
     conn = db.connect()
+    log.info("banco pronto (%s)", db_backend())
     backoff = 2
     pw = ctx = page = None
     state = {"ws": False}
@@ -198,9 +206,9 @@ async def amain() -> None:
                     pass
                 try:
                     conn = db.connect()
-                    log.info("SQLite reconectado")
+                    log.info("%s reconectado", db_backend())
                 except Exception:
-                    log.warning("falha ao reconectar SQLite", exc_info=True)
+                    log.warning("falha ao reconectar %s", db_backend(), exc_info=True)
                 if _browser_alive(page):
                     if ctx is not None:
                         page = await page_on_origin(ctx, origin, page) or page

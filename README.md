@@ -1,6 +1,6 @@
-# HELPTOA Bot (SQLite)
+# HELPTOA Bot (SQLite ou MySQL 8)
 
-Daemon Playwright + painel PHP no **mesmo servidor**, com banco **SQLite** local. Sem CDN.
+Daemon Playwright + painel PHP no **mesmo servidor**, com banco **SQLite** local (padrão) ou **MySQL 8**. Sem CDN.
 
 Este diretório é um subprojeto autônomo (pode ir para um repositório separado).
 
@@ -9,6 +9,7 @@ Este diretório é um subprojeto autônomo (pode ir para um repositório separad
 - Python 3.10+ com `pip` (Playwright + Chromium)
 - PHP 7.4.3+ com extensão `pdo_sqlite` (obrigatória). `mbstring` é **opcional**: o painel não depende dela (o corte de texto usa `ui_clip`, com alternativa própria quando a extensão não está habilitada)
 - Bot e painel no mesmo host, com escrita na pasta `data/`
+- Para o banco em **MySQL 8.0.19+**: `PyMySQL` (já em `requirements.txt`) no lado Python. O painel PHP em MySQL é a Fase 3 do plano `sqliteformysql.md` e ainda não está ligado
 
 ## Configuração
 
@@ -32,8 +33,26 @@ Edite `.env`:
 | `TOA_HEADLESS` | não | `1` em produção (sem janela) |
 | `TOA_NAV_TIMEOUT_MS` | não | Tempo máximo (ms) de navegação no TOA. Padrão `60000` |
 | `BOT_API_TOKEN` | se usar a API | Header `X-Bot-Token` em `/api/v1/classifications` |
+| `DB_BACKEND` | não | `sqlite` (padrão) ou `mysql`. Ver *Banco* abaixo |
+| `IP_MYSQL`, `PORTA_MYSQL`, `USUARIO_MYSQL`, `SENHA_MYSQL`, `DATABASE_MYSQL` | só com `mysql` | Credenciais do MySQL 8 (mesmos nomes no painel PHP) |
 
-O arquivo SQLite é criado na primeira conexão (bot ou painel). Banco começa vazio, com templates e ajustes padrão.
+No padrão (`sqlite`) o arquivo é criado na primeira conexão (bot ou painel); o banco começa vazio, com templates e ajustes padrão.
+
+### Banco: SQLite (padrão) ou MySQL 8
+
+O **bot Python** fala os dois backends; o default continua **SQLite** e nada muda para quem não configura nada.
+
+| | `DB_BACKEND=sqlite` (padrão) | `DB_BACKEND=mysql` |
+|---|---|---|
+| Conexão | arquivo em `SQLITE_PATH`, com `PRAGMA foreign_keys/WAL/busy_timeout` | `PyMySQL` + tradução do dialeto em `python/sqlcompat.py` |
+| DDL | `schema.sql` como está | **o mesmo** `schema.sql`, traduzido no `execute` |
+| Datas | `datetime('now')` | `UTC_TIMESTAMP()` (sessão em `time_zone='+00:00'`) |
+| Testes | suite completa offline | os mesmos testes, sem tocar no banco remoto |
+
+- O código continua escrito em dialeto SQLite e a tradução acontece no *choke point* (`python/sqlcompat.py`): `?`→`%s`, `ON CONFLICT`→`ON DUPLICATE KEY UPDATE`, `AUTOINCREMENT`→`AUTO_INCREMENT`, `PRAGMA`→`SET`, índice parcial→coluna gerada + índice único, `TEXT` das colunas de chave→`VARCHAR(191)`.
+- As FKs precisam ser de **tabela** (`CONSTRAINT ... FOREIGN KEY`): o MySQL **descarta em silêncio** o `REFERENCES` escrito na coluna e o `ON DELETE` nunca dispararia. O `schema.sql` cria as tabelas fora da ordem das FKs, então o boot cria com a checagem desligada (`FOREIGN_KEY_CHECKS=0`) e religa no fim.
+- Credenciais do MySQL: `IP_MYSQL`, `PORTA_MYSQL`, `USUARIO_MYSQL`, `SENHA_MYSQL`, `DATABASE_MYSQL` (mesmos nomes no painel PHP). Faltando valor com `DB_BACKEND=mysql`, o boot para com a lista exata das chaves.
+- **Painel PHP:** hoje só SQLite — a bifurcação do painel é a Fase 3 de [sqliteformysql.md](sqliteformysql.md).
 
 Crie o usuário do painel:
 
