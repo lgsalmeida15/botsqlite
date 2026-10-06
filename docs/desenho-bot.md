@@ -33,7 +33,7 @@ flowchart LR
 | `python/db.py` | acesso, migracoes, **ledger de casos**, jobs (backend decidido por `config.db_backend()`) |
 | `python/sqlcompat.py` | tradutor SQLite → MySQL no *choke point* + fachada de conexao (so age no backend `mysql`) |
 | `python/resource_profile.py` | valida perfil de gestor do operador nos scripts |
-| `python/scripts/` | scripts de atendimento (`criar_apoio`, `criar_infra_rede`, `criar_acesso_hub`) + `registry.py` + `manifest.json` + `bases/` |
+| `python/scripts/` | scripts de atendimento (`criar_apoio`, `criar_infra_rede`, `remanejamento_rota`, `criar_acesso_hub`) + `registry.py` + `manifest.json` + `bases/` |
 | `schema.sql` | DDL aplicada tanto pelo Python quanto pelo PHP |
 | `php/index.php` + `php/bootstrap.php` | painel: abas, acoes POST, render e migracoes |
 | `tests/` | 487 testes Python (24 arquivos, rodam offline em SQLite) + 10 suites PHP |

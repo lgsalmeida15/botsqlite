@@ -13,7 +13,13 @@ from unittest.mock import AsyncMock, patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from python.scripts import criar_acesso_hub, criar_apoio, criar_infra_rede, registry  # noqa: E402
+from python.scripts import (  # noqa: E402
+    criar_acesso_hub,
+    criar_apoio,
+    criar_infra_rede,
+    registry,
+    remanejamento_rota,
+)
 from tests.test_submenu import insert_option, mem_conn, seed_queue_menu  # noqa: E402
 
 ENV = {
@@ -34,6 +40,18 @@ ANSWERS_INFRA = {
     "equipamento": "LIBAC",
     "rede": "HFC",
     "tecnico": "Z679436",
+}
+ENV_ROTA = {
+    "REMANEJAMENTO_API_URL": "http://example.test:8101/api/v1/toa/realocar_tarefa?ambiente=PRODUCAO",
+    "APOIO_STATUS_URL": "http://example.test/api/v1/toa",
+    "APOIO_API_KEY": "sekret",
+}
+ANSWERS_ROTA_PROXIMA = {"tarefa_id": "42", "tecnico": "Z679436", "posicao": "Próxima da rota"}
+ANSWERS_ROTA_APOS = {
+    "tarefa_id": "42",
+    "tecnico": "Z679436",
+    "posicao": "Após outra atividade",
+    "apos_tarefa_id": "41",
 }
 
 
@@ -83,6 +101,7 @@ class ManifestRegistryTest(unittest.TestCase):
         self.assertIn("criar_apoio", slugs)
         self.assertIn("criar_infra_rede", slugs)
         self.assertIn("criar_acesso_hub", slugs)
+        self.assertIn("remanejamento_rota", slugs)
 
 
 class RegistryFieldsTest(unittest.TestCase):
@@ -131,6 +150,58 @@ class RegistryFieldsTest(unittest.TestCase):
     def test_confirm_note(self):
         self.assertIn("recusa", registry.confirm_note("criar_acesso_hub"))
         self.assertEqual(registry.confirm_note("criar_infra_rede"), "")
+
+    def test_remanejamento_nao_pede_apos_na_proxima(self):
+        self.assertEqual(
+            [f["key"] for f in registry.fields_for("remanejamento_rota", {})],
+            ["tarefa_id", "tecnico", "posicao"],
+        )
+        self.assertEqual(
+            [
+                f["key"]
+                for f in registry.fields_for(
+                    "remanejamento_rota", {"posicao": "Próxima da rota"}
+                )
+            ],
+            ["tarefa_id", "tecnico", "posicao"],
+        )
+
+    def test_remanejamento_pede_apos_quando_apos_outra(self):
+        self.assertEqual(
+            [
+                f["key"]
+                for f in registry.fields_for(
+                    "remanejamento_rota", {"posicao": "Após outra atividade"}
+                )
+            ],
+            ["tarefa_id", "tecnico", "posicao", "apos_tarefa_id"],
+        )
+
+    def test_remanejamento_normaliza_ids_e_posicao(self):
+        self.assertEqual(
+            registry.normalize_answer("remanejamento_rota", {"key": "tarefa_id"}, "42", {})[
+                "value"
+            ],
+            "42",
+        )
+        ruim = registry.normalize_answer("remanejamento_rota", {"key": "tarefa_id"}, "0", {})
+        self.assertIsNone(ruim["value"])
+        self.assertTrue(ruim["retry"])
+        self.assertEqual(
+            registry.normalize_answer("remanejamento_rota", {"key": "posicao"}, "2", {})["value"],
+            "Após outra atividade",
+        )
+        self.assertEqual(
+            registry.normalize_answer("remanejamento_rota", {"key": "posicao"}, "1", {})["value"],
+            "Próxima da rota",
+        )
+
+    def test_remanejamento_recusa_apos_igual_a_tarefa(self):
+        norm = registry.normalize_answer(
+            "remanejamento_rota", {"key": "apos_tarefa_id"}, "42", {"tarefa_id": "42"}
+        )
+        self.assertIsNone(norm["value"])
+        self.assertTrue(norm["retry"])
 
 
 class CriarApoioTest(unittest.IsolatedAsyncioTestCase):
@@ -515,6 +586,151 @@ class CriarInfraRedeTest(unittest.IsolatedAsyncioTestCase):
         with patch.dict(os.environ, {**ENV, **ENV_INFRA}, clear=False):
             r = await criar_infra_rede.run(
                 {"answers": ANSWERS_INFRA, "resume_uuid": "uid-infra"},
+                http_post=fake_post,
+                http_get=fake_get,
+            )
+        self.assertTrue(r["ok"])
+        self.assertEqual(posts, [])
+
+
+class RemanejamentoRotaTest(unittest.IsolatedAsyncioTestCase):
+    async def test_posicao1_nao_envia_apos_e_usa_url_propria(self):
+        captured = {}
+
+        def fake_post(url, payload, headers, *a, **k):
+            captured["url"] = url
+            captured["payload"] = payload
+            captured["headers"] = headers
+            return 200, {"status": "SUCESSO", "acao": "REALOCAR_TAREFA"}
+
+        with patch.dict(os.environ, ENV_ROTA, clear=False):
+            r = await remanejamento_rota.run(
+                {"answers": ANSWERS_ROTA_PROXIMA}, http_post=fake_post
+            )
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["action"], "reply_and_close")
+        self.assertEqual(r["message"], remanejamento_rota.SUCCESS_MESSAGE)
+        self.assertEqual(captured["url"], ENV_ROTA["REMANEJAMENTO_API_URL"])
+        self.assertEqual(captured["payload"], {"tarefa_id": 42, "tecnico": "Z679436"})
+        self.assertNotIn("apos_tarefa_id", captured["payload"])
+        self.assertNotIn("posicao", captured["payload"])
+        self.assertEqual(captured["headers"]["x-api-key"], "sekret")
+        self.assertEqual(captured["headers"]["x-modo"], "sync")
+        self.assertNotIn("sekret", r["detail"])
+
+    async def test_posicao2_envia_posicao_apos_e_apos_tarefa_id(self):
+        captured = {}
+
+        def fake_post(url, payload, headers, *a, **k):
+            captured["payload"] = payload
+            return 200, {"status": "SUCESSO"}
+
+        with patch.dict(os.environ, ENV_ROTA, clear=False):
+            r = await remanejamento_rota.run({"answers": ANSWERS_ROTA_APOS}, http_post=fake_post)
+        self.assertTrue(r["ok"])
+        self.assertEqual(
+            captured["payload"],
+            {
+                "tarefa_id": 42,
+                "tecnico": "Z679436",
+                "posicao": remanejamento_rota.POS_API_APOS,
+                "apos_tarefa_id": 41,
+            },
+        )
+
+    async def test_answers_invalidos_transfere_sem_http(self):
+        def fake_post(url, payload, headers, *a, **k):
+            raise AssertionError("nao deveria chamar HTTP")
+
+        with patch.dict(os.environ, ENV_ROTA, clear=False):
+            r = await remanejamento_rota.run(
+                {"answers": {"tarefa_id": "42", "tecnico": "", "posicao": "Próxima da rota"}},
+                http_post=fake_post,
+            )
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["action"], "ask_and_transfer")
+        self.assertEqual(r["message"], remanejamento_rota.ERROR_MESSAGE)
+        self.assertEqual(r["detail"], "bad_answers")
+
+    async def test_sem_config_transfere(self):
+        def fake_post(url, payload, headers, *a, **k):
+            raise AssertionError("nao deveria chamar HTTP")
+
+        with patch.dict(os.environ, {"APOIO_API_KEY": "sekret"}, clear=True):
+            r = await remanejamento_rota.run(
+                {"answers": ANSWERS_ROTA_PROXIMA}, http_post=fake_post
+            )
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["detail"], "config")
+
+    async def test_http_500_transfere_sem_vazar_chave(self):
+        calls = []
+
+        def fake_post(url, payload, headers, *a, **k):
+            calls.append(headers.get("x-api-key"))
+            return 500, {"detail": "falha xyz"}
+
+        with patch.dict(os.environ, ENV_ROTA, clear=False), patch(
+            "python.scripts.remanejamento_rota.asyncio.sleep", new_callable=AsyncMock
+        ):
+            r = await remanejamento_rota.run({"answers": ANSWERS_ROTA_PROXIMA}, http_post=fake_post)
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["action"], "ask_and_transfer")
+        self.assertEqual(r["message"], remanejamento_rota.ERROR_MESSAGE)
+        self.assertIn("http 500", r["detail"])
+        self.assertIn("falha xyz", r["detail"])
+        self.assertNotIn("sekret", r["detail"])
+        self.assertEqual(len(calls), 3)
+
+    async def test_409_gera_novo_uuid_e_repete(self):
+        uuids = []
+
+        def fake_post(url, payload, headers, *a, **k):
+            uuids.append(headers.get("x-uuid"))
+            if len(uuids) == 1:
+                return 409, {"detail": "uuid ja utilizado"}
+            return 200, {"status": "SUCESSO"}
+
+        with patch.dict(os.environ, ENV_ROTA, clear=False):
+            r = await remanejamento_rota.run({"answers": ANSWERS_ROTA_PROXIMA}, http_post=fake_post)
+        self.assertTrue(r["ok"])
+        self.assertEqual(len(uuids), 2)
+        self.assertNotEqual(uuids[0], uuids[1])
+
+    async def test_pendente_depois_get_sucesso(self):
+        gets = []
+
+        def fake_post(url, payload, headers, *a, **k):
+            return 200, {"status": "PENDENTE"}
+
+        def fake_get(url, headers, *a, **k):
+            gets.append(headers.get("x-uuid"))
+            return 200, {"status": "SUCESSO"}
+
+        with patch.dict(os.environ, ENV_ROTA, clear=False):
+            r = await remanejamento_rota.run(
+                {"answers": ANSWERS_ROTA_PROXIMA},
+                http_post=fake_post,
+                http_get=fake_get,
+            )
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["action"], "reply_and_close")
+        self.assertEqual(len(gets), 1)
+
+    async def test_resume_so_get_sem_post(self):
+        posts = []
+
+        def fake_post(url, payload, headers, *a, **k):
+            posts.append(1)
+            raise AssertionError("POST no resume")
+
+        def fake_get(url, headers, *a, **k):
+            self.assertEqual(headers.get("x-uuid"), "uid-rota")
+            return 200, {"status": "SUCESSO"}
+
+        with patch.dict(os.environ, ENV_ROTA, clear=False):
+            r = await remanejamento_rota.run(
+                {"answers": ANSWERS_ROTA_PROXIMA, "resume_uuid": "uid-rota"},
                 http_post=fake_post,
                 http_get=fake_get,
             )

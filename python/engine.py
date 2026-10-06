@@ -1491,7 +1491,7 @@ class Engine:
         if not fields:
             await self._invalid_reply(cid, row)
             return
-        if slug == "criar_apoio":
+        if slug in ("criar_apoio", "remanejamento_rota"):
             addr = (MEM.get(cid) or {}).get("started_addr") or ""
             login = _member_login_raw(addr)
             page = getattr(self.sock, "page", None)

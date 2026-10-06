@@ -29,6 +29,15 @@
         {"key": "rede", "type": "choice", "prompt": "Qual a rede?", "choices": ["HFC", "GPON"]},
         {"key": "tecnico", "type": "text", "prompt": "Qual o Login do Técnico?"}
       ]
+    },
+    {
+      "slug": "remanejamento_rota",
+      "label": "Remanejar rota de tecnicos",
+      "fields": [
+        {"key": "tarefa_id", "type": "int", "prompt": "Informe Id da atividade a ser remanejada"},
+        {"key": "tecnico", "type": "text", "prompt": "Informe Login do técnico a receber atividade"},
+        {"key": "posicao", "type": "choice", "prompt": "Posição da atividade:", "choices": ["Próxima da rota", "Após outra atividade"]}
+      ]
     }
   ]
 }

@@ -22,6 +22,11 @@ ENV_APOIO = {
     "APOIO_API_KEY": "sekret",
 }
 ENV_HUB = {"WEBHOOK_ACESSO_HUB": "http://example.test/hook/acesso-hub"}
+ENV_ROTA = {
+    "REMANEJAMENTO_API_URL": "http://example.test:8101/api/v1/toa/realocar_tarefa?ambiente=PRODUCAO",
+    "APOIO_STATUS_URL": "http://example.test/api/v1/toa",
+    "APOIO_API_KEY": "sekret",
+}
 
 
 def seed_apoio_leaf(conn) -> int:
@@ -86,6 +91,28 @@ def seed_hub_leaf(conn) -> int:
         classification="hub",
         action="run_script",
         script_slug="criar_acesso_hub",
+    )
+    return parent
+
+
+def seed_rota_leaf(conn) -> int:
+    parent = insert_option(
+        conn,
+        menu_id=1,
+        sort_order=1,
+        label="Coord. Rota",
+        classification="",
+        action="submenu",
+    )
+    insert_option(
+        conn,
+        menu_id=1,
+        parent_id=parent,
+        sort_order=1,
+        label="Remanejar rota",
+        classification="apoio",
+        action="run_script",
+        script_slug="remanejamento_rota",
     )
     return parent
 
@@ -614,6 +641,145 @@ class AcessoHubWizardTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(int(chat["script_field_index"] or 0), 0)
         self.assertEqual(json.loads(chat["script_answers"] or "{}"), {})
         self.assertIn("Qual hub/site?", sock.sent_texts()[-1])
+
+
+class RemanejamentoWizardTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        from python.engine import MEM
+
+        MEM.clear()
+        self._gate = patch(
+            "python.engine.resource_profile.lookup",
+            new_callable=AsyncMock,
+            return_value={"allowed": True, "login": "tec", "perfil": "Gestor RE3", "reason": "ok"},
+        )
+        self._gate.start()
+        self.addCleanup(self._gate.stop)
+        self.addCleanup(MEM.clear)
+
+    def _eng(self, conn) -> tuple[Engine, FakeSock]:
+        sock = FakeSock()
+        return Engine(conn, sock), sock
+
+    async def _abre(self, eng: Engine, conn) -> None:
+        await eng.handle_reply(10, awaiting(conn), "1")
+        await eng.handle_reply(10, row_of(conn), "1")
+
+    async def test_posicao_proxima_envia_payload_sem_apos(self):
+        conn = mem_conn()
+        seed_queue_menu(conn)
+        seed_rota_leaf(conn)
+        eng, sock = self._eng(conn)
+        await self._abre(eng, conn)
+        chat = row_of(conn)
+        self.assertEqual(chat["status"], "awaiting_script_answer")
+        self.assertEqual(chat["script_slug"], "remanejamento_rota")
+        self.assertIn("Informe Id da atividade", sock.sent_texts()[-1])
+
+        await eng.handle_reply(10, chat, "42")
+        self.assertIn("Informe Login do técnico", sock.sent_texts()[-1])
+        await eng.handle_reply(10, row_of(conn), "Z679436")
+        pos = sock.sent_texts()[-1]
+        self.assertIn("Posição da atividade", pos)
+        self.assertIn("1) Próxima da rota", pos)
+        self.assertIn("2) Após outra atividade", pos)
+
+        await eng.handle_reply(10, row_of(conn), "1")
+        chat = row_of(conn)
+        self.assertEqual(chat["status"], "awaiting_script_confirm")
+        conf = sock.sent_texts()[-1]
+        self.assertIn("Confirme as informações:", conf)
+        self.assertIn("Atividade: 42.", conf)
+        self.assertIn("Técnico: Z679436.", conf)
+        self.assertIn("Posição: Próxima da rota.", conf)
+        self.assertNotIn("Após a atividade", conf)
+
+        captured = {}
+
+        def fake_post(url, payload, headers, *a, **k):
+            captured["url"] = url
+            captured["payload"] = payload
+            return 200, {"status": "SUCESSO"}
+
+        with patch.dict(os.environ, ENV_ROTA, clear=False), patch(
+            "python.scripts.remanejamento_rota._post_json", side_effect=fake_post
+        ):
+            await eng.handle_reply(10, chat, "1")
+        chat = row_of(conn)
+        self.assertEqual(chat["status"], "closed")
+        self.assertEqual(captured["payload"], {"tarefa_id": 42, "tecnico": "Z679436"})
+        self.assertNotIn("posicao", captured["payload"])
+        self.assertTrue(any("Remanejamento efetuado" in t for t in sock.sent_texts()))
+
+    async def test_posicao_apos_pergunta_apos_e_envia(self):
+        conn = mem_conn()
+        seed_queue_menu(conn)
+        seed_rota_leaf(conn)
+        eng, sock = self._eng(conn)
+        await self._abre(eng, conn)
+        await eng.handle_reply(10, row_of(conn), "42")
+        await eng.handle_reply(10, row_of(conn), "Z679436")
+        await eng.handle_reply(10, row_of(conn), "2")
+        chat = row_of(conn)
+        self.assertEqual(chat["status"], "awaiting_script_answer")
+        self.assertEqual(int(chat["script_field_index"]), 3)
+        self.assertIn("Informe Id da atividade anterior", sock.sent_texts()[-1])
+
+        await eng.handle_reply(10, row_of(conn), "41")
+        chat = row_of(conn)
+        self.assertEqual(chat["status"], "awaiting_script_confirm")
+        conf = sock.sent_texts()[-1]
+        self.assertIn("Posição: Após outra atividade.", conf)
+        self.assertIn("Após a atividade: 41.", conf)
+
+        captured = {}
+
+        def fake_post(url, payload, headers, *a, **k):
+            captured["payload"] = payload
+            return 200, {"status": "SUCESSO"}
+
+        with patch.dict(os.environ, ENV_ROTA, clear=False), patch(
+            "python.scripts.remanejamento_rota._post_json", side_effect=fake_post
+        ):
+            await eng.handle_reply(10, row_of(conn), "1")
+        self.assertEqual(
+            captured["payload"],
+            {
+                "tarefa_id": 42,
+                "tecnico": "Z679436",
+                "posicao": "apos_tarefa",
+                "apos_tarefa_id": 41,
+            },
+        )
+
+    async def test_id_invalido_avisa_e_nao_avanca(self):
+        conn = mem_conn()
+        seed_queue_menu(conn)
+        seed_rota_leaf(conn)
+        eng, sock = self._eng(conn)
+        await self._abre(eng, conn)
+        await eng.handle_reply(10, row_of(conn), "0")
+        chat = row_of(conn)
+        self.assertEqual(chat["status"], "awaiting_script_answer")
+        self.assertEqual(int(chat["retries"] or 0), 1)
+        self.assertIn("Id da atividade inválido", sock.sent_texts()[-2])
+        self.assertEqual(sock.sent_texts()[-1], "Informe Id da atividade a ser remanejada")
+        self.assertNotIn("tarefa_id", json.loads(chat["script_answers"] or "{}"))
+
+    async def test_apos_igual_a_tarefa_avisa(self):
+        conn = mem_conn()
+        seed_queue_menu(conn)
+        seed_rota_leaf(conn)
+        eng, sock = self._eng(conn)
+        await self._abre(eng, conn)
+        await eng.handle_reply(10, row_of(conn), "42")
+        await eng.handle_reply(10, row_of(conn), "Z679436")
+        await eng.handle_reply(10, row_of(conn), "2")
+        await eng.handle_reply(10, row_of(conn), "42")
+        chat = row_of(conn)
+        self.assertEqual(chat["status"], "awaiting_script_answer")
+        self.assertIn("não pode ser a anterior de si mesma", sock.sent_texts()[-2])
+        self.assertNotIn("apos_tarefa_id", json.loads(chat["script_answers"] or "{}"))
 
 
 class ResumeScriptStatusTest(unittest.TestCase):

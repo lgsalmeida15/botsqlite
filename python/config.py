@@ -8,7 +8,12 @@ ROOT = Path(__file__).resolve().parent.parent
 ENV_PATH = ROOT / ".env"
 
 # URLs cujos hosts (API interna na rede Claro) nunca podem passar por proxy.
-NO_PROXY_URL_KEYS = ("APOIO_API_URL", "APOIO_STATUS_URL", "INFRA_REDE_API_URL")
+NO_PROXY_URL_KEYS = (
+    "APOIO_API_URL",
+    "APOIO_STATUS_URL",
+    "INFRA_REDE_API_URL",
+    "REMANEJAMENTO_API_URL",
+)
 
 
 def load_env() -> None:
