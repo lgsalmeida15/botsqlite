@@ -831,6 +831,45 @@ não passa por vacuidade (a amostra ruim tem de ser acusada): chave composta, `C
 | 27 | Backend decidido no **import** do `db` antes do `load_env()`: com `DB_BACKEND=mysql` no `.env` o `_BACKEND_MYSQL` fica `False` (sem `PRAGMA foreign_keys = OFF`, excecoes do `sqlite3` no `except` do bot) | `python/db.py` (import) x ordem em `python/main.py:161` e `run.py` | `load_env()` antes de importar o `db` (`main.py`/`run.py`) + `db._resolve_backend()` reavaliado no import **e** em `connect()` | Fase 2 (`test_backend_do_db_se_realinha_depois_do_import`) |
 | 28 | `x IS ?` (valor por parâmetro) → **1064** (`IS 1`): o `IS` do MySQL só compara com `NULL`/`TRUE`/`FALSE` | `db.py:1263` (`queue_position`, chamada pelo tick de rotas a cada 5 s) | `x <=> %s` (regra 26); operando à esquerda composto falha alto em vez de gerar SQL inválido | Fase 4/5 (boot real: `tmp_bak/bot-20261006-161042.err` registrou o 1064 a cada 5 s) |
 | 29 | Parâmetro **fora do grupo do `VALUES`** + `executemany` → `TypeError: not all arguments converted during string formatting`: o atalho `RE_INSERT_VALUES` do PyMySQL entrega a linha inteira só para o grupo do `VALUES` (o `postfix` nem é formatado) | `db.py:937`/`945` (`ingest_search_contact`: `last_seen = datetime('now')` no `ON DUPLICATE KEY UPDATE`) | a fachada só usa o lote do driver quando todo `%s` está no `VALUES`; fora disso executa linha a linha (4.2) | Fase 4/5 (boot real; o driver falso dos testes **não** emula o atalho) |
+| 30 | Colacao **legada** `ci` numa tabela que **ja existia** (`CREATE TABLE IF NOT EXISTS` nao altera tabela existente) -> toda FK nova apontando para essa coluna morre com **3780** (`Referencing column 'queue_address' and referenced column 'address' ... are incompatible`) | base `chat_bot_toa`: 5 tabelas criadas por uma versao **anterior** do schema, antes da regra 5.5c - `queues.address`, `templates.slug`, `bot_users.login`, `transfer_targets.kind`/`address` em `utf8mb4_general_ci` (default do servidor) contra `utf8mb4_bin` do alvo | `ALTER TABLE ... MODIFY` das colunas-chave para a collation/tipo do alvo **antes** do `--apply` (6.1) | `--apply` fechar os 54 comandos sem 3780 |
+| 31 | FK **inline** de tabela pre-existente nao e recriada (o `CREATE TABLE IF NOT EXISTS` dela e no-op) -> o DDL fecha com **29 FKs** em vez de 30 | `bot_users.group_id` na base antiga: `int` (em vez de `BIGINT`) e sem `fk_bot_users_group_id` | `ALTER TABLE bot_users ADD CONSTRAINT ... ON DELETE SET NULL` **depois** do `--apply` (o pai `permission_groups` nasce no fim do `schema.sql`) (6.1) | `FKs gravadas no destino: 30` e `FKs conferidas: 30` |
+| 32 | Os **seeds** do `schema.sql` (`INSERT OR IGNORE`) rodam no DDL, **antes** da carga, e vencem a origem (`INSERT IGNORE` nao sobrescreve linha existente); `--truncate` **nao** conserta (o seed roda de novo antes da carga) | `templates` (10 conflitos), `bot_settings` (36), `permission_groups` (1): `max_open_chats_per_agent` 4->8, `max_open_forms_per_agent` 4->8, `rbac_scope_groups` 1->0, `rbac_seeded` 1->0, `templates.id`/`updated_at`, `permission_groups.created_at` | a origem manda: comparar coluna a coluna e `UPDATE` dirigido **depois** do `--apply` (6.1) | hash de conteudo por tabela (`tmp_bak/verifica_final.py`), nao so `COUNT(*)` |
+
+### 6.1 Base de producao legada — o que o `CREATE TABLE IF NOT EXISTS` nao conserta (06/10/2026)
+
+A base `chat_bot_toa` (10.70.107.52) ja tinha 5 tabelas (`bot_users`, `queues`,
+`templates`, `menus`, `transfer_targets`), **todas com 0 linhas**, criadas por uma
+versao anterior do schema. `CREATE TABLE IF NOT EXISTS` nao altera tabela existente,
+entao nada disso se conserta sozinho - e a primeira FK nova que aponta para
+`queues.address` derruba o `--apply` inteiro com o erro 3780. Os 5 comandos abaixo
+alinham a base ao `schema.sql` atual (nenhum `DROP`: as tabelas de producao sao
+preservadas e a origem SQLite nunca e tocada):
+
+```sql
+ALTER TABLE `queues`           MODIFY `address` VARCHAR(191) COLLATE utf8mb4_bin NOT NULL;
+ALTER TABLE `templates`        MODIFY `slug`    VARCHAR(191) COLLATE utf8mb4_bin NOT NULL;
+ALTER TABLE `bot_users`        MODIFY `login`   VARCHAR(191) COLLATE utf8mb4_bin NOT NULL,
+                               MODIFY `group_id` BIGINT NULL;
+ALTER TABLE `transfer_targets` MODIFY `kind`    TEXT COLLATE utf8mb4_bin NOT NULL,
+                               MODIFY `address` VARCHAR(191) COLLATE utf8mb4_bin NOT NULL;
+-- depois do --apply (o pai nasce no fim do schema.sql):
+ALTER TABLE `bot_users` ADD CONSTRAINT `fk_bot_users_group_id`
+  FOREIGN KEY (`group_id`) REFERENCES `permission_groups` (`id`) ON DELETE SET NULL;
+```
+
+Roteiro que foi executado: alinhar as colunas (6 colunas modificadas, `ALTERs: 6 de 6 ok`
+na evidencia) -> `--apply` -> `UPDATE` das linhas que os seeds venceram -> `ADD CONSTRAINT`
+acima -> `--apply` de novo (idempotente: 0 linha nova) -> `--check` -> hash de conteudo por
+tabela.
+
+Resultado em producao (06/10/2026): 31 tabelas, **222.268 linhas**, 30 FKs, 0 orfaos,
+`--check` e hash por tabela com **0 divergencia** (31/31 identicas; unico AVISO
+esperado: `bot_jobs.payload`, coluna so na origem, por design). Evidencias em
+`tmp_bak/migracao-prod-20261006-*.txt` (relatorio do migrador, tentativa que falhou
+com 3780, DDL antes/depois, reparo, correcoes de conteudo, 2a passada, `--check` e
+hash por tabela). Scripts temporarios usados no cutover (em `tmp_bak/`, nao
+versionados): `reparo_legado.py`, `ajusta_conteudo.py`, `verifica_final.py`,
+`preflight_boot.py`, `valida_sql_do_doc.py`.
 
 ---
 
@@ -1043,19 +1082,37 @@ nunca foi tocado).
 **Arquivos:** `.env` do servidor (so `DB_BACKEND` + credenciais).
 **Passos:**
 1. Parar o bot; parar o painel; confirmar que nao ha `helptoa.sqlite` aberto.
-2. Backup final: `data\backup_cutover.sqlite` + hash.
-3. `python bin/migrar_sqlite_para_mysql.py --sqlite data\helptoa.sqlite --schema --apply`
-   e, na sequencia, `--check`.
-4. Trocar o `.env` para `DB_BACKEND=mysql` (+ host/porta/usuario/senha/base).
-5. Subir o painel (conferir login e as abas) e depois o bot.
-6. Monitorar 30-60 min: log do bot, `SHOW PROCESSLIST`, contagens.
+2. Backup final: `data\backup_cutover.sqlite` + hash (a origem continua intocada).
+3. Base legada (so se o destino ja tiver tabelas do schema antigo): alinhar as
+   collations/tipos da secao 6.1 **antes** do `--apply`, senao a FK de `menu_queues`
+   morre com 3780 e o `--apply` para no meio do DDL.
+4. `python bin/migrar_sqlite_para_mysql.py --apply` e, na sequencia,
+   `python bin/migrar_sqlite_para_mysql.py --check` (`--schema`, `--apply` e `--check`
+   sao exclusivos entre si: uma flag por execucao).
+5. Fechar as 3 pendencias que o `IF NOT EXISTS` e os seeds deixam (6.1): `UPDATE`
+   dirigido das linhas semeadas, `ADD CONSTRAINT fk_bot_users_group_id`, e `--apply`
+   de novo - idempotente, tem de fechar com 0 linha nova e
+   `FKs conferidas: 30 | com orfao: 0`.
+6. Conferir por **conteudo**, nao so por contagem: hash por tabela origem x destino.
+7. Trocar o `.env` para `DB_BACKEND=mysql` (+ host/porta/usuario/senha/base).
+8. Subir o painel (conferir login e as abas) e depois o bot.
+9. Monitorar 30-60 min: log do bot, `SHOW PROCESSLIST`, contagens.
 
 **GATE:** `--check` = 0 diferenca logo apos a carga; painel e bot operando; log limpo; **501/0** + 12
 suites verdes no repositorio.
 **Nao avance se:** o `--check` divergir, o login falhar ou aparecer excecao de SQL no log do bot.
 **Rollback (1 linha):** parar os dois, `DB_BACKEND=sqlite`, subir de novo. O arquivo SQLite
 continua com os dados de antes do cutover; o que foi escrito no MySQL depois do cutover (poucos
-minutos) se perde - por isso a janela de observacao do passo 6 e curta e vigiada.
+minutos) se perde - por isso a janela de observacao do passo 9 e curta e vigiada.
+
+**Estado (06/10/2026):** a base de producao `chat_bot_toa` ja esta migrada e conferida
+(passos 1-6 e secao 6.1: 31 tabelas / 222.268 linhas / 30 FKs / 0 divergencia de conteudo).
+Falta o passo 7 (virar o `.env` do servidor para `DB_BACKEND=mysql`) e os passos 8-9 (subir
+painel e bot). Enquanto o `.env` nao virar, o bot continua escrevendo no SQLite e o MySQL
+fica parado - o rollback e so nao mexer no `.env`. O caminho de boot do bot foi exercitado
+contra a base migrada (`db.connect()` = `ensure_schema` + as 10 migracoes): sem erro, **0
+linha escrita** e 31 tabelas / 30 FKs depois (`tmp_bak/preflight_boot.py --boot`); o hash por
+tabela continuou com 0 divergencia depois disso.
 
 ---
 
