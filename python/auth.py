@@ -57,7 +57,7 @@ _SESSION_JS = """async () => {
 
 
 _WIPE_ORIGIN_JS = """async () => {
-    const out = {sw: 0, caches: 0};
+    const out = {sw: 0, caches: 0, keys: 0};
     try {
         const regs = await navigator.serviceWorker.getRegistrations();
         for (const r of regs) { await r.unregister(); out.sw++; }
@@ -65,7 +65,7 @@ _WIPE_ORIGIN_JS = """async () => {
     try {
         for (const k of await caches.keys()) { await caches.delete(k); out.caches++; }
     } catch (e) {}
-    try { localStorage.clear(); } catch (e) {}
+    try { out.keys = localStorage.length; localStorage.clear(); } catch (e) {}
     try { sessionStorage.clear(); } catch (e) {}
     return out;
 }"""
@@ -121,22 +121,26 @@ async def _open_landing(page, origin: str) -> None:
     )
 
 
-async def _wipe_origin_state(page) -> None:
+async def _wipe_origin_state(page) -> bool:
     # Quando o TOA sobe uma release nova, o ServiceWorker e o offline cache
     # gravados no perfil persistente continuam na versão antiga: a instalação
     # do SW passa a falhar ("Unexpected ... manifest version") e o módulo de
     # chat nunca termina o bootstrap, então a página nunca cria o WebSocket.
     # O localStorage também guarda o communityConfig velho, que faz o JS
     # remontar a URL do WS com a session key expirada.
+    # Retorna True quando removeu algo — só aí vale pagar outra navegação.
     try:
-        out = await page.evaluate(_WIPE_ORIGIN_JS)
+        out = await page.evaluate(_WIPE_ORIGIN_JS) or {}
     except Exception as e:
         log.warning("não limpou estado da origem: %s", e)
-        return
-    log.info(
-        "estado da origem limpo sw=%s caches=%s",
-        (out or {}).get("sw"), (out or {}).get("caches"),
-    )
+        return False
+    sujo = any(out.get(k) for k in ("sw", "caches", "keys"))
+    if sujo:
+        log.info(
+            "estado da origem limpo sw=%s caches=%s keys=%s",
+            out.get("sw"), out.get("caches"), out.get("keys"),
+        )
+    return sujo
 
 
 async def _probe_session(page, origin: str) -> bool:
@@ -313,8 +317,8 @@ async def ensure_logged_in(page, origin: str) -> None:
     await ctx.clear_cookies()
     log.info("cookies limpos; abrindo landing origin=%s", origin)
     await _open_landing(page, origin)
-    await _wipe_origin_state(page)
-    await _open_landing(page, origin)
+    if await _wipe_origin_state(page):
+        await _open_landing(page, origin)
 
     last_attempt = 0.0
     if await _try_auto_login(page):
