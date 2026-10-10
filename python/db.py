@@ -1297,6 +1297,33 @@ def finish_routes_for_chat(conn, chat_id: int, status: str, detail: str = "") ->
     return int(cur.rowcount or 0)
 
 
+def finish_orphan_routes(conn, status: str = "failed",
+                         detail: str = "rota orfa: chat fora do TOA") -> int:
+    """Encerra rotas de chat cujo chat saiu do conjunto aberto (rota orfa).
+
+    Cinto de seguranca do `resume_stale`: se qualquer caminho deixar o chat fora do
+    estado aberto sem fechar a rota, ela para de girar `move_chat` para sempre.
+    Nao toca em formulario nem em rota com posse (lease) de entrega viva.
+    """
+    cur = conn.execute(
+        """UPDATE pending_routes
+              SET status = ?, detail = ?, next_try_at = NULL,
+                  claimed_by = '', claim_expires_at = NULL
+            WHERE status = 'waiting' AND kind = 'chat'
+              AND chat_id IN (
+                    SELECT chat_id FROM chats
+                     WHERE status NOT IN
+                           ('joined', 'menu_sent', 'awaiting_reply', 'classified',
+                            'monitoring', 'awaiting_script_answer',
+                            'awaiting_script_confirm', 'awaiting_script_run'))
+              AND (COALESCE(claimed_by, '') = ''
+                   OR claim_expires_at IS NULL
+                   OR datetime(claim_expires_at) <= datetime('now'))""",
+        (str(status), detail or ""),
+    )
+    return int(cur.rowcount or 0)
+
+
 def due_routes(conn, per_line: int = 5) -> dict[str, list[dict]]:
     """Rotas vencidas por LINHA: chat e formulario esperam em filas apartadas.
 

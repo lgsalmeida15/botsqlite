@@ -1049,9 +1049,16 @@ class Engine:
         return 0
 
     def _move_max_fail(self) -> int:
-        """Teto de `move_chat` recusado antes de encerrar a rota (nao gira para sempre)."""
+        """Teto de `move_chat` recusado antes de encerrar a rota (nao gira para sempre).
+
+        Vale para formulario (historico `form_move_max_fail`) e para chat; a chave
+        generica `move_max_fail` tem precedencia quando configurada.
+        """
         try:
-            return max(1, int(self.cfg.get("form_move_max_fail") or 3))
+            valor = self.cfg.get("move_max_fail")
+            if valor in (None, ""):
+                valor = self.cfg.get("form_move_max_fail")
+            return max(1, int(valor or 3))
         except (TypeError, ValueError):
             return 3
 
@@ -1211,6 +1218,10 @@ class Engine:
                     log.exception("rejoin_silent %s", cid)
                     self._emit("join_failed", cid, q, str(e))
             elif action == "stale":
+                # A rota tem de sair do caminho AQUI: sem isto ela ficava `waiting`
+                # para sempre e o tick tentava `move_chat` num chat que o bot ja nao
+                # conduz (TOA recusa com e=10) — girando em loop pela fila.
+                db.finish_routes_for_chat(self.conn, cid, "failed", "chat sumiu do TOA")
                 db.upsert_chat(self.conn, cid, status="left", left_at=now)
                 if not self._case_recent(cid):
                     self._close_case(cid, "stale_boot")
@@ -2230,7 +2241,10 @@ class Engine:
                 log.warning("move_chat %s %s: %s", cid, q, e)
                 self._reserve_drop(addr, "chat", case_key)
                 if not str(marks.get("exclude_assignee") or "").strip():
-                    return False, f"{route}; move_falhou={e}"
+                    # Conta a recusa: o tick encerra a rota no teto, senao o chat
+                    # gira para sempre tentando mover um chat que o bot nao conduz.
+                    falhas = db.bump_move_fails(self.conn, route_id)
+                    return False, f"{route}; move_falhou={e}; falhas={falhas}"
                 # Resgate: o chat ja estava com o analista que ficou offline e o
                 # TOA recusou um novo move — segue para o convite do novo alvo.
                 self._emit(
@@ -3560,6 +3574,14 @@ class Engine:
                     self._emit("queued_assigned", cid, q, f"espera={espera}s; {detail}")
                     await self._deliver_sibling(case_key, str(picked.get("address") or ""), team)
                     continue
+                if self._move_falhas(detail) >= self._move_max_fail():
+                    # Chat com `move_chat` recusado no teto: encerra (com o fallback do
+                    # time) em vez de girar para sempre — mesmo tratamento do formulario.
+                    motivo = f"move_chat recusado pelo TOA ({self._move_falhas(detail)}x); rota encerrada"
+                    db.finish_route(self.conn, rid, "failed", f"{motivo}; {detail}")
+                    self._emit("chat_move_refused", cid, q, f"{motivo}; {detail}")
+                    await self._apply_chat_fallback(cid, q)
+                    continue
                 db.retry_route(self.conn, rid, used + 1, settings["retry_interval_sec"], detail)
                 # Releitura da marca: o move pode ter acontecido agora, dentro da entrega.
                 if fila and not db.chat_moved(self.conn, cid):
@@ -3719,6 +3741,13 @@ class Engine:
             await self._reclaim_offline()
         except Exception:
             log.exception("reclaim_offline")
+        # Rota de chat orfa (chat ja saiu do bot): encerra para nao girar `move_chat`.
+        try:
+            orfas = db.finish_orphan_routes(self.conn)
+            if orfas:
+                self._emit("orphan_route_closed", None, None, f"{orfas} rota(s) de chat encerrada(s)")
+        except Exception:
+            log.exception("finish_orphan_routes")
         sec = int(self.cfg.get("reply_timeout_sec") or 300)
         for row in db.awaiting_timeouts(self.conn):
             if not _silence_expired(row, sec):

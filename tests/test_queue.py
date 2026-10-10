@@ -321,6 +321,64 @@ class QueueTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("queue_expired", events(conn))
         self.assertEqual(chat_row(conn)["status"], "closed_no_agent")
 
+    async def test_chat_move_recusado_encerra_a_rota_no_teto(self):
+        """Chat com `move_chat` recusado pelo TOA para de girar: encerra no teto.
+
+        Antes, com a fila ligada e o chat ainda nao movido, a rota de chat retentava
+        para sempre (o loop `e=10` das rotas orfas). Agora conta a recusa e encerra
+        no teto, com o fallback do time.
+        """
+        conn = mem_conn()
+        seed_queue_menu(conn, with_team=True)
+        seed_ask_leaf(conn)
+        sock = RouteSock(online=[], move_error="10: erro do TOA sem mensagem")
+        eng = engine_cfg(conn, sock)
+        await self._entra_na_fila(eng, conn)
+        self.assertEqual(len(routes(conn, "waiting")), 1)
+        sock.online = ["ana"]
+        for _ in range(eng._move_max_fail()):
+            conn.execute("UPDATE pending_routes SET next_try_at = datetime('now', '-1 seconds')")
+            await eng.tick_routes()
+        self.assertEqual(routes(conn, "waiting"), [], "a rota nao gira para sempre")
+        falha = routes(conn, "failed")
+        self.assertEqual(len(falha), 1)
+        self.assertIn("move_falhou=10", falha[0]["detail"])
+        self.assertIn("chat_move_refused", events(conn))
+        self.assertEqual(chat_row(conn)["status"], "closed_no_agent", "fallback close aplicado")
+
+    async def test_finish_orphan_routes_encerra_so_chat_fora_do_aberto(self):
+        """A varredura fecha rota de chat orfa e respeita `classified`, form e lease."""
+        conn = mem_conn()
+        seed_queue_menu(conn, with_team=True)
+        db.upsert_chat(conn, 30, queue_address="h:q1", status="left")
+        db.upsert_chat(conn, 31, queue_address="h:q1", status="classified")
+        db.upsert_chat(conn, 32, queue_address="h:q1", status="closed")
+        db.upsert_chat(conn, 33, queue_address="h:q1", status="left")
+        db.enqueue_route(conn, "chat", 30, "h:q1", 1, detail="x", delay_sec=0)
+        db.enqueue_route(conn, "chat", 31, "h:q1", 1, detail="x", delay_sec=0)
+        db.enqueue_route(conn, "chat", 32, "h:q1", 1, detail="x", delay_sec=0)
+        r33 = db.enqueue_route(conn, "chat", 33, "h:q1", 1, detail="x", delay_sec=0)
+        db.enqueue_route(conn, "form", 30, "h:q1", 1, detail="x", delay_sec=0)
+        # Rota orfa COM posse (lease) viva: entrega em andamento, nao mexer.
+        conn.execute(
+            "UPDATE pending_routes SET claimed_by = 'tok',"
+            " claim_expires_at = datetime('now', '+300 seconds') WHERE id = ?",
+            (int(r33),),
+        )
+        n = db.finish_orphan_routes(conn)
+        self.assertEqual(n, 2, "so o chat 30 (left) e 32 (closed)")
+        mantidas = {(str(r["kind"]), int(r["chat_id"])) for r in routes(conn, "waiting")}
+        self.assertEqual(mantidas, {("chat", 31), ("chat", 33), ("form", 30)})
+
+    async def test_tick_timeouts_encerra_rota_orfa(self):
+        """O tick fecha a rota orfa sozinho (contencao interna, sem watchdog externo)."""
+        eng, conn, _sock = self._eng(online=[])
+        db.enqueue_route(conn, "chat", 30, "h:q1", 1, detail="x", delay_sec=0)
+        db.upsert_chat(conn, 30, queue_address="h:q1", status="left")
+        await eng.tick_timeouts()
+        self.assertEqual(routes(conn, "waiting"), [])
+        self.assertIn("orphan_route_closed", events(conn))
+
 
 class QueueSchemaTest(unittest.TestCase):
     def test_colunas_ajustes_e_template(self):
