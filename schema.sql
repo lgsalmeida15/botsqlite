@@ -174,7 +174,12 @@ CREATE TABLE IF NOT EXISTS bot_events (
   queue_address VARCHAR(191),
   queue_enabled INTEGER,
   reason VARCHAR(191) NOT NULL,
-  detail TEXT NOT NULL DEFAULT ''
+  detail TEXT NOT NULL DEFAULT '',
+  -- Autor do chat/formulario no momento do evento (nome + endereco). Fica
+  -- vazio quando o payload nao traz identidade confiavel; o painel cai no
+  -- endereco ou mostra "-". Colunas preenchidas pelo bot no `_emit`.
+  author_addr TEXT NOT NULL DEFAULT '',
+  author_name TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS bot_events_at_idx ON bot_events (at DESC);
@@ -382,6 +387,19 @@ CREATE TABLE IF NOT EXISTS analyst_load_history (
 );
 
 CREATE INDEX IF NOT EXISTS analyst_load_history_at ON analyst_load_history (at DESC);
+
+-- Fila do TOA por endereco (coleta do snapshot): o que a lista `pending` do
+-- helpdesk mostrou para CADA FILA na ultima volta — uma linha por fila. E a
+-- fonte do card FILA FORMS do dashboard: forms presentes na fila do TOA, sem
+-- depender de `pending_routes` (rotas orfas de form inflavam o numero).
+CREATE TABLE IF NOT EXISTS queue_load (
+  queue_address TEXT PRIMARY KEY,
+  at TEXT NOT NULL DEFAULT (datetime('now')),
+  pending_forms INTEGER NOT NULL DEFAULT 0,
+  pending_chats INTEGER NOT NULL DEFAULT 0,
+  toa_ok INTEGER NOT NULL DEFAULT 0,
+  detail TEXT NOT NULL DEFAULT ''
+);
 
 -- Ledger de atribuicoes: a carga real por CASO (solicitante distinto).
 -- Formulario + chat do MESMO solicitante contam como um unico caso.

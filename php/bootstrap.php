@@ -106,6 +106,52 @@ function bot_ensure_schema(PDO $pdo): void
     bot_migrate_delivery($pdo);
     bot_migrate_load($pdo);
     bot_migrate_form_aware($pdo);
+    bot_migrate_events_author($pdo);
+    bot_migrate_queue_load($pdo);
+}
+
+/**
+ * Fila do TOA por endereco (card FILA FORMS do dashboard): tabela queue_load.
+ *
+ * O bot grava a cada snapshot o que a lista `pending` do TOA mostrou para cada
+ * fila; o painel soma para o card. Sem a tabela o SELECT do dashboard cai no
+ * try/catch e o card vira "-".
+ */
+function bot_migrate_queue_load(PDO $pdo): void
+{
+    if (bot_table_exists($pdo, 'queue_load')) {
+        return;
+    }
+    $pdo->exec(
+        'CREATE TABLE queue_load ('
+        . ' queue_address TEXT PRIMARY KEY,'
+        . " at TEXT NOT NULL DEFAULT (datetime('now')),"
+        . ' pending_forms INTEGER NOT NULL DEFAULT 0,'
+        . ' pending_chats INTEGER NOT NULL DEFAULT 0,'
+        . ' toa_ok INTEGER NOT NULL DEFAULT 0,'
+        . " detail TEXT NOT NULL DEFAULT '')"
+    );
+}
+
+/**
+ * Autor do chat/formulario em bot_events (coluna AUTOR da aba Atividade).
+ *
+ * Base criada antes destas colunas nao ganha nada com o CREATE IF NOT EXISTS
+ * do schema.sql: o ALTER e o que vale — inclusive no painel local plugado no
+ * banco de producao, roda uma unica vez e e idempotente.
+ */
+function bot_migrate_events_author(PDO $pdo): void
+{
+    if (!bot_table_exists($pdo, 'bot_events')) {
+        return;
+    }
+    $cols = bot_table_columns($pdo, 'bot_events');
+    if (!isset($cols['author_addr'])) {
+        $pdo->exec("ALTER TABLE bot_events ADD COLUMN author_addr TEXT NOT NULL DEFAULT ''");
+    }
+    if (!isset($cols['author_name'])) {
+        $pdo->exec("ALTER TABLE bot_events ADD COLUMN author_name TEXT NOT NULL DEFAULT ''");
+    }
 }
 
 /**

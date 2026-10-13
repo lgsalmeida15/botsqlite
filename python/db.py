@@ -103,6 +103,45 @@ def ensure_schema(conn) -> None:
     _migrate_load(conn)
     _migrate_kinds(conn)
     _migrate_form_window(conn)
+    _migrate_events_author(conn)
+    _migrate_queue_load(conn)
+
+
+def _migrate_queue_load(conn) -> None:
+    """Fila do TOA por endereco (card FILA FORMS do dashboard).
+
+    Base antiga nao ganha a tabela com o CREATE IF NOT EXISTS do schema.sql
+    rodar de novo? Ganha — CREATE IF NOT EXISTS cobre tabela nova. A funcao
+    existe para o mesmo padrao das demais migracoes (checagem explicita) e para
+    o painel PHP espelhar a chamada.
+    """
+    if "queue_load" not in _table_names(conn):
+        conn.execute(
+            """CREATE TABLE queue_load (
+                 queue_address TEXT PRIMARY KEY,
+                 at TEXT NOT NULL DEFAULT (datetime('now')),
+                 pending_forms INTEGER NOT NULL DEFAULT 0,
+                 pending_chats INTEGER NOT NULL DEFAULT 0,
+                 toa_ok INTEGER NOT NULL DEFAULT 0,
+                 detail TEXT NOT NULL DEFAULT ''
+               )"""
+        )
+
+
+def _migrate_events_author(conn) -> None:
+    """Autor do chat/formulario em bot_events: colunas novas em base antiga.
+
+    Sem o ALTER, o INSERT do `_emit` (que ja manda author_addr/author_name)
+    quebraria em banco criado antes destas colunas — e o painel local plugado
+    no banco de producao depende delas para a coluna AUTOR da aba Atividade.
+    """
+    if "bot_events" not in _table_names(conn):
+        return
+    cols = _table_columns(conn, "bot_events")
+    if "author_addr" not in cols:
+        conn.execute("ALTER TABLE bot_events ADD COLUMN author_addr TEXT NOT NULL DEFAULT ''")
+    if "author_name" not in cols:
+        conn.execute("ALTER TABLE bot_events ADD COLUMN author_name TEXT NOT NULL DEFAULT ''")
 
 
 def _table_columns(conn, table: str) -> set[str]:
@@ -666,6 +705,35 @@ def load_trim_history(conn, keep: int = 200) -> int:
     return int(cur.rowcount or 0)
 
 
+def queue_load_upsert(conn, queue_address: str, **campos) -> None:
+    """Grava a leitura da fila no TOA (uma linha por endereco de fila)."""
+    base = {"pending_forms": 0, "pending_chats": 0, "toa_ok": 0, "detail": ""}
+    base.update({k: v for k, v in campos.items() if k in base})
+    conn.execute(
+        f"""INSERT INTO queue_load
+              (queue_address, at, {', '.join(base)})
+            VALUES (?, datetime('now'), {', '.join('?' * len(base))})
+            ON CONFLICT (queue_address) DO UPDATE SET
+              at = datetime('now'),
+              {', '.join(f'{k} = excluded.{k}' for k in base)}""",
+        [str(queue_address)] + list(base.values()),
+    )
+
+
+def queue_load_frescas(conn, fresh_sec: float = 90.0) -> list[dict]:
+    """Leituras de fila ainda frescas (2 ciclos do snapshot, minimo 60 s).
+
+    Leitura velha ou com `toa_ok=0` (a lista `pending` nao respondeu) nao decide
+    nada: o chamador mostra "sem coleta recente" em vez de um numero mentiroso.
+    """
+    return conn.execute(
+        "SELECT *, (julianday('now') - julianday(at)) * 86400 AS idade"
+        " FROM queue_load"
+        " WHERE toa_ok = 1 AND (julianday('now') - julianday(at)) * 86400 <= ?",
+        (float(fresh_sec),),
+    ).fetchall()
+
+
 def load_add_history(conn, address: str, **campos) -> None:
     """Uma linha por analista por rodada de leitura."""
     conn.execute(
@@ -1064,13 +1132,17 @@ def log_event(
     queue_address: str | None = None,
     queue_enabled: bool | None = None,
     detail: str = "",
+    author_addr: str = "",
+    author_name: str = "",
 ) -> None:
     enabled = None if queue_enabled is None else (1 if queue_enabled else 0)
     try:
         conn.execute(
-            """INSERT INTO bot_events (chat_id, queue_address, queue_enabled, reason, detail)
-               VALUES (?, ?, ?, ?, ?)""",
-            (chat_id, queue_address, enabled, reason, detail or ""),
+            """INSERT INTO bot_events
+                 (chat_id, queue_address, queue_enabled, reason, detail, author_addr, author_name)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (chat_id, queue_address, enabled, reason, detail or "",
+             str(author_addr or ""), str(author_name or "")),
         )
     except Exception:
         log.warning("bot_events: insert falhou", exc_info=True)

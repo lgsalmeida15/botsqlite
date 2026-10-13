@@ -51,6 +51,32 @@ ok(
 bot_migrate_load($pdo);
 ok(bot_table_exists($pdo, 'analyst_load') && bot_table_exists($pdo, 'analyst_load_history'), 'bot_migrate_load e idempotente');
 
+// queue_load: fonte do card FILA FORMS do dashboard (forms na lista `pending`
+// do TOA por fila, lidos no snapshot do bot). Espelho de python/db.py.
+ok(bot_table_exists($pdo, 'queue_load'), 'queue_load criada (card FILA FORMS)');
+$qlCols = bot_table_columns($pdo, 'queue_load');
+ok(
+    array_diff(['queue_address', 'at', 'pending_forms', 'pending_chats', 'toa_ok', 'detail'], array_keys($qlCols)) === [],
+    'queue_load com as colunas da leitura da fila'
+);
+bot_migrate_queue_load($pdo);
+ok(bot_table_exists($pdo, 'queue_load'), 'bot_migrate_queue_load e idempotente');
+// Consulta do dashboard: soma so o que esta fresco e com TOA respondendo.
+$pdo->exec("INSERT INTO queue_load (queue_address, at, pending_forms, pending_chats, toa_ok) VALUES ('h:q1', datetime('now'), 3, 1, 1)");
+$pdo->exec("INSERT INTO queue_load (queue_address, at, pending_forms, pending_chats, toa_ok) VALUES ('h:velha', datetime('now', '-10 minutes'), 9, 0, 1)");
+$pdo->exec("INSERT INTO queue_load (queue_address, at, pending_forms, pending_chats, toa_ok) VALUES ('h:falha', datetime('now'), 7, 0, 0)");
+$soma = (int) $pdo->query(
+    "SELECT COALESCE(SUM(l.pending_forms), 0) FROM queue_load l"
+    . " WHERE l.toa_ok = 1 AND l.at >= datetime('now', '-60 seconds')"
+)->fetchColumn();
+ok($soma === 3, 'dashboard soma so a leitura fresca e boa (3, nao 19)');
+
+// bot_events ganhou o autor (coluna AUTOR da aba Atividade).
+$evCols = bot_table_columns($pdo, 'bot_events');
+ok(isset($evCols['author_addr']) && isset($evCols['author_name']), 'bot_events com author_addr/author_name');
+bot_migrate_events_author($pdo);
+ok(true, 'bot_migrate_events_author e idempotente (sem excecao)');
+
 $cfg = [];
 foreach ($pdo->query('SELECT key, value FROM bot_settings') as $r) {
     $cfg[$r['key']] = (string) $r['value'];

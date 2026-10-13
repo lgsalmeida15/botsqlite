@@ -550,9 +550,48 @@ class Engine:
         self.enabled = db.enabled_queues(self.conn)
         log.info("search_contact: %s operadores em %s filas", n_ops, n_queues)
 
+    def _author_do_chat(self, cid: int) -> tuple[str, str]:
+        """(endereco, nome) do autor do chat/formulario para gravar no evento.
+
+        Ordem: ledger aberto (ja tem identidade gravada) -> rota pendente
+        (requester_addr) -> indice de formularios abertos (payload vivo).
+        Sem identidade confiavel devolve vazio: o painel cai no endereco ou
+        mostra "-" — nunca inventa nome.
+        """
+        try:
+            linha = db.open_assignment(self.conn, cid)
+            if linha:
+                addr = str(linha.get("requester_addr") or "")
+                nome = str(linha.get("requester_name") or "")
+                if addr or nome:
+                    return addr, nome
+        except Exception:
+            pass
+        try:
+            rota = self.conn.execute(
+                "SELECT requester_addr FROM pending_routes"
+                " WHERE chat_id = ? AND requester_addr != '' ORDER BY id DESC LIMIT 1",
+                (int(cid),),
+            ).fetchone()
+            if rota and str(rota.get("requester_addr") or ""):
+                return str(rota["requester_addr"]), ""
+        except Exception:
+            pass
+        payload = self._open_forms.get(int(cid))
+        if payload:
+            req = form_open.requester_key(payload, self.own)
+            if req[1] or req[2]:
+                return str(req[1] or ""), str(req[2] or "")
+        return "", ""
+
     def _emit(self, reason: str, cid: int | None, q: str | None, detail: str = "") -> None:
         on = bool(q and q in self.enabled)
-        db.log_event(self.conn, reason, chat_id=cid, queue_address=q, queue_enabled=on if q else None, detail=detail)
+        addr, nome = self._author_do_chat(int(cid)) if cid is not None else ("", "")
+        db.log_event(
+            self.conn, reason, chat_id=cid, queue_address=q,
+            queue_enabled=on if q else None, detail=detail,
+            author_addr=addr, author_name=nome,
+        )
 
     def _note_open_form(self, chat: dict | None, origem: str = "closure") -> None:
         """Mantem o indice de formularios acompanhados (abertura form-aware).
@@ -1952,7 +1991,11 @@ class Engine:
         message = str(result.get("message") or "")
         q = row.get("queue_address")
         reason = "script_ok" if result.get("ok") else "script_error"
-        self._emit(reason, cid, q, str(result.get("detail") or "")[:800])
+        # slug no detail: sem ele so ficava "http 200"/"http_error" e era
+        # impossivel saber QUAL script falhou na aba Atividade.
+        slug = str(row.get("script_slug") or "").strip()
+        det = str(result.get("detail") or "")
+        self._emit(reason, cid, q, (f"slug={slug}; {det}" if slug else det)[:800])
         if message:
             await self.send(cid, message)
         if action == "retry_form":
@@ -2755,7 +2798,7 @@ class Engine:
             poll = 30.0
         return max(poll * 2.0, 60.0)
 
-    async def _listas_toa(self, queue_address: str | None) -> tuple[dict[int, dict], bool]:
+    async def _listas_toa(self, queue_address: str | None) -> tuple[dict[int, dict], bool, set[int]]:
         """O que o TOA lista para a fila: `in_process` + `pending` (+ sessao).
 
         `in_process` e a lista do front (chats E formularios em atendimento) e
@@ -2765,8 +2808,14 @@ class Engine:
         O segundo valor (`ok`) so e True quando as DUAS listas do front
         responderam: sem essa garantia a ausencia nao pode decidir nada (um
         timeout no `pending` esconderia um formulario que so espera na fila).
+
+        O terceiro valor e o conjunto de ids vistos na lista `pending` (a FILA
+        do TOA para aquela fila): e a fonte do card FILA FORMS do dashboard —
+        forms presentes na fila, sem depender de `pending_routes` (rotas orfas
+        de form inflavam o numero).
         """
         vistos: dict[int, dict] = {}
+        pendentes: set[int] = set()
         fonte = str(self.cfg.get("route_capacity_source") or "both")
         if fonte in ("active", "both"):
             try:
@@ -2781,7 +2830,7 @@ class Engine:
             except Exception as e:
                 log.warning("get_active_chats carga: %s", e)
         if not queue_address:
-            return vistos, False
+            return vistos, False, pendentes
         ok = True
         for tipo in ("in_process", "pending"):
             try:
@@ -2799,10 +2848,12 @@ class Engine:
                     if cid is None:
                         continue
                     vistos[int(cid)] = c
+                    if tipo == "pending":
+                        pendentes.add(int(cid))
             except Exception as e:
                 ok = False
                 log.warning("get_helpdesk_chats %s tipo=%s carga: %s", queue_address, tipo, e)
-        return vistos, ok
+        return vistos, ok, pendentes
 
     async def snapshot_load(self, motivo: str = "timer") -> int:
         """Grava a carga por analista e fecha o formulario ja resolvido no TOA.
@@ -2815,6 +2866,7 @@ class Engine:
         """
         fontes: dict[int, dict] = {}
         ok_geral = False
+        pendentes_vistos: set[int] = set()
         filas: list[str | None] = []
         equipes: list[tuple[int, str]] = [
             (int(t["id"]), str(t["name"] or t["id"]))
@@ -2829,9 +2881,31 @@ class Engine:
                 if r["queue_address"] and r["queue_address"] not in filas:
                     filas.append(r["queue_address"])
         for q in (filas or [None]):
-            vistos, ok = await self._listas_toa(q)
+            vistos, ok, pendentes = await self._listas_toa(q)
             fontes.update(vistos)
             ok_geral = ok_geral or ok
+            if q:
+                # Fila do TOA (card FILA FORMS): o que a lista `pending` mostrou
+                # PARA ESTA fila, deduplicado por chat_id — inclusive entre
+                # filas do MESMO snapshot (um chat em duas filas nao pode virar
+                # dois no total do card). `ok=False` grava a leitura como falha:
+                # o painel mostra "sem coleta recente" em vez de numero velho.
+                n_forms = n_chats = 0
+                for cid in pendentes:
+                    if cid in pendentes_vistos:
+                        continue
+                    pendentes_vistos.add(cid)
+                    chat = vistos.get(cid)
+                    if form_open.is_validation_form(chat):
+                        n_forms += 1
+                    else:
+                        n_chats += 1
+                db.queue_load_upsert(
+                    self.conn, q,
+                    pending_forms=n_forms, pending_chats=n_chats,
+                    toa_ok=1 if ok else 0,
+                    detail=f"motivo={motivo}; pendentes={len(pendentes)}",
+                )
         logins = sorted({
             _member_login_raw(str(m["address"]))
             for ms in membros_por_time.values() for m in ms if m.get("address")

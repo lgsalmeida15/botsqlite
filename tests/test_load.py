@@ -261,19 +261,27 @@ class LoadTest(unittest.IsolatedAsyncioTestCase):
 
 
 class LoadFila(LoadSock):
-    """Listas por FILA: permite ter carga numa fila diferente da do item."""
+    """Listas por FILA: permite ter carga numa fila diferente da do item.
 
-    def __init__(self, por_fila=None, **kw):
+    `por_fila` vale para `in_process`; `pending_fila` (opcional) alimenta a
+    lista `pending` por fila — e e a fonte do card FILA FORMS.
+    """
+
+    def __init__(self, por_fila=None, pending_fila=None, **kw):
         super().__init__(**kw)
         self.por_fila = {str(k): list(v) for k, v in (por_fila or {}).items()}
+        self.pending_fila = {str(k): list(v) for k, v in (pending_fila or {}).items()}
 
     async def command(self, name, payload=None, **kwargs):
         if name == "get_helpdesk_chats":
             q = str((payload or {}).get("helpdesk_address") or "")
             tipo = str((payload or {}).get("chat_type") or "")
-            if q in self.por_fila:
+            if q in self.por_fila or q in self.pending_fila:
                 self.cmds.append((name, payload or {}))
-                lista = self.por_fila[q] if tipo == "in_process" else []
+                if tipo == "in_process":
+                    lista = self.por_fila.get(q, [])
+                else:
+                    lista = self.pending_fila.get(q, [])
                 return {"d": {"chats": [dict(c) for c in lista]}}
         return await super().command(name, payload, **kwargs)
 
@@ -453,6 +461,120 @@ class CapPeloFisicoTest(unittest.IsolatedAsyncioTestCase):
         # chat + formulario do MESMO autor: um caso so (a regra do cap).
         self.assertEqual(len(chaves), 1, chaves)
         self.assertEqual(len(chaves), int(db.load_rows(conn)[0]["casos_total"]))
+
+
+def form_na_fila(cid: int = 301, tec: str = TEC) -> dict:
+    """Formulario de validacao na lista `pending` (na fila do TOA, sem analista)."""
+    return {
+        "chat_id": cid,
+        "mode": "message_scenario",
+        "person": "Message Scenario Agent",
+        "helpdesk_address": "h:q1",
+        "participants": {tec: {"address": tec, "present": True}},
+    }
+
+
+def chat_na_fila(cid: int = 302, tec: str = TEC) -> dict:
+    """Chat simples na lista `pending` (conta como chat, nao form)."""
+    return {
+        "chat_id": cid,
+        "helpdesk_address": "h:q1",
+        "participants": {tec: {"address": tec, "present": True}},
+    }
+
+
+class QueueLoadTest(unittest.IsolatedAsyncioTestCase):
+    """queue_load: a fonte do card FILA FORMS do dashboard.
+
+    O card precisa contar os forms presentes na lista `pending` do TOA por
+    fila — nao as rotas em `pending_routes` (rota orfa de form inflava o
+    numero). Uma linha por fila, atualizada a cada snapshot.
+    """
+
+    def tearDown(self):
+        MEM.clear()
+
+    def _conn(self):
+        conn = mem_conn()
+        seed_queue_menu(conn, with_team=True)
+        return conn
+
+    def _fila(self, conn, address: str, name: str = "") -> None:
+        conn.execute("INSERT INTO queues (address, name, enabled) VALUES (?, ?, 1)", (address, name or address))
+        conn.execute("INSERT INTO team_queues (team_id, queue_address) VALUES (1, ?)", (address,))
+
+    async def test_snapshot_grava_queue_load_por_fila(self):
+        conn = self._conn()
+        eng = base_engine(
+            conn,
+            LoadSock(in_process=[], pending=[form_na_fila(301), form_na_fila(303), chat_na_fila(302)], online=["ana"]),
+        )
+        await eng.snapshot_load("teste")
+        linhas = conn.execute("SELECT * FROM queue_load WHERE queue_address = 'h:q1'").fetchall()
+        self.assertEqual(len(linhas), 1, "uma linha por fila")
+        self.assertEqual(int(linhas[0]["pending_forms"]), 2)
+        self.assertEqual(int(linhas[0]["pending_chats"]), 1)
+        self.assertEqual(int(linhas[0]["toa_ok"]), 1)
+
+    async def test_pending_e_deduplicado_por_chat(self):
+        """O MESMO chat repetido na lista `pending` conta uma vez."""
+        conn = self._conn()
+        eng = base_engine(
+            conn,
+            LoadSock(in_process=[], pending=[form_na_fila(301), form_na_fila(301)], online=["ana"]),
+        )
+        await eng.snapshot_load("teste")
+        linha = conn.execute("SELECT * FROM queue_load WHERE queue_address = 'h:q1'").fetchone()
+        self.assertEqual(int(linha["pending_forms"]), 1)
+
+    async def test_form_em_duas_filas_conta_uma_vez_no_total(self):
+        """Mesmo form listado em duas filas: dedup entre filas do snapshot."""
+        conn = self._conn()
+        self._fila(conn, "h:q2")
+        form_q1 = form_na_fila(301)
+        form_q2 = form_na_fila(301)
+        form_q2["helpdesk_address"] = "h:q2"
+        eng = base_engine(
+            conn,
+            LoadFila(pending_fila={"h:q1": [form_q1], "h:q2": [form_q2]}, online=["ana"]),
+        )
+        await eng.snapshot_load("teste")
+        q1 = conn.execute("SELECT * FROM queue_load WHERE queue_address = 'h:q1'").fetchone()
+        q2 = conn.execute("SELECT * FROM queue_load WHERE queue_address = 'h:q2'").fetchone()
+        self.assertEqual(int(q1["pending_forms"]), 1)
+        self.assertEqual(int(q2["pending_forms"]), 0, "o form ja contou na primeira fila")
+        self.assertEqual(int(q1["pending_forms"]) + int(q2["pending_forms"]), 1)
+
+    async def test_fila_com_falha_grava_toa_ok_zero(self):
+        """Leitura falha nao vira numero no card: toa_ok=0 e o painel mostra '-'."""
+        conn = self._conn()
+        eng = base_engine(conn, LoadSock(in_process=[], pending=[form_na_fila()], online=["ana"], fail_tipos=("pending",)))
+        await eng.snapshot_load("teste")
+        linha = conn.execute("SELECT * FROM queue_load WHERE queue_address = 'h:q1'").fetchone()
+        self.assertEqual(int(linha["toa_ok"]), 0)
+
+    async def test_upsert_e_idempotente_por_fila(self):
+        conn = self._conn()
+        eng = base_engine(conn, LoadSock(in_process=[], pending=[form_na_fila()], online=["ana"]))
+        await eng.snapshot_load("t1")
+        eng.sock = LoadSock(in_process=[], pending=[], online=["ana"])
+        await eng.snapshot_load("t2")
+        linhas = conn.execute("SELECT * FROM queue_load WHERE queue_address = 'h:q1'").fetchall()
+        self.assertEqual(len(linhas), 1, "upsert: uma linha por fila, nao acumula")
+        self.assertEqual(int(linhas[0]["pending_forms"]), 0, "segunda leitura atualiza o valor")
+
+    def test_queue_load_frescas_filtra_velha_e_falha(self):
+        conn = self._conn()
+        db.queue_load_upsert(conn, "h:q1", pending_forms=3, toa_ok=1)
+        self.assertEqual(len(db.queue_load_frescas(conn, fresh_sec=90)), 1)
+        conn.execute("UPDATE queue_load SET at = datetime('now', '-10 minutes')")
+        self.assertEqual(db.queue_load_frescas(conn, fresh_sec=90), [], "leitura velha nao serve")
+        conn.execute("UPDATE queue_load SET at = datetime('now'), toa_ok = 0")
+        self.assertEqual(db.queue_load_frescas(conn, fresh_sec=90), [], "leitura falha nao serve")
+
+    def test_tabela_existe_no_schema(self):
+        conn = mem_conn()
+        self.assertIn("queue_load", db._table_names(conn))
 
 
 if __name__ == "__main__":
