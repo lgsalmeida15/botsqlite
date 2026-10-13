@@ -56,6 +56,21 @@ _SESSION_JS = """async () => {
 }"""
 
 
+_WIPE_ORIGIN_JS = """async () => {
+    const out = {sw: 0, caches: 0, keys: 0};
+    try {
+        const regs = await navigator.serviceWorker.getRegistrations();
+        for (const r of regs) { await r.unregister(); out.sw++; }
+    } catch (e) {}
+    try {
+        for (const k of await caches.keys()) { await caches.delete(k); out.caches++; }
+    } catch (e) {}
+    try { out.keys = localStorage.length; localStorage.clear(); } catch (e) {}
+    try { sessionStorage.clear(); } catch (e) {}
+    return out;
+}"""
+
+
 class SessionNotReady(Exception):
     """Login/SSO ainda não entregou JSON válido de manage/supervisor."""
 
@@ -104,6 +119,28 @@ async def _open_landing(page, origin: str) -> None:
     await page.goto(
         _landing(origin), wait_until="domcontentloaded", timeout=_nav_timeout_ms()
     )
+
+
+async def _wipe_origin_state(page) -> bool:
+    # Quando o TOA sobe uma release nova, o ServiceWorker e o offline cache
+    # gravados no perfil persistente continuam na versão antiga: a instalação
+    # do SW passa a falhar ("Unexpected ... manifest version") e o módulo de
+    # chat nunca termina o bootstrap, então a página nunca cria o WebSocket.
+    # O localStorage também guarda o communityConfig velho, que faz o JS
+    # remontar a URL do WS com a session key expirada.
+    # Retorna True quando removeu algo — só aí vale pagar outra navegação.
+    try:
+        out = await page.evaluate(_WIPE_ORIGIN_JS) or {}
+    except Exception as e:
+        log.warning("não limpou estado da origem: %s", e)
+        return False
+    sujo = any(out.get(k) for k in ("sw", "caches", "keys"))
+    if sujo:
+        log.info(
+            "estado da origem limpo sw=%s caches=%s keys=%s",
+            out.get("sw"), out.get("caches"), out.get("keys"),
+        )
+    return sujo
 
 
 async def _probe_session(page, origin: str) -> bool:
@@ -280,6 +317,8 @@ async def ensure_logged_in(page, origin: str) -> None:
     await ctx.clear_cookies()
     log.info("cookies limpos; abrindo landing origin=%s", origin)
     await _open_landing(page, origin)
+    if await _wipe_origin_state(page):
+        await _open_landing(page, origin)
 
     last_attempt = 0.0
     if await _try_auto_login(page):
@@ -373,6 +412,9 @@ async def launch_browser():
         "headless": headless,
         "locale": "pt-BR",
         "args": ["--disable-dev-shm-usage"],
+        # O bot não precisa do offline cache do TOA, e um SW gravado por uma
+        # release antiga trava o bootstrap do chat após upgrade do servidor.
+        "service_workers": "block",
     }
     proxy = env("TOA_PROXY")
     if proxy:
