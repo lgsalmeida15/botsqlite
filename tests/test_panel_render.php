@@ -58,6 +58,8 @@ $pdo->exec("INSERT INTO chats (chat_id, queue_address, status, classification) V
 $pdo->exec("INSERT INTO chats (chat_id, queue_address, status, linked_form_chat_id) VALUES (11, 'h:q1', 'closed', 99)");
 $pdo->exec("INSERT INTO bot_events (chat_id, queue_address, reason, detail) VALUES (10, 'h:q1', 'form_aware_skip', 'abertos=1; na_fila=0')");
 $pdo->exec("INSERT INTO bot_events (chat_id, queue_address, reason, detail) VALUES (11, 'h:q1', 'transferido', 'detalhe bem longo para exercitar o corte de texto do painel sem mbstring')");
+// Evento com autor gravado pelo bot (coluna AUTOR da propria aba Atividade).
+$pdo->exec("INSERT INTO bot_events (chat_id, queue_address, reason, detail, author_addr, author_name) VALUES (10, 'h:q1', 'classified', 'apoio', 'u:tec@claro.com', 'Tec Um')");
 $pdo->exec("INSERT INTO pending_routes (kind, chat_id, queue_address, status, detail) VALUES ('chat', 10, 'h:q1', 'failed', 'tentativas esgotadas; fallback=close')");
 $pdo->exec("INSERT INTO delivery_attempts (kind, chat_id, op, target, result) VALUES ('chat', 10, 'move_chat', 'u:ana@claro.com', 'ok')");
 $pdo->exec("INSERT INTO route_assignments (kind, chat_id, queue_address, team_id, assignee, case_key) VALUES ('form', 99, 'h:q1', 1, 'u:ana@claro.com', 'a:u:tec@claro.com')");
@@ -78,6 +80,10 @@ $pdo->exec(
     . " forms_ledger, reservas, casos_total, form_ocioso_min, form_presente_toa, toa_ok, detail)"
     . " VALUES ('u:inativo@claro.com', 'Inativo', 1, '', 0, 1, datetime('now', '-5 minutes'), 9, 0, 9, 0, 0, 9, 0.0, 0, 1, 'motivo=teste')"
 );
+// Fila do TOA (card FILA FORMS do dashboard): 2 forms na fila de h:q1. A fila
+// velha (10 min) nao pode entrar no total — e o que o card mostra como "-".
+$pdo->exec("INSERT INTO queue_load (queue_address, at, pending_forms, pending_chats, toa_ok) VALUES ('h:q1', datetime('now'), 2, 1, 1)");
+$pdo->exec("INSERT INTO queue_load (queue_address, at, pending_forms, pending_chats, toa_ok) VALUES ('h:velha', datetime('now', '-10 minutes'), 5, 0, 1)");
 
 // Trava da aba Filas: habilitar exige Menu ATIVO + Time ATIVO vinculados.
 // Sem isso o bot assumia o chat, mandava o menu e fechava depois (closed_no_agent).
@@ -266,6 +272,16 @@ ok(strpos($htmlDash, 'TOTAL CHATS/DIA') !== false, 'aba dashboard: card TOTAL CH
 ok(strpos($htmlDash, 'TOTAL FORMS/DIA') !== false, 'aba dashboard: card TOTAL FORMS/DIA');
 ok(strpos($htmlDash, '>FILA DE CHAT<') !== false, 'aba dashboard: card FILA DE CHAT');
 ok(strpos($htmlDash, '>FILA FORMS<') !== false, 'aba dashboard: card FILA FORMS');
+// Card FILA FORMS: fonte e queue_load (fila do TOA), nao pending_routes.
+// h:q1 (2 forms, fresca) conta; h:velha (5, 10 min) fica de fora.
+ok(
+    strpos($htmlDash, 'badge bg-info text-dark">2<') !== false,
+    'aba dashboard: FILA FORMS soma so a coleta fresca (2, nao 7)'
+);
+ok(
+    strpos($htmlDash, 'Formulários presentes na fila') !== false,
+    'aba dashboard: FILA FORMS explica que vem da fila do TOA'
+);
 ok(strpos($htmlDash, 'class="dash-donut"') !== false, 'aba dashboard: donut de operadores (SVG puro)');
 ok(strpos($htmlDash, 'class="dash-legend"') !== false, 'aba dashboard: legenda do donut');
 ok(strpos($htmlDash, '<span class="dot"') !== false, 'aba dashboard: legenda com as cores do donut');
@@ -293,6 +309,15 @@ ok(strpos($htmlDashNome, 'value="Ana"') !== false, 'aba dashboard: nome digitado
 ok(
     strpos($htmlDashNome, 'u:ana@claro.com') !== false && strpos($htmlDashNome, 'u:inativo@claro.com') === false,
     'aba dashboard: filtro por nome restringe a tabela ao analista'
+);
+
+// Aba Atividade: coluna AUTOR (nome do autor do chat/form na movimentacao).
+$htmlAtiv = (string) ($htmls['activity'] ?? '');
+ok(strpos($htmlAtiv, '<th>Autor</th>') !== false, 'aba activity: coluna AUTOR no cabecalho');
+ok(strpos($htmlAtiv, 'Tec Um') !== false, 'aba activity: nome do autor exibido');
+ok(
+    strpos($htmlAtiv, '<code class="small">u:tec@claro.com</code>') !== false,
+    'aba activity: endereco do autor junto do nome'
 );
 
 // Ajustes do resgate no Roteamento: globais + por time (linha de cada time).

@@ -405,11 +405,18 @@ depois do ACK, e um `route_seen` sem atomicidade).
 - `delivery_attempts` registra cada chamada externa de entrega (`move_chat`, `invite_to_chat`,
   `leave_chat`) com alvo, `r` do TOA, resultado (`ok`/`timeout`/`error`) e latencia; o detalhe do
   evento `transferred` passou a trazer `move=`/`invite=`.
+- Teto de `move_chat` recusado (chat **e** formulario): conta em `pending_routes.move_fails` e a rota
+  encerra (`chat_move_refused`/`form_move_refused`) em vez de girar para sempre. Config:
+  `move_max_fail` (fallback `form_move_max_fail`, padrao 3).
 - Ledger: `route_assignments.close_reason` (`chat_removed`, `stale_boot`, `form_done`, `ttl`, `manual`)
   e varredura de boot (`_sweep_stale_cases`) que fecha o caso quando o TOA nao mostra mais o item,
-  respeitando `case_stale_confirm_sec`; `resume_stale` tambem fecha.
+  respeitando `case_stale_confirm_sec`; `resume_stale` tambem fecha. **`resume_stale` encerra a rota
+  `waiting` do chat** (`finish_routes_for_chat`): sem isso a rota ficava `waiting` para sempre e o
+  tick tentava `move_chat` num chat que o bot nao conduz (o loop `e=10` das rotas orfas).
+- Contencao: a cada `tick_timeouts` o bot roda `finish_orphan_routes` (fecha rota de chat cujo chat
+  saiu do conjunto aberto, respeitando lease) — evento `orphan_route_closed`.
 - Eventos novos: `case_closed`, `delivery_duplicate_blocked`, `delivery_target_locked`,
-  `delivery_failed_no_team`, `delivery_recovered`.
+  `delivery_failed_no_team`, `delivery_recovered`, `chat_move_refused`, `orphan_route_closed`.
 - Painel (aba Roteamento): **Entregas paradas e sem dono** (rotas `failed`/`cancelled` + chats
   `classified` sem rota, com *Reprocessar*) e **Casos abertos (ledger) e tentativas (24 h)**
   (com *Liberar*), alem do `close_reason` visivel.
@@ -559,7 +566,7 @@ flowchart TD
   R --> Q{Banco x presenca no TOA}
   Q -->|bot presente| H[rehydrate: so memoria, sem join e sem menu]
   Q -->|bot ausente| S[rejoin_silent: entra sem reenviar menu]
-  Q -->|chat sumiu do TOA| ST[status left + evento resume_stale]
+  Q -->|chat sumiu do TOA| ST[status left + encerra a rota + evento resume_stale]
   H --> SC{Estava rodando script?}
   S --> SC
   SC -->|sim| RS[Retoma o script de onde parou]

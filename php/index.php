@@ -2818,7 +2818,8 @@ if ($page === 'activity') {
         }
         $offset = ($listPage - 1) * $per;
         $st = $pdo->prepare(
-            "SELECT e.at, e.chat_id, e.queue_address, e.queue_enabled, e.reason, e.detail, q.name AS queue_name
+            "SELECT e.at, e.chat_id, e.queue_address, e.queue_enabled, e.reason, e.detail,
+                    e.author_addr, e.author_name, q.name AS queue_name
              FROM bot_events e
              LEFT JOIN queues q ON q.address = e.queue_address
              $where
@@ -2832,12 +2833,20 @@ if ($page === 'activity') {
         $rows = [];
     }
     echo '<div class="table-responsive sticky-head"><table class="table table-slim table-hover align-middle bg-white mb-0">';
-    echo '<thead><tr><th>Hora</th><th>chat_id</th><th>Fila</th><th>Habilitada</th><th>Evento</th><th>Detalhe</th></tr></thead><tbody>';
+    echo '<thead><tr><th>Hora</th><th>chat_id</th><th>Autor</th><th>Fila</th><th>Habilitada</th><th>Evento</th><th>Detalhe</th></tr></thead><tbody>';
     foreach ($rows as $r) {
         $on = $r['queue_enabled'];
         $onKnown = $on === true || $on === 't' || $on === 1 || $on === false || $on === 'f' || $on === 0;
         $fila = $r['queue_name'] ? $r['queue_name'] . ' — ' . $r['queue_address'] : ($r['queue_address'] ?: '—');
+        $autorNome = trim((string) ($r['author_name'] ?? ''));
+        $autorAddr = trim((string) ($r['author_addr'] ?? ''));
+        $autor = $autorNome !== '' ? $autorNome : ($autorAddr !== '' ? $autorAddr : '—');
+        $autorHtml = h($autor);
+        if ($autorAddr !== '' && $autorNome !== '') {
+            $autorHtml .= '<br><code class="small">' . h($autorAddr) . '</code>';
+        }
         echo '<tr><td>' . h(fmt_dt($r['at'])) . '</td><td>' . h((string) ($r['chat_id'] ?? '')) . '</td>';
+        echo '<td>' . $autorHtml . '</td>';
         echo '<td><code>' . h($fila) . '</code></td>';
         echo '<td>' . ($onKnown ? badge_state(bool_on($on), 'sim', 'não') : '<span class="text-muted">—</span>') . '</td>';
         echo '<td>' . event_badge((string) $r['reason'], $labels[$r['reason']] ?? (string) $r['reason']) . '</td>';
@@ -3369,7 +3378,7 @@ if ($page === 'dashboard') {
     );
     echo '<div class="d-none">';
     echo '<h1 class="h3 mb-1">Dashboard</h1>';
-    echo '<p class="text-muted">Cards: <strong>TOTAL CHATS/DIA</strong> e <strong>TOTAL FORMS/DIA</strong> são o que os analistas atenderam no período (roteado pelo bot, transferido ou assumido); <strong>FILA DE CHAT</strong> são os chats com o chatbot agora e <strong>FILA FORMS</strong> são os formulários abertos sem operador (esperando na fila do time). O filtro de filas, o período e o nome do analista valem para os cards, o donut e a tabela. Abaixo, o gráfico de classificações por categoria e o resumo do formulário de validação — tudo gerado pelo próprio painel, sem bibliotecas externas.</p></div>';
+    echo '<p class="text-muted">Cards: <strong>TOTAL CHATS/DIA</strong> e <strong>TOTAL FORMS/DIA</strong> são o que os analistas atenderam no período (roteado pelo bot, transferido ou assumido); <strong>FILA DE CHAT</strong> são os chats com o chatbot agora e <strong>FILA FORMS</strong> são os formulários presentes na fila do TOA (lista <em>pending</em>) a cada leitura do bot — sem contar rotas pendentes de forms que já saíram do TOA. O filtro de filas, o período e o nome do analista valem para os cards, o donut e a tabela. Abaixo, o gráfico de classificações por categoria e o resumo do formulário de validação — tudo gerado pelo próprio painel, sem bibliotecas externas.</p></div>';
 
     $dashQueueOpts = [];
     foreach ($candQueues as $cq) {
@@ -3558,22 +3567,45 @@ if ($page === 'dashboard') {
         }
         // FILA FORMS (agora): formulario aberto e SEM operador (esperando na fila
         // do time), o mesmo criterio do card "Fila de formulário" da aba Carga.
-        $filaFormAgora = 0;
+        // FILA FORMS (coleta minuto a minuto): forms presentes na lista
+        // `pending` do TOA por fila, medidos no snapshot do bot (queue_load) —
+        // nao as rotas em `pending_routes` (rotas orfas de form inflavam o
+        // numero). Sem leitura fresca o card mostra "—" (nunca um zero falso).
+        $filaFormAgora = null;
         try {
+            $pollFila = 30;
+            foreach ($pdo->query('SELECT key, value FROM bot_settings') as $rCfgFila) {
+                if ((string) $rCfgFila['key'] === 'load_poll_sec') {
+                    $pollFila = max(5, (int) $rCfgFila['value']);
+                }
+            }
+            $janelaFila = max(60, $pollFila * 2);
             $paramsFilaForm = [];
-            $filtroFilaForm = " WHERE r.status = 'waiting' AND r.kind = 'form'"
-                . bot_scope_team_where($pdo, 'r.team_id', $paramsFilaForm);
+            $condsFilaForm = ["l.toa_ok = 1", "l.at >= datetime('now', ?)"];
+            $paramsFilaForm[] = '-' . $janelaFila . ' seconds';
+            $scopeFilaForm = bot_scope_queue_where($pdo, 'l.queue_address', $paramsFilaForm);
+            if ($scopeFilaForm !== '') {
+                $condsFilaForm[] = substr($scopeFilaForm, 5);
+            }
             if ($selList) {
-                $filtroFilaForm .= ' AND r.queue_address IN (' . implode(',', array_fill(0, count($selList), '?')) . ')';
+                $condsFilaForm[] = 'l.queue_address IN (' . implode(',', array_fill(0, count($selList), '?')) . ')';
                 foreach ($selList as $qaFil) {
                     $paramsFilaForm[] = $qaFil;
                 }
             }
-            $stFilaForm = $pdo->prepare('SELECT COUNT(*) FROM pending_routes r' . $filtroFilaForm);
+            $stFilaForm = $pdo->prepare(
+                'SELECT COALESCE(SUM(l.pending_forms), 0) AS total_forms, COUNT(*) AS n_filas FROM queue_load l'
+                . ' WHERE ' . implode(' AND ', $condsFilaForm)
+            );
             $stFilaForm->execute($paramsFilaForm);
-            $filaFormAgora = (int) $stFilaForm->fetchColumn();
+            $filaRow = $stFilaForm->fetch();
+            // Uma fila sozinha sem coleta ja invalida o total: melhor "-" que
+            // um numero que parece completo.
+            $filaFormAgora = $filaRow && (int) ($filaRow['n_filas'] ?? 0) > 0
+                ? (int) ($filaRow['total_forms'] ?? 0)
+                : null;
         } catch (Throwable $eFilaForm) {
-            $filaFormAgora = 0;
+            $filaFormAgora = null;
         }
         // Linhas da tabela: a ultima leitura por analista (aba Carga), na mesma
         // ordem de la — quem esta ativo no roteamento primeiro, maior carga no topo.
@@ -3687,11 +3719,15 @@ if ($page === 'dashboard') {
         }
         // Cards do topo. "Atendidos" = ledger do periodo; as duas filas = agora.
         echo '<div class="row g-3 mb-3">';
+        $filaFormsCard = $filaFormAgora === null ? '—' : (string) $filaFormAgora;
+        $filaFormsDesc = $filaFormAgora === null
+            ? 'Sem coleta recente da fila no TOA — o card atualiza sozinho na proxima leitura do bot.'
+            : 'Formulários presentes na fila (lista pending) do TOA, sem analista — coleta a cada leitura do bot.';
         $cardsDash = [
             ['TOTAL CHATS/DIA', (string) $atendTot['chat'], 'bg-dark', 'Chats com analista no período: roteado pelo bot, transferido ou assumido.'],
             ['TOTAL FORMS/DIA', (string) $atendTot['form'], 'bg-primary', 'Formulários de validação com analista no período: roteado ou assumido.'],
             ['FILA DE CHAT', (string) $botAgora, 'bg-warning text-dark', 'Chats com o chatbot agora (bot dentro do chat, sem analista).'],
-            ['FILA FORMS', (string) $filaFormAgora, 'bg-info text-dark', 'Formulários abertos sem operador (esperando na fila do time).'],
+            ['FILA FORMS', $filaFormsCard, 'bg-info text-dark', $filaFormsDesc],
         ];
         foreach ($cardsDash as $cD) {
             echo '<div class="col-6 col-xl-3"><div class="card h-100"><div class="card-body py-2">';

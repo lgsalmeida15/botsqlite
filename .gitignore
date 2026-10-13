@@ -14,3 +14,7 @@ data/*.sqlite-shm
 Thumbs.db
 *.stackdump
 tmp_bak/
+
+# Dumps de producao (SQLite em texto) - dados reais, nao versionar
+/helptoa_dump*.sql
+/*_dump_*.sql

@@ -149,6 +149,26 @@ class ResumeOpenChatsTest(unittest.TestCase):
         ]
         self.assertIn("resume_stale", reasons)
 
+    def test_stale_encerra_a_rota_da_fila(self):
+        """Chat que sumiu do TOA nao pode deixar a rota `waiting` para sempre.
+
+        Sem isto a rota girava `move_chat` (e=10) num chat que o bot ja nao
+        conduzia — o loop das rotas orfas.
+        """
+        awaiting(self.conn, 10, node=self.opt_id)
+        self.conn.execute(
+            "INSERT INTO pending_routes (kind, chat_id, queue_address, status, detail, next_try_at) "
+            "VALUES ('chat', 10, 'h:q1', 'waiting', 'na fila', datetime('now'))"
+        )
+        eng = Engine(self.conn, ResumeSock(chats=[]))
+        asyncio.run(eng.resume_open_chats())
+        rota = self.conn.execute(
+            "SELECT status, detail, next_try_at FROM pending_routes WHERE chat_id = 10"
+        ).fetchone()
+        self.assertEqual(rota["status"], "failed")
+        self.assertEqual(rota["detail"], "chat sumiu do TOA")
+        self.assertIsNone(rota["next_try_at"])
+
 
 if __name__ == "__main__":
     unittest.main()

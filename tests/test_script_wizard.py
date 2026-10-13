@@ -196,6 +196,9 @@ class ScriptWizardTest(unittest.IsolatedAsyncioTestCase):
             for e in conn.execute("SELECT detail FROM bot_events WHERE reason = 'script_ok'").fetchall()
         ]
         self.assertTrue(any("http 200" in (d or "") for d in details))
+        # O detail leva o slug do script: sem isso a aba Atividade so mosta
+        # "http 200" e fica impossivel saber qual script rodou.
+        self.assertTrue(any("slug=criar_apoio" in (d or "") for d in details))
         blob = " ".join(
             (e["detail"] or "") + (e["reason"] or "")
             for e in conn.execute("SELECT reason, detail FROM bot_events").fetchall()
@@ -295,6 +298,11 @@ class ScriptWizardTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("invite_to_chat", cmds)
         reasons = [e["reason"] for e in conn.execute("SELECT reason FROM bot_events").fetchall()]
         self.assertIn("script_error", reasons)
+        det_err = [
+            e["detail"]
+            for e in conn.execute("SELECT detail FROM bot_events WHERE reason = 'script_error'").fetchall()
+        ]
+        self.assertTrue(any("slug=criar_apoio" in (d or "") for d in det_err))
 
     async def test_timeout_no_wizard_encerra(self):
         conn = mem_conn()

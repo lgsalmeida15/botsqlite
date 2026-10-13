@@ -550,9 +550,48 @@ class Engine:
         self.enabled = db.enabled_queues(self.conn)
         log.info("search_contact: %s operadores em %s filas", n_ops, n_queues)
 
+    def _author_do_chat(self, cid: int) -> tuple[str, str]:
+        """(endereco, nome) do autor do chat/formulario para gravar no evento.
+
+        Ordem: ledger aberto (ja tem identidade gravada) -> rota pendente
+        (requester_addr) -> indice de formularios abertos (payload vivo).
+        Sem identidade confiavel devolve vazio: o painel cai no endereco ou
+        mostra "-" — nunca inventa nome.
+        """
+        try:
+            linha = db.open_assignment(self.conn, cid)
+            if linha:
+                addr = str(linha.get("requester_addr") or "")
+                nome = str(linha.get("requester_name") or "")
+                if addr or nome:
+                    return addr, nome
+        except Exception:
+            pass
+        try:
+            rota = self.conn.execute(
+                "SELECT requester_addr FROM pending_routes"
+                " WHERE chat_id = ? AND requester_addr != '' ORDER BY id DESC LIMIT 1",
+                (int(cid),),
+            ).fetchone()
+            if rota and str(rota.get("requester_addr") or ""):
+                return str(rota["requester_addr"]), ""
+        except Exception:
+            pass
+        payload = self._open_forms.get(int(cid))
+        if payload:
+            req = form_open.requester_key(payload, self.own)
+            if req[1] or req[2]:
+                return str(req[1] or ""), str(req[2] or "")
+        return "", ""
+
     def _emit(self, reason: str, cid: int | None, q: str | None, detail: str = "") -> None:
         on = bool(q and q in self.enabled)
-        db.log_event(self.conn, reason, chat_id=cid, queue_address=q, queue_enabled=on if q else None, detail=detail)
+        addr, nome = self._author_do_chat(int(cid)) if cid is not None else ("", "")
+        db.log_event(
+            self.conn, reason, chat_id=cid, queue_address=q,
+            queue_enabled=on if q else None, detail=detail,
+            author_addr=addr, author_name=nome,
+        )
 
     def _note_open_form(self, chat: dict | None, origem: str = "closure") -> None:
         """Mantem o indice de formularios acompanhados (abertura form-aware).
@@ -1049,9 +1088,16 @@ class Engine:
         return 0
 
     def _move_max_fail(self) -> int:
-        """Teto de `move_chat` recusado antes de encerrar a rota (nao gira para sempre)."""
+        """Teto de `move_chat` recusado antes de encerrar a rota (nao gira para sempre).
+
+        Vale para formulario (historico `form_move_max_fail`) e para chat; a chave
+        generica `move_max_fail` tem precedencia quando configurada.
+        """
         try:
-            return max(1, int(self.cfg.get("form_move_max_fail") or 3))
+            valor = self.cfg.get("move_max_fail")
+            if valor in (None, ""):
+                valor = self.cfg.get("form_move_max_fail")
+            return max(1, int(valor or 3))
         except (TypeError, ValueError):
             return 3
 
@@ -1211,6 +1257,10 @@ class Engine:
                     log.exception("rejoin_silent %s", cid)
                     self._emit("join_failed", cid, q, str(e))
             elif action == "stale":
+                # A rota tem de sair do caminho AQUI: sem isto ela ficava `waiting`
+                # para sempre e o tick tentava `move_chat` num chat que o bot ja nao
+                # conduz (TOA recusa com e=10) — girando em loop pela fila.
+                db.finish_routes_for_chat(self.conn, cid, "failed", "chat sumiu do TOA")
                 db.upsert_chat(self.conn, cid, status="left", left_at=now)
                 if not self._case_recent(cid):
                     self._close_case(cid, "stale_boot")
@@ -1941,7 +1991,11 @@ class Engine:
         message = str(result.get("message") or "")
         q = row.get("queue_address")
         reason = "script_ok" if result.get("ok") else "script_error"
-        self._emit(reason, cid, q, str(result.get("detail") or "")[:800])
+        # slug no detail: sem ele so ficava "http 200"/"http_error" e era
+        # impossivel saber QUAL script falhou na aba Atividade.
+        slug = str(row.get("script_slug") or "").strip()
+        det = str(result.get("detail") or "")
+        self._emit(reason, cid, q, (f"slug={slug}; {det}" if slug else det)[:800])
         if message:
             await self.send(cid, message)
         if action == "retry_form":
@@ -2230,7 +2284,10 @@ class Engine:
                 log.warning("move_chat %s %s: %s", cid, q, e)
                 self._reserve_drop(addr, "chat", case_key)
                 if not str(marks.get("exclude_assignee") or "").strip():
-                    return False, f"{route}; move_falhou={e}"
+                    # Conta a recusa: o tick encerra a rota no teto, senao o chat
+                    # gira para sempre tentando mover um chat que o bot nao conduz.
+                    falhas = db.bump_move_fails(self.conn, route_id)
+                    return False, f"{route}; move_falhou={e}; falhas={falhas}"
                 # Resgate: o chat ja estava com o analista que ficou offline e o
                 # TOA recusou um novo move — segue para o convite do novo alvo.
                 self._emit(
@@ -2741,7 +2798,7 @@ class Engine:
             poll = 30.0
         return max(poll * 2.0, 60.0)
 
-    async def _listas_toa(self, queue_address: str | None) -> tuple[dict[int, dict], bool]:
+    async def _listas_toa(self, queue_address: str | None) -> tuple[dict[int, dict], bool, set[int]]:
         """O que o TOA lista para a fila: `in_process` + `pending` (+ sessao).
 
         `in_process` e a lista do front (chats E formularios em atendimento) e
@@ -2751,8 +2808,14 @@ class Engine:
         O segundo valor (`ok`) so e True quando as DUAS listas do front
         responderam: sem essa garantia a ausencia nao pode decidir nada (um
         timeout no `pending` esconderia um formulario que so espera na fila).
+
+        O terceiro valor e o conjunto de ids vistos na lista `pending` (a FILA
+        do TOA para aquela fila): e a fonte do card FILA FORMS do dashboard —
+        forms presentes na fila, sem depender de `pending_routes` (rotas orfas
+        de form inflavam o numero).
         """
         vistos: dict[int, dict] = {}
+        pendentes: set[int] = set()
         fonte = str(self.cfg.get("route_capacity_source") or "both")
         if fonte in ("active", "both"):
             try:
@@ -2767,7 +2830,7 @@ class Engine:
             except Exception as e:
                 log.warning("get_active_chats carga: %s", e)
         if not queue_address:
-            return vistos, False
+            return vistos, False, pendentes
         ok = True
         for tipo in ("in_process", "pending"):
             try:
@@ -2785,10 +2848,12 @@ class Engine:
                     if cid is None:
                         continue
                     vistos[int(cid)] = c
+                    if tipo == "pending":
+                        pendentes.add(int(cid))
             except Exception as e:
                 ok = False
                 log.warning("get_helpdesk_chats %s tipo=%s carga: %s", queue_address, tipo, e)
-        return vistos, ok
+        return vistos, ok, pendentes
 
     async def snapshot_load(self, motivo: str = "timer") -> int:
         """Grava a carga por analista e fecha o formulario ja resolvido no TOA.
@@ -2801,6 +2866,7 @@ class Engine:
         """
         fontes: dict[int, dict] = {}
         ok_geral = False
+        pendentes_vistos: set[int] = set()
         filas: list[str | None] = []
         equipes: list[tuple[int, str]] = [
             (int(t["id"]), str(t["name"] or t["id"]))
@@ -2815,9 +2881,31 @@ class Engine:
                 if r["queue_address"] and r["queue_address"] not in filas:
                     filas.append(r["queue_address"])
         for q in (filas or [None]):
-            vistos, ok = await self._listas_toa(q)
+            vistos, ok, pendentes = await self._listas_toa(q)
             fontes.update(vistos)
             ok_geral = ok_geral or ok
+            if q:
+                # Fila do TOA (card FILA FORMS): o que a lista `pending` mostrou
+                # PARA ESTA fila, deduplicado por chat_id — inclusive entre
+                # filas do MESMO snapshot (um chat em duas filas nao pode virar
+                # dois no total do card). `ok=False` grava a leitura como falha:
+                # o painel mostra "sem coleta recente" em vez de numero velho.
+                n_forms = n_chats = 0
+                for cid in pendentes:
+                    if cid in pendentes_vistos:
+                        continue
+                    pendentes_vistos.add(cid)
+                    chat = vistos.get(cid)
+                    if form_open.is_validation_form(chat):
+                        n_forms += 1
+                    else:
+                        n_chats += 1
+                db.queue_load_upsert(
+                    self.conn, q,
+                    pending_forms=n_forms, pending_chats=n_chats,
+                    toa_ok=1 if ok else 0,
+                    detail=f"motivo={motivo}; pendentes={len(pendentes)}",
+                )
         logins = sorted({
             _member_login_raw(str(m["address"]))
             for ms in membros_por_time.values() for m in ms if m.get("address")
@@ -3560,6 +3648,14 @@ class Engine:
                     self._emit("queued_assigned", cid, q, f"espera={espera}s; {detail}")
                     await self._deliver_sibling(case_key, str(picked.get("address") or ""), team)
                     continue
+                if self._move_falhas(detail) >= self._move_max_fail():
+                    # Chat com `move_chat` recusado no teto: encerra (com o fallback do
+                    # time) em vez de girar para sempre — mesmo tratamento do formulario.
+                    motivo = f"move_chat recusado pelo TOA ({self._move_falhas(detail)}x); rota encerrada"
+                    db.finish_route(self.conn, rid, "failed", f"{motivo}; {detail}")
+                    self._emit("chat_move_refused", cid, q, f"{motivo}; {detail}")
+                    await self._apply_chat_fallback(cid, q)
+                    continue
                 db.retry_route(self.conn, rid, used + 1, settings["retry_interval_sec"], detail)
                 # Releitura da marca: o move pode ter acontecido agora, dentro da entrega.
                 if fila and not db.chat_moved(self.conn, cid):
@@ -3719,6 +3815,13 @@ class Engine:
             await self._reclaim_offline()
         except Exception:
             log.exception("reclaim_offline")
+        # Rota de chat orfa (chat ja saiu do bot): encerra para nao girar `move_chat`.
+        try:
+            orfas = db.finish_orphan_routes(self.conn)
+            if orfas:
+                self._emit("orphan_route_closed", None, None, f"{orfas} rota(s) de chat encerrada(s)")
+        except Exception:
+            log.exception("finish_orphan_routes")
         sec = int(self.cfg.get("reply_timeout_sec") or 300)
         for row in db.awaiting_timeouts(self.conn):
             if not _silence_expired(row, sec):
