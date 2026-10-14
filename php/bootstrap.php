@@ -103,6 +103,7 @@ function bot_ensure_schema(PDO $pdo): void
     bot_migrate_rbac($pdo);
     bot_migrate_ask($pdo);
     bot_migrate_queue($pdo);
+    bot_migrate_queue_priority($pdo);
     bot_migrate_delivery($pdo);
     bot_migrate_load($pdo);
     bot_migrate_form_aware($pdo);
@@ -384,6 +385,20 @@ function bot_migrate_queue(PDO $pdo): void
     );
     if (!isset($cols['last_position'])) {
         $pdo->exec('ALTER TABLE pending_routes ADD COLUMN last_position INTEGER NOT NULL DEFAULT 0');
+    }
+}
+
+/**
+ * Priorizacao manual da fila (painel): fura a fila da propria linha/time.
+ * Espelho de python/db.py::_migrate_queue_priority.
+ */
+function bot_migrate_queue_priority(PDO $pdo): void
+{
+    if (!bot_table_exists($pdo, 'pending_routes')) {
+        return;
+    }
+    if (!isset(bot_table_columns($pdo, 'pending_routes')['priority'])) {
+        $pdo->exec('ALTER TABLE pending_routes ADD COLUMN priority INTEGER NOT NULL DEFAULT 0');
     }
 }
 

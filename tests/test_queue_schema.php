@@ -30,6 +30,7 @@ bot_ensure_schema($pdo);
 $cols = bot_table_columns($pdo, 'pending_routes');
 ok(isset($cols['expires_at']), 'pending_routes.expires_at criada');
 ok(isset($cols['last_position']), 'pending_routes.last_position criada');
+ok(isset($cols['priority']), 'pending_routes.priority criada (priorizacao manual no painel)');
 $chatCols = bot_table_columns($pdo, 'chats');
 ok(isset($chatCols['moved_at']), 'chats.moved_at criada (transferencia parcial)');
 

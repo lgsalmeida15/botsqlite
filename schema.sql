@@ -295,6 +295,9 @@ CREATE TABLE IF NOT EXISTS pending_routes (
   -- Abertura form-aware: rota do chat que so pode ser entregue ao DONO do caso
   -- (analista que atende o formulario); sem dono ela espera, sem gastar tentativa.
   expects_owner INTEGER NOT NULL DEFAULT 0,
+  -- Priorizacao manual (painel): fura a fila da propria linha (chat/formulario)
+  -- e time. Ordem real e `priority DESC, id ASC` (ver db.due_routes).
+  priority INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 

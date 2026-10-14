@@ -379,6 +379,69 @@ class QueueTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(routes(conn, "waiting"), [])
         self.assertIn("orphan_route_closed", events(conn))
 
+    async def test_priorizar_item_fura_a_fila(self):
+        """`set_route_priority` entrega o priorizado antes de quem chegou primeiro."""
+        eng, conn, sock = self._eng(online=["ana"])
+        eng.cfg["max_cases_per_agent"] = "1"
+        db.enqueue_route(conn, "chat", 30, "h:q1", 1, detail="chat", delay_sec=0)
+        segundo = db.enqueue_route(conn, "chat", 31, "h:q1", 1, detail="chat", delay_sec=0)
+        self.assertTrue(db.set_route_priority(conn, segundo, 1))
+        await eng.tick_routes()
+        entregues = routes(conn, "done")
+        self.assertEqual(len(entregues), 1)
+        self.assertEqual(int(entregues[0]["chat_id"]), 31, "priorizado entregue primeiro")
+        esperando = routes(conn, "waiting")
+        self.assertEqual(len(esperando), 1)
+        self.assertEqual(int(esperando[0]["chat_id"]), 30)
+
+    def test_priorizar_so_vale_para_rota_em_espera(self):
+        """Rota ja entregue (done) nao pode ser priorizada: a acao e so para quem espera."""
+        conn = mem_conn()
+        seed_queue_menu(conn, with_team=True)
+        rid = db.enqueue_route(conn, "chat", 10, "h:q1", 1, delay_sec=0)
+        db.finish_route(conn, rid, "done", "")
+        self.assertFalse(db.set_route_priority(conn, rid, 1))
+
+    def test_tentar_agora_ignora_o_backoff(self):
+        """`retry_route_now` zera o proximo tick sem esperar o intervalo de retry."""
+        conn = mem_conn()
+        seed_queue_menu(conn, with_team=True)
+        rid = db.enqueue_route(conn, "chat", 10, "h:q1", 1, delay_sec=55)
+        self.assertEqual(db.due_routes(conn)["chat"], [], "ainda no backoff")
+        self.assertTrue(db.retry_route_now(conn, rid))
+        devidas = db.due_routes(conn)["chat"]
+        self.assertEqual(len(devidas), 1)
+        self.assertEqual(int(devidas[0]["id"]), rid)
+
+    async def test_fechar_caso_acorda_a_fila_do_mesmo_time(self):
+        """`_close_case` zera o backoff de quem espera: nao fica ate 60s parado.
+
+        Antes, uma rota que tinha acabado de falhar (next_try_at no futuro, por
+        `transfer_retry_interval_sec`) so era tentada de novo quando o backoff
+        vencesse sozinho, mesmo que um analista liberasse vaga um segundo depois.
+        """
+        eng, conn, sock = self._eng(online=["ana"])
+        eng.cfg["max_cases_per_agent"] = "1"
+        db.enqueue_route(conn, "chat", 10, "h:q1", 1, detail="chat", delay_sec=0)
+        db.enqueue_route(conn, "chat", 11, "h:q1", 1, detail="chat", delay_sec=0)
+        await eng.tick_routes()
+        entregues = routes(conn, "done")
+        self.assertEqual(len(entregues), 1)
+        self.assertEqual(int(entregues[0]["chat_id"]), 10, "ana recebeu o primeiro")
+        esperando = routes(conn, "waiting")
+        self.assertEqual(len(esperando), 1)
+        rid11 = int(esperando[0]["id"])
+        # Simula o backoff de uma tentativa que acabou de falhar (bem no futuro).
+        conn.execute(
+            "UPDATE pending_routes SET next_try_at = datetime('now', '+55 seconds') WHERE id = ?",
+            (rid11,),
+        )
+        self.assertEqual(db.due_routes(conn)["chat"], [], "backoff ainda nao venceu")
+        eng._close_case(10, "teste")
+        devidas = db.due_routes(conn)["chat"]
+        self.assertEqual(len(devidas), 1, "a fila foi acordada na hora, sem esperar o backoff")
+        self.assertEqual(int(devidas[0]["id"]), rid11)
+
 
 class QueueSchemaTest(unittest.TestCase):
     def test_colunas_ajustes_e_template(self):
@@ -386,6 +449,7 @@ class QueueSchemaTest(unittest.TestCase):
         cols = db._table_columns(conn, "pending_routes")
         self.assertIn("expires_at", cols)
         self.assertIn("last_position", cols)
+        self.assertIn("priority", cols)
         self.assertIn("moved_at", db._table_columns(conn, "chats"))
         cfg = db.settings(conn)
         self.assertIn("queue_wait_enabled", cfg)

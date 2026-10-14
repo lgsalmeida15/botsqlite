@@ -1,3 +1,4 @@
+
 # HELPTOA Bot — desenho do fluxo atual
 
 > Retrato do codigo em 22/09/2026. Cobre **atendimento**, **menu**, **roteamento por caso**, **formulario de validacao**, **timers**, **banco** e **painel**.
@@ -385,7 +386,10 @@ fallback do formulario valem com a fila **desligada**.
 - `queue_wait_enabled=false` devolve o comportamento antigo: N tentativas (`transfer_attempts`) e depois fallback.
 - A fila vive no banco: kill/restart nao perde posicao nem o aviso ja enviado (`last_position`).
 - **Sem prazo:** nao existe mais `queue_max_wait_sec` — a rota nasce sem `expires_at` (o campo continua na tabela apenas como marcador do botao **Encerrar espera**). O timeout antigo encerrava o chat sem transferencia quando o time ficava saturado.
-- Na aba **Roteamento** o card **Fila de espera (agora)** mostra posicao, tempo de espera, tentativas e o prazo ("sem prazo"); **Encerrar espera** encerra na hora e deixa o motor aplicar o fallback.
+- Na aba **Roteamento** o card **Fila de espera (agora)** mostra posicao, solicitante, tempo de espera, tentativas, **proxima tentativa** e o prazo ("sem prazo"); um alerta no topo da pagina ("N aguardando na fila agora") linka direto pro card (`#fila-espera`). **Encerrar espera** encerra na hora e deixa o motor aplicar o fallback.
+- **Priorizacao manual (painel):** `pending_routes.priority` (0 por padrao) fura a fila da propria linha (chat/formulario) e do proprio time — ordem real e `priority DESC, id` (`db.due_routes`, `db.queue_position`). Botao **Priorizar**/**Remover prioridade** no card; entre varios priorizados a ordem continua por chegada.
+- **Tentar agora (painel):** zera o `next_try_at` de um item especifico (`db.retry_route_now`), ignorando o backoff do retry (`transfer_retry_interval_sec`/`form_route_retry_interval_sec`, 60s por padrao) sem mudar o ajuste global.
+- **Acordar a fila ao liberar vaga:** fechar um caso (`Engine._close_case`, qualquer motivo) chama `db.wake_team_routes` e zera o `next_try_at` de quem aguarda o backoff natural no mesmo time. Sem isso um item podia ficar ate 60s parado mesmo com um analista liberando vaga logo em seguida — o tick (5s) so olha rotas com `next_try_at` vencido.
 - Quando a rota do chat e encerrada por outro motivo (tecnico saiu, chat removido, ausencia no TOA), a linha em `pending_routes` e fechada junto, para o tick nao insistir num chat que nao existe mais.
 - **Fila desabilitada (ou bot desligado no painel):** o bot **nao fica dentro** de um quadro que o operador tirou dele. A espera e **encerrada com o motivo** (`fila_desabilitada`, `bot_desligado` no `detail` da rota e em `route_assignments.close_reason`) e o chat volta ao quadro **em silencio** (`leave_chat`, sem mensagem ao tecnico); o formulario apenas deixa de ser oferecido (`form_queue_off`, rota `failed`). Cada tick devolve ate **10 chats** (`_LEAVE_BUDGET`) — o resto sai nos ciclos seguintes. Tambem sai quem **ja foi entregue**: a varredura olha os chats vivos (`db.resume_chats`), nao so as rotas em espera. Antes a rota era **segurada** `waiting` para voltar sozinha ao religar — na pratica o item ficava invisivel para as duas recuperacoes (`due_routes` so ve o que venceu; a recuperacao exige chat **sem** rota) e so voltava pelo botao *Reabrir rota*. **Religar nao retoma**: quem entrega e uma pessoa.
 

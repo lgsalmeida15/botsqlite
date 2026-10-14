@@ -97,6 +97,7 @@ def ensure_schema(conn) -> None:
     _migrate_rbac(conn)
     _migrate_ask(conn)
     _migrate_queue(conn)
+    _migrate_queue_priority(conn)
     _migrate_delivery(conn)
     _migrate_form_aware(conn)
     _migrate_case_keys(conn)
@@ -374,6 +375,19 @@ def _migrate_queue(conn) -> None:
         "UPDATE pending_routes SET expires_at = NULL"
         " WHERE status = 'waiting' AND expires_at IS NOT NULL AND expires_at > datetime('now')"
     )
+
+
+def _migrate_queue_priority(conn) -> None:
+    """Priorizacao manual da fila (painel): fura a fila da propria linha/time.
+
+    Sem isso a fila e estritamente FIFO por `id` — o atendente so pode encerrar
+    a espera (aplica o fallback), nunca adiantar um item especifico.
+    Espelho de php/bootstrap.php::bot_migrate_queue_priority.
+    """
+    if "pending_routes" not in _table_names(conn):
+        return
+    if "priority" not in _table_columns(conn, "pending_routes"):
+        conn.execute("ALTER TABLE pending_routes ADD COLUMN priority INTEGER NOT NULL DEFAULT 0")
 
 
 def _migrate_delivery(conn) -> None:
@@ -1325,15 +1339,17 @@ def queue_position(conn, route_id: int, so_chat: bool = False) -> int:
     if not route_id:
         return 0
     row = conn.execute(
-        "SELECT team_id, id FROM pending_routes WHERE id = ?", (int(route_id),)
+        "SELECT team_id, id, priority FROM pending_routes WHERE id = ?", (int(route_id),)
     ).fetchone()
     if not row:
         return 0
     filtro = " AND kind = 'chat'" if so_chat else ""
+    prioridade = int(row["priority"] or 0)
     total = conn.execute(
         "SELECT COUNT(*) AS n FROM pending_routes"
-        " WHERE status = 'waiting' AND id < ? AND (team_id IS ?)" + filtro,
-        (int(row["id"]), row["team_id"]),
+        " WHERE status = 'waiting' AND (team_id IS ?)"
+        " AND (priority > ? OR (priority = ? AND id < ?))" + filtro,
+        (row["team_id"], prioridade, prioridade, int(row["id"])),
     ).fetchone()
     return int(total["n"]) + 1
 
@@ -1399,9 +1415,10 @@ def finish_orphan_routes(conn, status: str = "failed",
 def due_routes(conn, per_line: int = 5) -> dict[str, list[dict]]:
     """Rotas vencidas por LINHA: chat e formulario esperam em filas apartadas.
 
-    Devolve as duas listas (cada uma FIFO por `id`) para o tick tentar a cabeca
-    de cada linha na mesma passada — um formulario enviado depois de 10 chats e
-    o 1o da linha dele, nao o 11.
+    Devolve as duas listas (cada uma FIFO por `id`, priorizados primeiro) para o
+    tick tentar a cabeca de cada linha na mesma passada — um formulario enviado
+    depois de 10 chats e o 1o da linha dele, nao o 11. `priority` (painel, acao
+    manual) fura a fila da propria linha/time sem quebrar o FIFO entre iguais.
     """
     linhas: dict[str, list[dict]] = {}
     for kind in ("chat", "form"):
@@ -1409,7 +1426,7 @@ def due_routes(conn, per_line: int = 5) -> dict[str, list[dict]]:
             """SELECT * FROM pending_routes
                WHERE status = 'waiting' AND kind = ?
                  AND (next_try_at IS NULL OR datetime(next_try_at) <= datetime('now'))
-               ORDER BY id
+               ORDER BY priority DESC, id
                LIMIT ?""",
             (kind, max(1, int(per_line))),
         ).fetchall()
@@ -1424,6 +1441,52 @@ def retry_route(conn, route_id: int, attempts: int, delay_sec: float, detail: st
            WHERE id = ?""",
         (int(attempts), detail or "", str(max(int(delay_sec), 0)), int(route_id)),
     )
+
+
+def retry_route_now(conn, route_id: int) -> bool:
+    """Forca a proxima tentativa AGORA, ignorando o backoff do retry.
+
+    Acao manual do painel: usada quando o atendente quer que um item especifico
+    seja tentado no proximo tick (5s) em vez de esperar o intervalo cheio
+    (`transfer_retry_interval_sec`/`form_route_retry_interval_sec`, 60s por
+    padrao).
+    """
+    cur = conn.execute(
+        "UPDATE pending_routes SET next_try_at = datetime('now')"
+        " WHERE id = ? AND status = 'waiting'",
+        (int(route_id),),
+    )
+    return bool(cur.rowcount)
+
+
+def set_route_priority(conn, route_id: int, priority: int) -> bool:
+    """Prioriza (ou remove a prioridade de) um item da fila: acao manual do painel.
+
+    `priority=1` fura a fila da propria linha (chat/formulario) e time; entre
+    varios priorizados a ordem relativa continua FIFO por `id` (ver due_routes).
+    """
+    cur = conn.execute(
+        "UPDATE pending_routes SET priority = ? WHERE id = ? AND status = 'waiting'",
+        (int(priority), int(route_id)),
+    )
+    return bool(cur.rowcount)
+
+
+def wake_team_routes(conn, team_id) -> int:
+    """Acorda a fila do time ao liberar vaga: zera o backoff de quem ainda espera.
+
+    Sem isso um item podia ficar ate `transfer_retry_interval_sec` (padrao 60s)
+    parado mesmo que um analista tivesse liberado vaga um segundo depois da
+    ultima tentativa falha — o tick so olha rotas com `next_try_at` vencido.
+    Chamada em `Engine._close_case` (qualquer caso que fecha libera a vaga).
+    """
+    cur = conn.execute(
+        "UPDATE pending_routes SET next_try_at = datetime('now')"
+        " WHERE status = 'waiting' AND team_id IS ?"
+        " AND next_try_at IS NOT NULL AND datetime(next_try_at) > datetime('now')",
+        (team_id,),
+    )
+    return int(cur.rowcount or 0)
 
 
 def waiting_routes(conn, limite: int = 5) -> list[dict]:
