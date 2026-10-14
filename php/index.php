@@ -1818,12 +1818,23 @@ foreach ($nav as $navKey => $navLabel) {
     }
 }
 
+/**
+ * Cache-busting local (sem CDN/rede): `?v=<mtime>` do proprio arquivo em disco,
+ * pra depois de um deploy o navegador (ou qualquer proxy no meio do caminho)
+ * nao continuar servindo panel.css/panel.js antigos sem a regra/funcao nova.
+ */
+function bot_asset_ver(string $rel): string
+{
+    $mtime = @filemtime(__DIR__ . '/' . $rel);
+    return $mtime !== false ? '?v=' . $mtime : '';
+}
+
 function layout_start(string $title, array $nav, string $page, bool|int $autoRefresh = false): void
 {
     echo '<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">';
     echo '<title>' . h($title) . '</title>';
     echo '<link href="assets/bootstrap.min.css" rel="stylesheet">';
-    echo '<link href="assets/panel.css" rel="stylesheet">';
+    echo '<link href="assets/panel.css' . bot_asset_ver('assets/panel.css') . '" rel="stylesheet">';
     // Auto-refresh via JS (panel.js), nao <meta refresh>: o meta recarregava a
     // pagina no meio da digitacao de um filtro e apagava o que a pessoa tinha
     // escrito. O JS pausa enquanto algum campo de formulario esta com foco.
@@ -1858,7 +1869,7 @@ function layout_end(): void
 {
     echo '</main>';
     echo '<script src="assets/bootstrap.bundle.min.js"></script>';
-    echo '<script src="assets/panel.js"></script>';
+    echo '<script src="assets/panel.js' . bot_asset_ver('assets/panel.js') . '"></script>';
     echo '<script>
 (function () {
   function openAccordion(hash) {
