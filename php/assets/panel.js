@@ -84,6 +84,26 @@
     });
   });
 
+  /* Auto-refresh (data-auto-refresh no body, em segundos): recarrega a pagina
+     sozinha, mas PAUSA enquanto a pessoa esta com foco em algum campo de
+     formulario (ex.: digitando no filtro de Autor) e reinicia a contagem
+     quando o foco sai. Evita apagar o que a pessoa estava digitando. */
+  var autoRefreshSec = parseInt(document.body.getAttribute("data-auto-refresh") || "0", 10);
+  if (autoRefreshSec > 0) {
+    var autoRefreshTimer = null;
+    var armAutoRefresh = function () {
+      clearTimeout(autoRefreshTimer);
+      autoRefreshTimer = setTimeout(function () { location.reload(); }, autoRefreshSec * 1000);
+    };
+    document.addEventListener("focusin", function (ev) {
+      if (ev.target.closest("form")) { clearTimeout(autoRefreshTimer); }
+    });
+    document.addEventListener("focusout", function (ev) {
+      if (ev.target.closest("form")) { armAutoRefresh(); }
+    });
+    armAutoRefresh();
+  }
+
   /* Perguntas da opcao (Pedir info e transferir): adicionar / remover linhas */
   function renumberAskRows(tbody) {
     tbody.querySelectorAll("[data-ask-row]").forEach(function (tr, i) {

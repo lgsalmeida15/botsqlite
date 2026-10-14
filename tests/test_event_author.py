@@ -2,9 +2,11 @@
 """Autor do chat/form no evento: bot_events grava author_addr/author_name.
 
 A coluna AUTOR da aba Atividade nasce aqui: o `_emit` resolve a identidade na
-ordem ledger aberto -> rota pendente -> indice de formularios e grava o par
-(endereco, nome). Sem identidade confiavel o par fica vazio (o painel mostra
-endereco ou "-") — nunca inventa nome.
+ordem ledger aberto -> rota pendente -> indice de formularios -> snapshot de
+entrada do chat (started_addr/started_name, gravado pelo `remember` desde a
+1a leitura do payload) e grava o par (endereco, nome). Sem identidade
+confiavel o par fica vazio (o painel mostra endereco ou "-") — nunca inventa
+nome.
 """
 from __future__ import annotations
 
@@ -16,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from python import db  # noqa: E402
-from python.engine import Engine  # noqa: E402
+from python.engine import MEM, Engine, remember  # noqa: E402
 from tests.test_form_route import ANA, TEC  # noqa: E402
 from tests.test_submenu import FakeSock, mem_conn, seed_queue_menu  # noqa: E402
 
@@ -30,6 +32,12 @@ def ultimo_evento(conn) -> dict:
 
 
 class EventAuthorTest(unittest.TestCase):
+    def setUp(self) -> None:
+        # MEM e global do processo (cache de leitura de chat); sem limpar, um
+        # teste que chama remember() vaza o snapshot de entrada para os outros.
+        MEM.pop(CID, None)
+        self.addCleanup(MEM.pop, CID, None)
+
     def _eng(self, conn) -> Engine:
         return Engine(conn, FakeSock())
 
@@ -87,6 +95,56 @@ class EventAuthorTest(unittest.TestCase):
         ev = ultimo_evento(conn)
         self.assertEqual(ev["author_addr"], TEC)
         self.assertEqual(ev["author_name"], "Tec Dois")
+
+    def test_autor_vem_do_snapshot_de_entrada(self):
+        conn = mem_conn()
+        seed_queue_menu(conn, with_team=True)
+        # Sem ledger, sem rota pendente, sem indice de formulario: so a leitura
+        # do chat (triagem inicial, ex. "not_new") — e o unico caso em que o
+        # snapshot de entrada e quem resolve o autor.
+        remember({
+            "chat_id": CID,
+            "started_addr": TEC,
+            "helpdesk_address": "h:q1",
+            "participants": {TEC: {"address": TEC, "name": "Tec Tres", "present": True}},
+        })
+        self._eng(conn)._emit("not_new", CID, "h:q1", "já tem analista ou bot")
+        ev = ultimo_evento(conn)
+        self.assertEqual(ev["author_addr"], TEC)
+        self.assertEqual(ev["author_name"], "Tec Tres")
+
+    def test_ledger_vence_o_snapshot_de_entrada(self):
+        conn = mem_conn()
+        seed_queue_menu(conn, with_team=True)
+        remember({
+            "chat_id": CID,
+            "started_addr": TEC,
+            "helpdesk_address": "h:q1",
+            "participants": {TEC: {"address": TEC, "name": "Nome do payload", "present": True}},
+        })
+        db.assign_open(
+            conn, "form", CID, "h:q1", 1, ANA,
+            "a:" + TEC, TEC, "Nome do ledger", "address",
+        )
+        self._eng(conn)._emit("form_state", CID, "h:q1", "estado=aberto")
+        ev = ultimo_evento(conn)
+        self.assertEqual(ev["author_name"], "Nome do ledger")
+
+    def test_snapshot_de_entrada_e_pegajoso(self):
+        conn = mem_conn()
+        seed_queue_menu(conn, with_team=True)
+        remember({
+            "chat_id": CID,
+            "started_addr": TEC,
+            "helpdesk_address": "h:q1",
+            "participants": {TEC: {"address": TEC, "name": "Tec Quatro", "present": True}},
+        })
+        # Leitura seguinte sem participantes (o payload do TOA as vezes esvazia
+        # a lista): o nome ja resolvido nao pode sumir.
+        remember({"chat_id": CID, "helpdesk_address": "h:q1", "participants": {}})
+        self._eng(conn)._emit("not_new", CID, "h:q1", "já tem analista ou bot")
+        ev = ultimo_evento(conn)
+        self.assertEqual(ev["author_name"], "Tec Quatro")
 
     def test_sem_identidade_grava_vazio(self):
         conn = mem_conn()

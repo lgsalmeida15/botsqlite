@@ -320,6 +320,64 @@ ok(
     'aba activity: endereco do autor junto do nome'
 );
 
+// Outro evento sem autor (para o filtro ter o que excluir).
+$pdo->exec("INSERT INTO bot_events (chat_id, queue_address, reason, detail) VALUES (10, 'h:q1', 'not_new', 'sem identidade')");
+
+function render_activity(string $extra, int $uid): array
+{
+    $cmd = escapeshellarg(PHP_BINARY) . ' ' . escapeshellarg(__DIR__ . DIRECTORY_SEPARATOR . '_panel_render.php')
+        . ' activity ' . escapeshellarg((string) $uid) . ' ' . escapeshellarg($extra) . ' 2>&1';
+    $out = [];
+    $code = 0;
+    exec($cmd, $out, $code);
+    return [implode("\n", $out), $code];
+}
+
+// So o corpo da tabela: o <select> de eventos lista TODOS os reasons (inclusive
+// "not_new") como <option>, entao checar a pagina inteira daria falso negativo.
+function activity_tbody(string $html): string
+{
+    return preg_match('/<tbody>(.*?)<\/tbody>/s', $html, $m) ? $m[1] : '';
+}
+
+// Filtro por autor: volta no campo, restringe a tabela e pausa o auto-refresh.
+[$htmlAtivAutor, $codeAtivAutor] = render_activity('autor=Tec', $uid);
+ok($codeAtivAutor === 0, 'aba activity (filtro por autor): renderizou sem erro');
+ok(strpos($htmlAtivAutor, 'value="Tec"') !== false, 'aba activity: autor digitado volta no campo');
+$tbodyAtivAutor = activity_tbody($htmlAtivAutor);
+ok(
+    strpos($tbodyAtivAutor, 'Tec Um') !== false && strpos($tbodyAtivAutor, 'já atendido') === false,
+    'aba activity: filtro por autor restringe a tabela ao evento com identidade'
+);
+ok(strpos($htmlAtivAutor, 'data-auto-refresh') === false, 'aba activity: filtro por autor pausa o auto-refresh');
+
+// Sem urlencode: '@' nao precisa (so & = quebram parse_str), e o % do urlencode
+// vira espaco no escapeshellarg do Windows (protecao contra expansao do cmd.exe).
+[$htmlAtivAutorAddr] = render_activity('autor=tec@claro', $uid);
+ok(
+    strpos(activity_tbody($htmlAtivAutorAddr), 'Tec Um') !== false,
+    'aba activity: filtro por autor tambem acha pelo endereco'
+);
+
+// Filtro por chat_id: exato, so digitos, restringe a tabela a esse chat.
+[$htmlAtivChat, $codeAtivChat] = render_activity('chat_id=11', $uid);
+ok($codeAtivChat === 0, 'aba activity (filtro por chat_id): renderizou sem erro');
+ok(strpos($htmlAtivChat, 'value="11"') !== false, 'aba activity: chat_id digitado volta no campo');
+$tbodyAtivChat = activity_tbody($htmlAtivChat);
+ok(
+    strpos($tbodyAtivChat, 'detalhe bem longo') !== false && strpos($tbodyAtivChat, 'Tec Um') === false,
+    'aba activity: filtro por chat_id restringe a tabela ao chat informado'
+);
+ok(strpos($htmlAtivChat, 'data-auto-refresh') === false, 'aba activity: filtro por chat_id pausa o auto-refresh');
+
+// Lixo (nao-digito) no chat_id e ignorado, sem quebrar a pagina nem filtrar.
+[$htmlAtivChatLixo, $codeAtivChatLixo] = render_activity('chat_id=' . rawurlencode('abc'), $uid);
+ok($codeAtivChatLixo === 0, 'aba activity (chat_id invalido): renderizou sem erro');
+ok(
+    strpos(activity_tbody($htmlAtivChatLixo), 'Tec Um') !== false,
+    'aba activity: chat_id nao numerico e ignorado (sem filtrar)'
+);
+
 // Ajustes do resgate no Roteamento: globais + por time (linha de cada time).
 $htmlRoutingOff = (string) ($htmls['routing'] ?? '');
 ok(strpos($htmlRoutingOff, 'name="offline_requeue_enabled"') !== false, 'aba routing: liga/desliga do resgate');

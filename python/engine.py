@@ -106,8 +106,13 @@ def remember(chat: dict) -> int | None:
     prev = MEM.get(cid, {})
     raw = dict(prev.get("raw") or {})
     raw.update(chat)
+    # Nome de quem abriu o chat, pego do payload desde a 1a leitura (sem esperar
+    # ledger/rota/formulario). Pegajoso como o started_addr: uma vez resolvido,
+    # nao se perde se uma leitura seguinte vier sem participante/nome.
+    started_name = prev.get("started_name") or form_open.chat_opener(raw).get("name")
     MEM[cid] = {
         "started_addr": chat.get("started_addr") or prev.get("started_addr") or raw.get("started_addr"),
+        "started_name": started_name,
         "queue_address": queue_of(chat) or prev.get("queue_address"),
         "originator_spoke": prev.get("originator_spoke", False),
         "bot_present": prev.get("bot_present", False),
@@ -554,9 +559,11 @@ class Engine:
         """(endereco, nome) do autor do chat/formulario para gravar no evento.
 
         Ordem: ledger aberto (ja tem identidade gravada) -> rota pendente
-        (requester_addr) -> indice de formularios abertos (payload vivo).
-        Sem identidade confiavel devolve vazio: o painel cai no endereco ou
-        mostra "-" — nunca inventa nome.
+        (requester_addr) -> indice de formularios abertos (payload vivo) ->
+        snapshot de entrada do chat (started_addr/started_name, gravado pelo
+        `remember` desde a 1a leitura — cobre a triagem inicial, antes de
+        existir ledger/rota/formulario). Sem identidade confiavel devolve
+        vazio: o painel cai no endereco ou mostra "-" — nunca inventa nome.
         """
         try:
             linha = db.open_assignment(self.conn, cid)
@@ -582,6 +589,11 @@ class Engine:
             req = form_open.requester_key(payload, self.own)
             if req[1] or req[2]:
                 return str(req[1] or ""), str(req[2] or "")
+        mem = MEM.get(int(cid)) or {}
+        addr = str(mem.get("started_addr") or "")
+        nome = str(mem.get("started_name") or "")
+        if addr or nome:
+            return addr, nome
         return "", ""
 
     def _emit(self, reason: str, cid: int | None, q: str | None, detail: str = "") -> None:
@@ -864,7 +876,8 @@ class Engine:
         deixou casos "sumirem" do ledger sem ninguem saber por que.
         """
         row = self.conn.execute(
-            "SELECT assignee, kind, case_key FROM route_assignments WHERE chat_id = ? AND closed_at IS NULL",
+            "SELECT assignee, kind, case_key, team_id FROM route_assignments"
+            " WHERE chat_id = ? AND closed_at IS NULL",
             (int(cid),),
         ).fetchone()
         db.assign_close(self.conn, int(cid), reason)
@@ -875,6 +888,9 @@ class Engine:
         for k in [p for p in list(self._reserve.keys()) if p.startswith(prefixo)]:
             if k[len(prefixo):] in (chave, ""):
                 self._reserve.pop(k, None)
+        # Vaga liberada: acorda quem aguarda o retry natural (ate 60s por padrao)
+        # em vez de deixar o proximo tick esperar o backoff vencer sozinho.
+        db.wake_team_routes(self.conn, row.get("team_id"))
         self._emit(
             "case_closed", int(cid), MEM.get(int(cid), {}).get("queue_address"),
             f"{row.get('assignee') or ''}; motivo={reason or 'nao informado'}",
