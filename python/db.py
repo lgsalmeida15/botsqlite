@@ -98,6 +98,7 @@ def ensure_schema(conn) -> None:
     _migrate_ask(conn)
     _migrate_queue(conn)
     _migrate_queue_priority(conn)
+    _migrate_bot_events_chat_idx(conn)
     _migrate_delivery(conn)
     _migrate_form_aware(conn)
     _migrate_case_keys(conn)
@@ -388,6 +389,17 @@ def _migrate_queue_priority(conn) -> None:
         return
     if "priority" not in _table_columns(conn, "pending_routes"):
         conn.execute("ALTER TABLE pending_routes ADD COLUMN priority INTEGER NOT NULL DEFAULT 0")
+
+
+def _migrate_bot_events_chat_idx(conn) -> None:
+    """Indice p/ resolver o ultimo evento de um chat (autor/nome) sem table scan.
+
+    Usado pela tabela "Fila de chat" do painel Dashboard (PHP), que roda a cada
+    auto-refresh. Espelho de php/bootstrap.php::bot_migrate_bot_events_chat_idx.
+    """
+    if "bot_events" not in _table_names(conn):
+        return
+    conn.execute("CREATE INDEX IF NOT EXISTS bot_events_chat_idx ON bot_events (chat_id, id)")
 
 
 def _migrate_delivery(conn) -> None:

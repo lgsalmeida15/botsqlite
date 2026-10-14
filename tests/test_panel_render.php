@@ -275,21 +275,57 @@ ok(strpos($htmlDash, '>FILA FORMS<') !== false, 'aba dashboard: card FILA FORMS'
 // Card FILA FORMS: fonte e queue_load (fila do TOA), nao pending_routes.
 // h:q1 (2 forms, fresca) conta; h:velha (5, 10 min) fica de fora.
 ok(
-    strpos($htmlDash, 'badge bg-info text-dark">2<') !== false,
+    preg_match('/badge bg-info text-dark"[^>]*>2</', $htmlDash) === 1,
     'aba dashboard: FILA FORMS soma so a coleta fresca (2, nao 7)'
 );
 ok(
     strpos($htmlDash, 'Formulários presentes na fila') !== false,
-    'aba dashboard: FILA FORMS explica que vem da fila do TOA'
+    'aba dashboard: FILA FORMS explica que vem da fila do TOA (agora como title do badge)'
 );
 ok(strpos($htmlDash, 'class="dash-donut"') !== false, 'aba dashboard: donut de operadores (SVG puro)');
-ok(strpos($htmlDash, 'class="dash-legend"') !== false, 'aba dashboard: legenda do donut');
-ok(strpos($htmlDash, '<span class="dot"') !== false, 'aba dashboard: legenda com as cores do donut');
+// Legenda do donut foi removida de proposito (pedido de UI): so sobra o SVG com
+// <title> por fatia (hover) — sem lista de cores ao lado.
+ok(strpos($htmlDash, 'class="dash-legend"') === false, 'aba dashboard: sem legenda em lista ao lado do donut');
+ok(strpos($htmlDash, '<span class="dot"') === false, 'aba dashboard: sem bolinhas de cor da legenda antiga');
 ok(strpos($htmlDash, 'online x offline') !== false, 'aba dashboard: rotulo do donut');
 ok(strpos($htmlDash, 'Analistas') !== false, 'aba dashboard: tabela de analistas');
 ok(strpos($htmlDash, 'name="nome"') !== false, 'aba dashboard: filtro por analista (nome/endereco)');
 ok(strpos($htmlDash, 'Ex.: Ana') !== false, 'aba dashboard: exemplo do filtro por nome');
 ok(strpos($htmlDash, 'Devolver') === false, 'aba dashboard: sem botao manual de devolucao');
+
+// Nova tabela "Fila de chat — agora": chat_id=10 esta com o bot (status
+// awaiting_reply, sem rota 'waiting' — a dele e 'failed'); chat_id=12 tem uma
+// pending_route 'waiting' do time 1 (sem prioridade) — e quem exercita a acao
+// de priorizar.
+ok(strpos($htmlDash, 'Fila de chat — agora') !== false, 'aba dashboard: nova tabela de fila de chat');
+ok(strpos($htmlDash, '>com bot<') !== false, 'aba dashboard: chat com bot aparece na fila');
+ok(strpos($htmlDash, '>aguardando<') !== false, 'aba dashboard: chat aguardando roteamento aparece na fila');
+ok(strpos($htmlDash, 'value="queue_prioritize"') !== false, 'aba dashboard: acao de priorizar presente na fila');
+ok(strpos($htmlDash, '>Priorizar<') !== false, 'aba dashboard: botao Priorizar (sem prioridade ainda)');
+
+// POST queue_prioritize a partir do Dashboard: route_id = id da pending_route
+// do chat_id=12 (unica 'waiting' do fixture).
+$ridChat12 = (int) $pdo->query("SELECT id FROM pending_routes WHERE chat_id = 12 AND status = 'waiting'")->fetchColumn();
+putenv('PANEL_RENDER_POST=action=queue_prioritize&route_id=' . $ridChat12 . '&priority=1');
+$cmdPrioriza = escapeshellarg(PHP_BINARY) . ' ' . escapeshellarg(__DIR__ . DIRECTORY_SEPARATOR . '_panel_render.php')
+    . ' dashboard ' . $uid . ' ' . escapeshellarg('') . ' 2>&1';
+$outPrioriza = [];
+$codePrioriza = 0;
+exec($cmdPrioriza, $outPrioriza, $codePrioriza);
+putenv('PANEL_RENDER_POST');
+// POST com sucesso redireciona (Post/Redirect/Get, mesmo padrao ja usado pela
+// acao identica na aba Roteamento) — exit antes de renderizar qualquer pagina,
+// entao $queueMsg nunca aparece nesta mesma resposta. O que da pra conferir
+// aqui e so o codigo de saida e o estado persistido no banco.
+ok($codePrioriza === 0, 'aba dashboard (POST priorizar): renderizou sem erro');
+ok(
+    (int) $pdo->query("SELECT priority FROM pending_routes WHERE id = {$ridChat12}")->fetchColumn() === 1,
+    'aba dashboard: POST queue_prioritize grava priority=1 na rota'
+);
+// Nova renderizacao (GET): confirma que o estado persistido aparece na tabela.
+[$htmlDashPriorizado] = render_dashboard('', $uid);
+ok(strpos($htmlDashPriorizado, '>Remover prioridade<') !== false, 'aba dashboard: botao vira Remover prioridade apos priorizar');
+ok(strpos($htmlDashPriorizado, '>prioritário<') !== false, 'aba dashboard: badge prioritario aparece apos priorizar');
 
 /** Renderiza o dashboard com filtros extras (argv[3] do harness). */
 function render_dashboard(string $extra, int $uid): array

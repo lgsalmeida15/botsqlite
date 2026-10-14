@@ -1288,13 +1288,18 @@ class BotPDO extends PDO
      */
     private function botAjustaIndice(string $original, string $sql): ?string
     {
-        if (preg_match(BOT_SQL_CRIA_INDICE, $original, $m) === 1
+        // Sem comentario: as regexes de indice sao ancoradas (`^\s*CREATE`/`^\s*DROP`)
+        // e um `-- comentario` antes da instrucao (comum no schema.sql, que roda a
+        // cada bot_ensure_schema) faria o "ja existe" nunca bater — a 2a chamada
+        // tentaria recriar o indice e o MySQL derrubaria a pagina com 1061.
+        $semComentario = bot_sql_sem_comentario($original);
+        if (preg_match(BOT_SQL_CRIA_INDICE, $semComentario, $m) === 1
             && stripos($original, 'IF NOT EXISTS') !== false
             && $this->botIndiceExiste($m['tabela'], $m['nome'])
         ) {
             return null;
         }
-        if (preg_match(BOT_SQL_DROPA_INDICE, trim($original), $m) === 1
+        if (preg_match(BOT_SQL_DROPA_INDICE, trim($semComentario), $m) === 1
             && stripos($original, 'IF EXISTS') !== false
         ) {
             $tabela = $this->botTabelaDoIndice($m['nome']);

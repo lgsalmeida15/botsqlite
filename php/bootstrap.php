@@ -104,6 +104,7 @@ function bot_ensure_schema(PDO $pdo): void
     bot_migrate_ask($pdo);
     bot_migrate_queue($pdo);
     bot_migrate_queue_priority($pdo);
+    bot_migrate_bot_events_chat_idx($pdo);
     bot_migrate_delivery($pdo);
     bot_migrate_load($pdo);
     bot_migrate_form_aware($pdo);
@@ -400,6 +401,19 @@ function bot_migrate_queue_priority(PDO $pdo): void
     if (!isset(bot_table_columns($pdo, 'pending_routes')['priority'])) {
         $pdo->exec('ALTER TABLE pending_routes ADD COLUMN priority INTEGER NOT NULL DEFAULT 0');
     }
+}
+
+/**
+ * Indice para resolver o ultimo evento de um chat (autor/nome) sem table scan —
+ * usado pela tabela "Fila de chat" do Dashboard, que roda a cada auto-refresh.
+ * Espelho de python/db.py::_migrate_bot_events_chat_idx.
+ */
+function bot_migrate_bot_events_chat_idx(PDO $pdo): void
+{
+    if (!bot_table_exists($pdo, 'bot_events')) {
+        return;
+    }
+    $pdo->exec('CREATE INDEX IF NOT EXISTS bot_events_chat_idx ON bot_events (chat_id, id)');
 }
 
 function bot_migrate_delivery(PDO $pdo): void

@@ -850,15 +850,183 @@ function dash_donut(array $slices, string $centro = '', string $legenda = ''): v
     echo '<text class="dash-donut-num" x="' . $cx . '" y="68" text-anchor="middle">' . h($centro) . '</text>';
     echo '<text class="dash-donut-lbl" x="' . $cx . '" y="86" text-anchor="middle">' . h($legenda) . '</text>';
     echo '</svg>';
-    echo '<ul class="dash-legend">';
-    foreach ($slices as $fatia) {
-        $valor = max(0, (int) $fatia[1]);
-        $pct = $total > 0 ? (int) round($valor / $total * 100) : 0;
-        echo '<li><span class="dot" style="background:' . h((string) $fatia[2]) . '"></span>'
-            . h((string) $fatia[0]) . ' <strong>' . $valor . '</strong>'
-            . ' <span class="text-muted">(' . $pct . '%)</span></li>';
+    echo '</div>';
+}
+
+/**
+ * "Fila de chat — agora" do Dashboard: chats com o bot (ainda sem rota) e chats
+ * aguardando roteamento (`pending_routes`), com acao de priorizar. So respeita
+ * o filtro de FILA da pagina (retrato do agora, mesmo criterio dos cards FILA
+ * DE CHAT/FILA FORMS) — nunca o periodo nem o nome do analista.
+ */
+function dash_fila_chat_html(PDO $pdo, array $selList, array $statusBotDash, Closure $fmtEspera, string $csrf): string
+{
+    // (a) chats com o bot, ja filtrados por fila (mesmo criterio do card FILA DE CHAT).
+    $paramsFilaBot = [];
+    $whereFilaBot = 'c.moved_at IS NULL AND c.status IN ('
+        . implode(',', array_fill(0, count($statusBotDash), '?')) . ')';
+    foreach ($statusBotDash as $stFilaBot) {
+        $paramsFilaBot[] = $stFilaBot;
     }
-    echo '</ul></div>';
+    $whereFilaBot .= bot_scope_queue_where($pdo, 'c.queue_address', $paramsFilaBot);
+    if ($selList) {
+        $whereFilaBot .= ' AND c.queue_address IN (' . implode(',', array_fill(0, count($selList), '?')) . ')';
+        foreach ($selList as $qaFilaBot) {
+            $paramsFilaBot[] = $qaFilaBot;
+        }
+    }
+    $filaBotRows = [];
+    try {
+        $stFilaBot = $pdo->prepare(
+            'SELECT c.chat_id, c.queue_address, c.updated_at, q.name AS queue_name,'
+            . ' tq.team_id AS team_id, t.name AS team_name'
+            . ' FROM chats c'
+            . ' LEFT JOIN queues q ON q.address = c.queue_address'
+            . ' LEFT JOIN team_queues tq ON tq.queue_address = c.queue_address'
+            . ' LEFT JOIN teams t ON t.id = tq.team_id'
+            . ' WHERE ' . $whereFilaBot
+            . ' ORDER BY c.updated_at ASC'
+        );
+        $stFilaBot->execute($paramsFilaBot);
+        $filaBotRows = $stFilaBot->fetchAll();
+    } catch (Throwable $eFilaBot) {
+        $filaBotRows = [];
+    }
+
+    // (b) rotas de chat aguardando entrega — escopo por TIME (igual a aba
+    // Roteamento) para a posicao bater com a de la; o filtro de fila da pagina
+    // entra DEPOIS de calcular a posicao (senao a numeracao mentiria).
+    $paramsFilaPendAll = [];
+    $wherePendAll = "r.kind = 'chat' AND r.status = 'waiting'"
+        . bot_scope_team_where($pdo, 'r.team_id', $paramsFilaPendAll);
+    $filaPendAll = [];
+    try {
+        $stFilaPendAll = $pdo->prepare(
+            'SELECT r.id, r.chat_id, r.queue_address, r.team_id, r.priority, r.created_at,'
+            . ' q.name AS queue_name, t.name AS team_name'
+            . ' FROM pending_routes r'
+            . ' LEFT JOIN queues q ON q.address = r.queue_address'
+            . ' LEFT JOIN teams t ON t.id = r.team_id'
+            . ' WHERE ' . $wherePendAll
+            . ' ORDER BY r.priority DESC, r.id ASC'
+        );
+        $stFilaPendAll->execute($paramsFilaPendAll);
+        $filaPendAll = $stFilaPendAll->fetchAll();
+    } catch (Throwable $eFilaPendAll) {
+        $filaPendAll = [];
+    }
+    // Posicao por time (kind fixo 'chat'), mesma regra de $qPos do Roteamento.
+    $filaPendPos = [];
+    $filaPendCont = [];
+    foreach ($filaPendAll as $rp) {
+        $chaveFilaPend = (string) $rp['team_id'];
+        $filaPendCont[$chaveFilaPend] = ($filaPendCont[$chaveFilaPend] ?? 0) + 1;
+        $filaPendPos[(int) $rp['id']] = $filaPendCont[$chaveFilaPend];
+    }
+    // So agora filtra por fila (a posicao calculada acima ja e a "oficial").
+    $filaPendRows = $selList
+        ? array_values(array_filter(
+            $filaPendAll,
+            static fn($rp) => in_array((string) $rp['queue_address'], $selList, true)
+        ))
+        : $filaPendAll;
+
+    // Dedupe: chat com rota pendente 'waiting' aparece so na versao "aguardando"
+    // (com posicao/prioridade), nunca duplica a linha "com bot".
+    $filaPendChatIds = [];
+    foreach ($filaPendRows as $rp) {
+        $filaPendChatIds[(int) $rp['chat_id']] = true;
+    }
+    $filaBotRows = array_values(array_filter(
+        $filaBotRows,
+        static fn($rb) => !isset($filaPendChatIds[(int) $rb['chat_id']])
+    ));
+
+    // Solicitante: ultimo bot_events de cada chat_id (1 query so, nao uma por linha).
+    $filaChatIds = [];
+    foreach ($filaPendRows as $rp) {
+        $filaChatIds[(int) $rp['chat_id']] = true;
+    }
+    foreach ($filaBotRows as $rb) {
+        $filaChatIds[(int) $rb['chat_id']] = true;
+    }
+    $filaAutorMap = [];
+    if ($filaChatIds) {
+        $idsFilaChat = array_keys($filaChatIds);
+        $placeFilaChat = implode(',', array_fill(0, count($idsFilaChat), '?'));
+        try {
+            $stAutorFila = $pdo->prepare(
+                'SELECT chat_id, author_name, author_addr FROM bot_events'
+                . ' WHERE id IN (SELECT MAX(id) FROM bot_events WHERE chat_id IN (' . $placeFilaChat . ') GROUP BY chat_id)'
+            );
+            $stAutorFila->execute($idsFilaChat);
+            foreach ($stAutorFila->fetchAll() as $rAutorFila) {
+                $filaAutorMap[(int) $rAutorFila['chat_id']] = [
+                    'name' => trim((string) $rAutorFila['author_name']),
+                    'addr' => trim((string) $rAutorFila['author_addr']),
+                ];
+            }
+        } catch (Throwable $eAutorFila) {
+            $filaAutorMap = [];
+        }
+    }
+    $filaSolicitante = static function (int $chatIdSol) use ($filaAutorMap): string {
+        $a = $filaAutorMap[$chatIdSol] ?? null;
+        if ($a === null) {
+            return '-';
+        }
+        if ($a['name'] !== '') {
+            return $a['name'];
+        }
+        return $a['addr'] !== '' ? $a['addr'] : '-';
+    };
+
+    $out = '<div class="card mb-3"><div class="card-body">';
+    $out .= '<h2 class="h6 mb-3">Fila de chat — agora <span class="badge text-bg-secondary">'
+        . (count($filaPendRows) + count($filaBotRows)) . '</span></h2>';
+    if (!$filaPendRows && !$filaBotRows) {
+        $out .= '<p class="text-muted mb-0">Nenhum chat com o bot ou aguardando analista agora.</p>';
+    } else {
+        $out .= '<div class="table-responsive"><table class="table table-slim table-hover align-middle bg-white mb-0">';
+        $out .= '<thead><tr><th>#</th><th>Fila</th><th>Time</th><th>Chat</th><th>Status</th>'
+            . '<th>Solicitante</th><th>Há quanto tempo</th><th></th></tr></thead><tbody>';
+        foreach ($filaPendRows as $rp) {
+            $ridFila = (int) $rp['id'];
+            $prioritarioFila = (int) ($rp['priority'] ?? 0) > 0;
+            $segFila = max(0, time() - (strtotime((string) $rp['created_at'] . ' UTC') ?: time()));
+            $out .= '<tr' . ($prioritarioFila ? ' class="table-warning"' : '') . '>';
+            $out .= '<td><span class="badge text-bg-dark">' . $filaPendPos[$ridFila] . 'º</span>'
+                . ($prioritarioFila ? ' <span class="badge text-bg-warning text-dark">prioritário</span>' : '') . '</td>';
+            $out .= '<td><code>' . h((string) ($rp['queue_name'] ?: $rp['queue_address'])) . '</code></td>';
+            $out .= '<td>' . h((string) ($rp['team_name'] ?? '-')) . '</td>';
+            $out .= '<td>' . (int) $rp['chat_id'] . '</td>';
+            $out .= '<td><span class="badge bg-secondary">aguardando</span></td>';
+            $out .= '<td>' . h($filaSolicitante((int) $rp['chat_id'])) . '</td>';
+            $out .= '<td>' . h($fmtEspera($segFila)) . '</td>';
+            $out .= '<td class="text-end">';
+            $out .= '<form method="post" class="d-inline"><input type="hidden" name="csrf" value="' . h($csrf) . '">';
+            $out .= '<input type="hidden" name="action" value="queue_prioritize">';
+            $out .= '<input type="hidden" name="route_id" value="' . $ridFila . '">';
+            $out .= '<input type="hidden" name="priority" value="' . ($prioritarioFila ? '0' : '1') . '">';
+            $out .= '<button class="btn btn-sm ' . ($prioritarioFila ? 'btn-outline-secondary' : 'btn-outline-warning') . '">'
+                . ($prioritarioFila ? 'Remover prioridade' : 'Priorizar') . '</button></form>';
+            $out .= '</td></tr>';
+        }
+        foreach ($filaBotRows as $rb) {
+            $segFilaBot = max(0, time() - (strtotime((string) $rb['updated_at'] . ' UTC') ?: time()));
+            $out .= '<tr class="text-muted"><td>-</td>';
+            $out .= '<td><code>' . h((string) ($rb['queue_name'] ?: $rb['queue_address'])) . '</code></td>';
+            $out .= '<td>' . h((string) ($rb['team_name'] ?? '-')) . '</td>';
+            $out .= '<td>' . (int) $rb['chat_id'] . '</td>';
+            $out .= '<td><span class="badge bg-warning text-dark">com bot</span></td>';
+            $out .= '<td>' . h($filaSolicitante((int) $rb['chat_id'])) . '</td>';
+            $out .= '<td>' . h($fmtEspera($segFilaBot)) . '</td>';
+            $out .= '<td></td></tr>';
+        }
+        $out .= '</tbody></table></div>';
+    }
+    $out .= '</div></div>';
+    return $out;
 }
 
 function queue_picker(array $queues, array $owners, int $selfId, string $ownerKind): void
@@ -1566,6 +1734,31 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && $page !== 'login') {
                     ->execute([$rid, (string) ($_POST['address'] ?? '')]);
             }
         }
+        if ($page === 'dashboard') {
+            // Mesma acao `queue_prioritize` da aba Roteamento, em bloco proprio:
+            // o dispatch ja e por $page (sem colisao possivel), e isolar aqui evita
+            // alargar o escopo das outras acoes sensiveis de `routing` para esta
+            // pagina. `kind = 'chat'` a mais: esta tabela so lista chats.
+            if ($action === 'queue_prioritize') {
+                $ridDashP = (int) ($_POST['route_id'] ?? 0);
+                $novaPrioridadeDash = ((string) ($_POST['priority'] ?? '1')) === '0' ? 0 : 1;
+                $pParamsDash = [];
+                $stPDash = $pdo->prepare(
+                    "SELECT id FROM pending_routes WHERE id = ? AND status = 'waiting' AND kind = 'chat'"
+                    . bot_scope_team_where($pdo, 'team_id', $pParamsDash)
+                );
+                $stPDash->execute(array_merge([$ridDashP], $pParamsDash));
+                if (!$stPDash->fetchColumn()) {
+                    $formError = 'Item de fila inexistente ou fora do seu escopo.';
+                } else {
+                    $pdo->prepare('UPDATE pending_routes SET priority = ? WHERE id = ?')
+                        ->execute([$novaPrioridadeDash, $ridDashP]);
+                    $queueMsg = $novaPrioridadeDash
+                        ? 'Item priorizado: fura a fila da própria linha e time.'
+                        : 'Prioridade removida: o item volta à ordem de chegada.';
+                }
+            }
+        }
     } catch (PDOException $e) {
         if ($pdo->inTransaction()) {
             $pdo->rollBack();
@@ -1654,7 +1847,8 @@ function layout_start(string $title, array $nav, string $page, bool|int $autoRef
         }
         echo '<li class="nav-item"><a class="btn btn-outline-light btn-sm" href="?page=logout">Sair</a></li></ul>';
         echo '</div></div></nav>';
-        echo '<main class="container-xl py-4">';
+        $mainClass = $page === 'dashboard' ? 'container-fluid px-3 px-xl-4' : 'container-xl';
+        echo '<main class="' . h($mainClass) . ' py-4">';
     } else {
         echo '<main class="min-vh-100 d-flex align-items-center justify-content-center p-3">';
     }
@@ -1757,7 +1951,8 @@ $listPage = list_page();
 $filterReason = preg_replace('/[^a-z_]/', '', (string) ($_GET['reason'] ?? '')) ?: '';
 $filterStatus = preg_replace('/[^a-z_]/', '', (string) ($_GET['status'] ?? '')) ?: '';
 $autoRefresh = ($page === 'activity' && $listPage === 1 && $filterReason === '' && empty($_GET['filas']) && empty($_GET['de']) && empty($_GET['ate']) && trim((string) ($_GET['autor'] ?? '')) === '' && trim((string) ($_GET['chat_id'] ?? '')) === '') || $page === 'load';
-layout_start('HELPTOA Bot', $nav, $page, $page === 'load' ? 30 : $autoRefresh);
+$autoRefreshSec = ($page === 'load' || $page === 'dashboard') ? 30 : $autoRefresh;
+layout_start('HELPTOA Bot', $nav, $page, $autoRefreshSec);
 
 if ($page === 'queues') {
     $syncBtn = bot_can($pdo, 'queues.manage')
@@ -3504,10 +3699,6 @@ if ($page === 'dashboard') {
         'Cards do dia (chats e formulários atendidos e as duas filas), operadores online x offline e o volume de classificações do período.',
         ''
     );
-    echo '<div class="d-none">';
-    echo '<h1 class="h3 mb-1">Dashboard</h1>';
-    echo '<p class="text-muted">Cards: <strong>TOTAL CHATS/DIA</strong> e <strong>TOTAL FORMS/DIA</strong> são o que os analistas atenderam no período (roteado pelo bot, transferido ou assumido); <strong>FILA DE CHAT</strong> são os chats com o chatbot agora e <strong>FILA FORMS</strong> são os formulários presentes na fila do TOA (lista <em>pending</em>) a cada leitura do bot — sem contar rotas pendentes de forms que já saíram do TOA. O filtro de filas, o período e o nome do analista valem para os cards, o donut e a tabela. Abaixo, o gráfico de classificações por categoria e o resumo do formulário de validação — tudo gerado pelo próprio painel, sem bibliotecas externas.</p></div>';
-
     $dashQueueOpts = [];
     foreach ($candQueues as $cq) {
         $qaOpt = (string) $cq['queue_address'];
@@ -3515,7 +3706,7 @@ if ($page === 'dashboard') {
         $dashQueueOpts[$qaOpt] = ($nomeOpt !== '' ? $nomeOpt . ' — ' : '') . $qaOpt;
     }
     echo '<div class="card mb-3"><div class="card-body">';
-    echo '<form method="get" class="row g-3 align-items-end">';
+    echo '<form method="get" class="row g-2 align-items-end">';
     echo '<input type="hidden" name="page" value="dashboard">';
     echo '<div class="col-12 col-md-5"><label class="form-label">Filas — nenhuma marcada = todas</label>';
     if ($dashQueueOpts) {
@@ -3529,11 +3720,15 @@ if ($page === 'dashboard') {
     echo '<input type="text" class="form-control form-control-sm" name="nome" value="' . h($nomeRaw) . '" placeholder="Ex.: Ana"></div>';
     echo '<div class="col-12 col-md-auto"><button class="btn btn-primary btn-sm">Filtrar</button> ';
     echo '<a class="btn btn-outline-secondary btn-sm" href="?page=dashboard">Limpar</a></div>';
-    echo '<div class="col-12"><div class="form-text mb-0">O filtro vale para os cards, o donut e a tabela de analistas. '
-        . 'Os cards <strong>Fila de chat</strong> e <strong>Fila Forms</strong> mostram o <em>agora</em>; os demais respeitam o período.</div></div>';
     echo '</form>';
     if ($dashErr !== '') {
         echo '<div class="alert alert-danger mt-3 mb-0">' . h($dashErr) . '</div>';
+    }
+    if (!empty($formError)) {
+        echo '<div class="alert alert-danger mt-3 mb-0">' . h($formError) . '</div>';
+    }
+    if (!empty($queueMsg)) {
+        echo '<div class="alert alert-success mt-3 mb-0">' . h($queueMsg) . '</div>';
     }
     echo '</div></div>';
 
@@ -3586,8 +3781,6 @@ if ($page === 'dashboard') {
 
     if ($dashErr === '' && $de !== null && $ate !== null) {
         $legFila = $selList ? count($selList) . ' fila(s)' : 'todas as filas';
-        $legNome = $nomeBusca !== '' ? 'analista “' . $nomeBusca . '”' : 'todos os analistas';
-        $perLeg = $de->format('d/m/Y') . ' a ' . $ate->format('d/m/Y');
         // Filtro por nome: resolve os ENDERECOS dos operadores que casam (nome da
         // leitura, nome no time ou o proprio endereco). Sem isso o ledger, que
         // guarda so o endereco, nao teria como responder ao filtro por nome.
@@ -3673,6 +3866,20 @@ if ($page === 'dashboard') {
         // nulo, o mesmo criterio do card "ChatBot — Em atendimento" da aba Carga.
         $botAgora = 0;
         $statusBotDash = bot_open_chat_statuses();
+        // Usado aqui (card) e na tabela "Fila de chat — agora" + no card "Fila de
+        // espera do chat" mais abaixo — definido cedo para nao duplicar a funcao.
+        $fmtEspera = static function (?int $seg): string {
+            if ($seg === null) {
+                return '-';
+            }
+            if ($seg < 60) {
+                return $seg . ' s';
+            }
+            if ($seg < 3600) {
+                return floor($seg / 60) . ' min ' . ($seg % 60) . ' s';
+            }
+            return floor($seg / 3600) . ' h ' . floor(($seg % 3600) / 60) . ' min';
+        };
         try {
             $paramsBot = [];
             $filtroBot = ' WHERE c.moved_at IS NULL AND c.status IN ('
@@ -3860,8 +4067,7 @@ if ($page === 'dashboard') {
         foreach ($cardsDash as $cD) {
             echo '<div class="col-6 col-xl-3"><div class="card h-100"><div class="card-body py-2">';
             echo '<div class="text-muted small">' . h($cD[0]) . '</div>';
-            echo '<div class="fs-3"><span class="badge ' . h($cD[2]) . '">' . h($cD[1]) . '</span></div>';
-            echo '<div class="text-muted small">' . h($cD[3]) . '</div>';
+            echo '<div class="fs-3"><span class="badge ' . h($cD[2]) . '" title="' . h($cD[3]) . '">' . h($cD[1]) . '</span></div>';
             echo '</div></div></div>';
         }
         echo '</div>';
@@ -3869,10 +4075,7 @@ if ($page === 'dashboard') {
         echo '<div class="row g-3 mb-3">';
         echo '<div class="col-12 col-lg-4"><div class="card h-100"><div class="card-body">';
         echo '<h2 class="h6">Operadores — online x offline</h2>';
-        echo '<p class="text-muted small mb-2">Última leitura de presença por analista — ' . h($legFila) . ', ' . h($legNome) . '.</p>';
         dash_donut($fatiasDonut, (string) count($dashRows), 'analista(s)');
-        echo '<p class="text-muted small mb-0">Quem está <strong>inativo</strong> no roteamento não recebe item novo; '
-            . '<strong>sem leitura</strong> é presença que falhou na coleta — o analista não vira “offline” por isso.</p>';
         echo '</div></div></div>';
         // Tabela de detalhe: uma linha por analista com o retrato do TOA (agora) e o
         // que ele atendeu no periodo (ledger do bot).
@@ -3925,48 +4128,31 @@ if ($page === 'dashboard') {
                 echo '</tr>';
             }
             echo '</tbody></table></div>';
-            echo '<p class="text-muted small mb-0 mt-2">Total do <em>agora</em>: TOA chat <strong>' . $totToaChat
-                . '</strong>, TOA form <strong>' . $totToaForm . '</strong>, em atendimento <strong>' . ($totToaChat + $totToaForm)
-                . '</strong>. Atendidos no período <strong>' . h($perLeg) . '</strong>: chats <strong>' . $totAtChat
-                . '</strong> e formulários <strong>' . $totAtForm . '</strong> (ledger do bot). '
-                . 'A tabela se atualiza sozinha.</p>';
         }
         echo '</div></div></div>';
         echo '</div>';
-        echo '<div class="card"><div class="card-body">';
-        echo '<h2 class="h6 mb-0">Classificações por categoria — ' . h($de->format('d/m/Y')) . ' a ' . h($ate->format('d/m/Y')) . ' (' . h($legFila) . ')</h2>';
-        echo '<p class="text-muted mb-2 small">Total no período: ' . $grand . '</p>';
+
+        echo dash_fila_chat_html($pdo, $selList, $statusBotDash, $fmtEspera, $csrf);
+
+        echo '<div class="card mb-3"><div class="card-body">';
+        echo '<h2 class="h6 mb-3">Classificações por categoria — ' . h($de->format('d/m/Y')) . ' a ' . h($ate->format('d/m/Y'))
+            . ' (' . h($legFila) . ') <span class="badge text-bg-secondary">' . $grand . '</span></h2>';
         if (!$norm) {
             echo '<p class="text-muted mb-0">Nenhuma classificação encontrada para esses filtros.</p>';
         } else {
-            echo '<style>
-.dash-scroll{overflow-x:auto}
-.dash-chart{display:flex;align-items:flex-end;gap:6px;height:260px;min-width:max-content;padding:0 4px 0 0;
-  background-image:repeating-linear-gradient(to top, rgba(0,0,0,.07) 0 1px, transparent 1px 50px);}
-.dash-col{position:relative;flex:0 0 72px;height:100%}
-.dash-bar{position:absolute;left:50%;bottom:0;transform:translateX(-50%);width:56%;max-width:46px;min-width:6px;border-radius:4px 4px 0 0}
-.dash-val{position:absolute;left:0;right:0;text-align:center;font-size:.72rem;font-weight:600;line-height:1}
-.dash-labels{display:flex;gap:6px;padding:0 4px 0 0;min-width:max-content}
-.dash-cat{flex:0 0 72px;font-size:.68rem;color:#6c757d;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:2px 2px 0;text-align:center}
-</style>';
-            echo '<div class="dash-scroll"><div class="dash-chart">';
+            echo '<div class="dash-hbars">';
             $palDash = ['#0d6efd', '#198754', '#dc3545', '#fd7e14', '#6f42c1', '#20c997', '#d63384', '#ffc107', '#0dcaf0', '#6610f2', '#e83e8c', '#adb5bd'];
             foreach ($norm as $i => $nv) {
                 [$cat, $v] = $nv;
-                $px = $maxV > 0 ? max(3, (int) round($v / $maxV * 238)) : 0;
+                $pct = $maxV > 0 ? max(2, round($v / $maxV * 100, 1)) : 0;
                 $corDash = $palDash[$i % count($palDash)];
-                $ttDash = $cat . ': ' . $v;
-                echo '<div class="dash-col">';
-                echo '<div class="dash-bar" style="height:' . $px . 'px;background:' . $corDash . '" title="' . h($ttDash) . '"></div>';
-                echo '<div class="dash-val" style="bottom:' . ($px + 3) . 'px;color:' . $corDash . '">' . $v . '</div>';
+                echo '<div class="dash-hbar-row">';
+                echo '<div class="dash-hbar-label" title="' . h($cat) . '">' . h($cat) . '</div>';
+                echo '<div class="dash-hbar-track"><div class="dash-hbar-fill" style="width:' . $pct . '%;background:' . $corDash . '"></div></div>';
+                echo '<div class="dash-hbar-val">' . $v . '</div>';
                 echo '</div>';
             }
-            echo '</div><div class="dash-labels">';
-            foreach ($norm as $nv) {
-                [$cat] = $nv;
-                echo '<div class="dash-cat" title="' . h($cat) . '">' . h($cat) . '</div>';
-            }
-            echo '</div></div>';
+            echo '</div>';
         }
         echo '</div></div>';
         $formReasons = [
@@ -4076,27 +4262,16 @@ if ($page === 'dashboard') {
         } catch (Throwable $eAgora) {
             $naFilaAgora = 0;
         }
-        $fmtEspera = static function (?int $seg): string {
-            if ($seg === null) {
-                return '-';
-            }
-            if ($seg < 60) {
-                return $seg . ' s';
-            }
-            if ($seg < 3600) {
-                return floor($seg / 60) . ' min ' . ($seg % 60) . ' s';
-            }
-            return floor($seg / 3600) . ' h ' . floor(($seg % 3600) / 60) . ' min';
-        };
         echo '<div class="card mt-3"><div class="card-body">';
-        echo '<h2 class="h6 mb-0">Fila de espera do chat — ' . h($de->format('d/m/Y')) . ' a ' . h($ate->format('d/m/Y')) . '</h2>';
-        echo '<p class="text-muted mb-2 small">' . $entradasFila . ' entrada(s) na fila e ' . $saidasFila . ' atendida(s) no período. Espera é o tempo entre entrar na fila e receber um analista.</p>';
-        echo '<div class="d-flex flex-wrap gap-4">';
+        echo '<h2 class="h6 mb-0">Fila de espera do chat — ' . h($de->format('d/m/Y')) . ' a ' . h($ate->format('d/m/Y'))
+            . ' <span class="badge text-bg-secondary" title="' . h($entradasFila . ' entrada(s) na fila e ' . $saidasFila . ' atendida(s) no período. Espera é o tempo entre entrar na fila e receber um analista.') . '">'
+            . $entradasFila . ' / ' . $saidasFila . '</span></h2>';
+        echo '<div class="d-flex flex-wrap gap-4 mt-2">';
         echo '<div><span class="text-muted small d-block">Na fila agora (fora do período)</span><span class="fs-5">' . $naFilaAgora . '</span></div>';
         echo '<div><span class="text-muted small d-block">Espera média</span><span class="fs-5">' . h($fmtEspera($esperaMedia)) . '</span></div>';
         echo '<div><span class="text-muted small d-block">Maior espera</span><span class="fs-5">' . h($fmtEspera($esperaMax)) . '</span></div>';
         echo '</div>';
-        echo '<p class="text-muted small mb-0 mt-2">Sem amostra no período: aparece "-". A fila atual e o botão Encerrar espera ficam na aba <a href="?page=routing">Roteamento</a>.</p>';
+        echo '<p class="text-muted small mb-0 mt-2">A fila detalhada e o botão Encerrar espera ficam na aba <a href="?page=routing">Roteamento</a>.</p>';
         echo '</div></div>';
     }
 }

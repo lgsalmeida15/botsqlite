@@ -184,6 +184,7 @@ CREATE TABLE IF NOT EXISTS bot_events (
 
 CREATE INDEX IF NOT EXISTS bot_events_at_idx ON bot_events (at DESC);
 CREATE INDEX IF NOT EXISTS bot_events_metrics_idx ON bot_events (reason, queue_address, at);
+CREATE INDEX IF NOT EXISTS bot_events_chat_idx ON bot_events (chat_id, id);
 
 CREATE TABLE IF NOT EXISTS bot_jobs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
