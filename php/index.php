@@ -3706,8 +3706,7 @@ if ($page === 'dashboard') {
     }
 
     page_header(
-        'Dashboard',
-        'Cards do dia (chats e formulários atendidos e as duas filas), operadores online x offline e o volume de classificações do período.',
+        'DASHBOARD',
         ''
     );
     $dashQueueOpts = [];
@@ -4084,13 +4083,13 @@ if ($page === 'dashboard') {
         echo '</div>';
         // Donut de operadores (online x offline) ao lado da tabela de detalhe.
         echo '<div class="row g-3 mb-3">';
-        echo '<div class="col-12 col-lg-4"><div class="card h-100"><div class="card-body">';
+        echo '<div class="col-12 col-lg-3"><div class="card h-100"><div class="card-body">';
         echo '<h2 class="h6">Operadores — online x offline</h2>';
         dash_donut($fatiasDonut, (string) count($dashRows), 'analista(s)');
         echo '</div></div></div>';
         // Tabela de detalhe: uma linha por analista com o retrato do TOA (agora) e o
         // que ele atendeu no periodo (ledger do bot).
-        echo '<div class="col-12 col-lg-8"><div class="card h-100"><div class="card-body">';
+        echo '<div class="col-12 col-lg-9"><div class="card h-100"><div class="card-body">';
         echo '<h2 class="h6">Analistas — carga no TOA e atendidos</h2>';
         if (!$dashRows) {
             echo '<p class="text-muted mb-0">Nenhum analista para esses filtros.</p>';
@@ -4156,11 +4155,12 @@ if ($page === 'dashboard') {
             foreach ($norm as $i => $nv) {
                 [$cat, $v] = $nv;
                 $pct = $maxV > 0 ? max(2, round($v / $maxV * 100, 1)) : 0;
+                $pctGrand = $grand > 0 ? round($v / $grand * 100, 1) : 0;
                 $corDash = $palDash[$i % count($palDash)];
                 echo '<div class="dash-hbar-row">';
                 echo '<div class="dash-hbar-label" title="' . h($cat) . '">' . h($cat) . '</div>';
                 echo '<div class="dash-hbar-track"><div class="dash-hbar-fill" style="width:' . $pct . '%;background:' . $corDash . '"></div></div>';
-                echo '<div class="dash-hbar-val">' . $v . '</div>';
+                echo '<div class="dash-hbar-val">' . $v . ' <span class="dash-hbar-pct">(' . h(number_format($pctGrand, 1, ',', '.')) . '%)</span></div>';
                 echo '</div>';
             }
             echo '</div>';
