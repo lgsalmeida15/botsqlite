@@ -292,6 +292,14 @@ ok(strpos($htmlDash, 'Analistas') !== false, 'aba dashboard: tabela de analistas
 ok(strpos($htmlDash, 'name="nome"') !== false, 'aba dashboard: filtro por analista (nome/endereco)');
 ok(strpos($htmlDash, 'Ex.: Ana') !== false, 'aba dashboard: exemplo do filtro por nome');
 ok(strpos($htmlDash, 'Devolver') === false, 'aba dashboard: sem botao manual de devolucao');
+// Filtro "mostrar inativos e fora da janela": por padrao desmarcado, so o
+// ativo (Ana) aparece na tabela — o inativo no roteamento fica de fora.
+ok(strpos($htmlDash, 'name="mostrar_inativos"') !== false, 'aba dashboard: filtro de inativos/fora da janela presente');
+ok(strpos($htmlDash, 'name="mostrar_inativos" value="1" checked') === false, 'aba dashboard: filtro de inativos vem desmarcado por padrao');
+ok(
+    strpos($htmlDash, 'u:ana@claro.com') !== false && strpos($htmlDash, 'u:inativo@claro.com') === false,
+    'aba dashboard: tabela de analistas oculta o inativo no roteamento por padrao'
+);
 
 // Nova tabela "Fila de chat — agora": chat_id=10 esta com o bot (status
 // awaiting_reply, sem rota 'waiting' — a dele e 'failed'); chat_id=12 tem uma
@@ -346,6 +354,16 @@ ok(
     strpos($htmlDashNome, 'u:ana@claro.com') !== false && strpos($htmlDashNome, 'u:inativo@claro.com') === false,
     'aba dashboard: filtro por nome restringe a tabela ao analista'
 );
+
+// Marcando "mostrar inativos e fora da janela": o inativo volta a aparecer.
+[$htmlDashTodos, $codeDashTodos] = render_dashboard('mostrar_inativos=1', $uid);
+ok($codeDashTodos === 0, 'aba dashboard (mostrar inativos): renderizou sem erro');
+ok(strpos($htmlDashTodos, 'name="mostrar_inativos" value="1" checked') !== false, 'aba dashboard: filtro marcado volta marcado');
+ok(
+    strpos($htmlDashTodos, 'u:ana@claro.com') !== false && strpos($htmlDashTodos, 'u:inativo@claro.com') !== false,
+    'aba dashboard: com o filtro marcado o inativo no roteamento volta a aparecer'
+);
+ok(strpos($htmlDashTodos, '>inativo</span>') !== false, 'aba dashboard: selo de inativo no roteamento na tabela de analistas');
 
 // Aba Atividade: coluna AUTOR (nome do autor do chat/form na movimentacao).
 $htmlAtiv = (string) ($htmls['activity'] ?? '');

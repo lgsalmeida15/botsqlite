@@ -3668,6 +3668,9 @@ if ($page === 'dashboard') {
     $nomeRaw = trim((string) ($_GET['nome'] ?? ''));
     $nomeBusca = str_replace(['%', '_'], '', $nomeRaw);
     $nomeLike = $nomeBusca !== '' ? '%' . $nomeBusca . '%' : '';
+    // Tabela de analistas: por padrao so mostra quem esta ativo no roteamento
+    // e dentro da janela de plantao agora. O cheque exibe tambem os de fora.
+    $dashMostrarInativos = isset($_GET['mostrar_inativos']);
 
     $dashErr = '';
     $parseDay = static function (string $raw): ?DateTimeImmutable {
@@ -3728,6 +3731,11 @@ if ($page === 'dashboard') {
     ui_date_range($deRaw, $ateRaw);
     echo '<div class="col-12 col-md-3"><label class="form-label">Analista — nome ou endereço</label>';
     echo '<input type="text" class="form-control form-control-sm" name="nome" value="' . h($nomeRaw) . '" placeholder="Ex.: Ana"></div>';
+    echo '<div class="col-12 col-md-auto form-check mb-2">';
+    echo '<input class="form-check-input" type="checkbox" id="mostrar_inativos" name="mostrar_inativos" value="1"'
+        . ($dashMostrarInativos ? ' checked' : '') . '>';
+    echo '<label class="form-check-label" for="mostrar_inativos">Mostrar inativos e fora da janela na tabela de analistas</label>';
+    echo '</div>';
     echo '<div class="col-12 col-md-auto"><button class="btn btn-primary btn-sm">Filtrar</button> ';
     echo '<a class="btn btn-outline-secondary btn-sm" href="?page=dashboard">Limpar</a></div>';
     echo '</form>';
@@ -3976,7 +3984,8 @@ if ($page === 'dashboard') {
                 $paramsDashLoad[] = $nomeLike;
             }
             $stDashLoad = $pdo->prepare(
-                'SELECT l.*, t.name AS team_name, COALESCE(tm.active, 0) AS roteando'
+                'SELECT l.*, t.name AS team_name, COALESCE(tm.active, 0) AS roteando,'
+                . ' tm.route_start AS route_start, tm.route_end AS route_end'
                 . ' FROM analyst_load l'
                 . ' LEFT JOIN teams t ON t.id = l.team_id'
                 . ' LEFT JOIN team_members tm ON tm.team_id = l.team_id AND tm.address = l.address'
@@ -4002,6 +4011,7 @@ if ($page === 'dashboard') {
                     'form_velho' => (float) $rLoadDash['form_ocioso_min'],
                     'leitura' => (string) $rLoadDash['at'],
                     'roteando' => (int) ($rLoadDash['roteando'] ?? 0) === 1,
+                    'in_window' => member_in_route_window($rLoadDash['route_start'] ?? null, $rLoadDash['route_end'] ?? null),
                     'fora_leitura' => false,
                 ];
             }
@@ -4039,6 +4049,7 @@ if ($page === 'dashboard') {
                 'form_velho' => 0.0,
                 'leitura' => '',
                 'roteando' => false,
+                'in_window' => true,
                 'fora_leitura' => true,
             ];
         }
@@ -4091,8 +4102,12 @@ if ($page === 'dashboard') {
         // que ele atendeu no periodo (ledger do bot).
         echo '<div class="col-12 col-lg-9"><div class="card h-100"><div class="card-body">';
         echo '<h2 class="h6">Analistas — carga no TOA e atendidos</h2>';
-        if (!$dashRows) {
-            echo '<p class="text-muted mb-0">Nenhum analista para esses filtros.</p>';
+        $dashRowsTab = $dashMostrarInativos
+            ? $dashRows
+            : array_filter($dashRows, static fn (array $r): bool => $r['roteando'] && $r['in_window']);
+        if (!$dashRowsTab) {
+            echo '<p class="text-muted mb-0">Nenhum analista para esses filtros'
+                . (!$dashMostrarInativos && $dashRows ? ' (há inativos/fora da janela ocultos — marque o filtro acima para ver)' : '') . '.</p>';
         } else {
             $totToaChat = 0;
             $totToaForm = 0;
@@ -4103,7 +4118,7 @@ if ($page === 'dashboard') {
                 . '<th class="text-end">TOA chat</th><th class="text-end">TOA form</th>'
                 . '<th class="text-end">Em atend.</th><th class="text-end">Form + velho</th>'
                 . '<th>Leitura</th><th class="text-end">Atendidos (chat/form)</th></tr></thead><tbody>';
-            foreach ($dashRows as $addrTab => $rTab) {
+            foreach ($dashRowsTab as $addrTab => $rTab) {
                 $atChat = (int) ($atendPor[$addrTab]['chat'] ?? 0);
                 $atForm = (int) ($atendPor[$addrTab]['form'] ?? 0);
                 $emAtend = (int) $rTab['toa_chat'] + (int) $rTab['toa_form'];
@@ -4116,6 +4131,9 @@ if ($page === 'dashboard') {
                 echo '<td><strong>' . h((string) $rTab['name']) . '</strong>';
                 if (!$rTab['roteando']) {
                     echo ' <span class="badge text-bg-warning" title="Inativo no roteamento: nao recebe item novo">inativo</span>';
+                }
+                if (!$rTab['in_window']) {
+                    echo ' <span class="badge text-bg-secondary" title="Fora da janela de plantao agora">fora da janela</span>';
                 }
                 echo '<div class="text-muted small"><code>' . h((string) $addrTab) . '</code></div></td>';
                 echo '<td>' . h((string) $rTab['team']) . '</td>';
