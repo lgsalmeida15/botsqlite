@@ -10,7 +10,7 @@ from typing import Any, Awaitable, Callable
 
 log = logging.getLogger("helptoa.profile")
 
-DENIED_MESSAGE = "Usuário não habilitado para esta solicitação"
+DENIED_MESSAGE = "Usuário não habilitado para esta solicitação; por gentileza, solicite ao seu gestor que efetue a ação."
 CACHE_TTL_SEC = 600.0
 FETCH_TIMEOUT_SEC = 12.0
 LOGIN_TITLE = "efetuar login"
