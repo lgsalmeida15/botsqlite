@@ -2375,6 +2375,15 @@ class Engine:
         valor = str(self.cfg.get("queue_wait_enabled") or "true").strip().lower()
         return valor not in ("false", "0", "no")
 
+    def _form_priority_always(self) -> bool:
+        """Formulario sempre primeiro na disputa por vaga de analista (vs. alternar com chat).
+
+        Desligavel por config (sem redeploy) se precisar voltar a alternancia
+        50/50 antiga entre as duas linhas.
+        """
+        valor = str(self.cfg.get("form_priority_always") or "true").strip().lower()
+        return valor not in ("false", "0", "no")
+
     def _fila_desligada(self, q: str | None) -> bool:
         """A fila deste item esta DESABILITADA no painel (o bot nao atua nela)?"""
         return bool(q) and q not in self.enabled
@@ -3506,9 +3515,13 @@ class Engine:
     async def tick_routes(self) -> None:
         """Drena a fila de roteamento em DUAS linhas: chat e formulario.
 
-        Cada linha e FIFO por conta propria: a cada tick o bot comeca por uma
-        delas (alternando) e tenta a cabeca das duas na mesma passada — assim um
-        formulario enviado depois de 10 chats e o 1o da linha dele, nao o 11.
+        Cada linha e FIFO por conta propria. Por padrao (`form_priority_always`)
+        o formulario comeca sempre primeiro: quando os dois disputam a mesma
+        vaga de analista no mesmo tick, o formulario ganha. Com a config
+        desligada, volta a alternancia 50/50 antiga entre as duas linhas. De
+        um jeito ou de outro, as duas linhas sao tentadas na mesma passada —
+        um item enviado depois de 10 da outra linha nao espera ela andar
+        inteira.
         """
         if not self.bot_on:
             # Bot DESLIGADO no painel: nada e entregue (nem recuperado). Mesma
@@ -3523,21 +3536,30 @@ class Engine:
         # loop acima ver).
         await self._devolver_chats_ao_quadro()
         linhas = db.due_routes(self.conn)
-        if self._turno_fila % 2 == 0:
-            primeira = list(linhas.get("chat") or [])
-            segunda = list(linhas.get("form") or [])
+        if self._form_priority_always():
+            # Formulario sempre primeiro, por inteiro: todas as rotas de form
+            # devidas neste tick sao tentadas antes de qualquer chat — nao so a
+            # cabeca. E o que garante "sempre vai pro topo" mesmo quando sobra
+            # mais de 1 vaga disputada no mesmo tick (ver teste
+            # test_dois_formularios_ganham_as_duas_vagas_antes_do_chat).
+            fila: list[dict] = list(linhas.get("form") or []) + list(linhas.get("chat") or [])
         else:
-            primeira = list(linhas.get("form") or [])
-            segunda = list(linhas.get("chat") or [])
+            # Flag desligada: comportamento antigo — alterna quem comeca e
+            # intercala item a item (chat, form, chat, form...), so para nao
+            # perder o fallback historico sem redeploy.
+            if self._turno_fila % 2 == 0:
+                primeira = list(linhas.get("chat") or [])
+                segunda = list(linhas.get("form") or [])
+            else:
+                primeira = list(linhas.get("form") or [])
+                segunda = list(linhas.get("chat") or [])
+            fila = []
+            for i in range(max(len(primeira), len(segunda))):
+                if i < len(primeira):
+                    fila.append(primeira[i])
+                if i < len(segunda):
+                    fila.append(segunda[i])
         self._turno_fila += 1
-        # Alterna as linhas dentro do MESMO tick (chat, form, chat, form...): a
-        # cabeca do formulario nao espera a linha do chat andar inteira.
-        fila: list[dict] = []
-        for i in range(max(len(primeira), len(segunda))):
-            if i < len(primeira):
-                fila.append(primeira[i])
-            if i < len(segunda):
-                fila.append(segunda[i])
         for row in fila:
             rid = int(row["id"])
             atual = db.delivery_marks(self.conn, rid)
