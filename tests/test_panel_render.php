@@ -66,6 +66,24 @@ $pdo->exec("INSERT INTO route_assignments (kind, chat_id, queue_address, team_id
 $pdo->exec("INSERT INTO route_assignments (kind, chat_id, queue_address, team_id, assignee, case_key) VALUES ('chat', 10, 'h:q1', 1, 'u:ana@claro.com', 'a:u:tec@claro.com')");
 // Uma rota esperando: exercita o card "Fila de espera (agora)" (posicao por tipo+time).
 $pdo->exec("INSERT INTO pending_routes (kind, chat_id, queue_address, team_id, status, detail) VALUES ('chat', 12, 'h:q1', 1, 'waiting', 'na fila')");
+// Formulario esperando: exercita a fila de atendimento mostrando tambem
+// formulario (nao so chat) e a coluna Categoria fixa "Validação". h:q1 tem
+// queue_load fresco com pending_forms=2 (ver abaixo) — este formulario conta
+// como "confirmado pelo TOA" (rn_form=1 <= 2).
+$pdo->exec("INSERT INTO pending_routes (kind, chat_id, queue_address, team_id, status, detail) VALUES ('form', 13, 'h:q1', 1, 'waiting', 'formulario na fila')");
+// Formulario ORFAO: fila 'h:velha' so tem leitura VELHA do TOA (10 min atras,
+// fora da janela de frescor) — tem que ficar de fora da fila de atendimento,
+// mesma regra do card FILA FORMS (nao conta pending_routes cru).
+$pdo->exec("INSERT INTO pending_routes (kind, chat_id, queue_address, team_id, status, detail) VALUES ('form', 14, 'h:velha', 1, 'waiting', 'formulario orfao havia semanas')");
+// Fila 'h:q1b' com leitura FRESCA mas so 1 vaga confirmada (pending_forms=1) e
+// 2 formularios candidatos: um antigo (chat_id=20, inserido primeiro = id
+// menor) e um recente (chat_id=21, id maior). So o RECENTE pode entrar no
+// corte — contar do mais antigo pra frente garantiria vaga pro orfao.
+$pdo->exec("INSERT INTO queues (address, name, enabled) VALUES ('h:q1b', 'Fila 1b', 1)");
+$pdo->exec("INSERT INTO team_queues (team_id, queue_address) VALUES (1, 'h:q1b')");
+$pdo->exec("INSERT INTO pending_routes (kind, chat_id, queue_address, team_id, status, detail) VALUES ('form', 20, 'h:q1b', 1, 'waiting', 'formulario antigo na h:q1b')");
+$pdo->exec("INSERT INTO pending_routes (kind, chat_id, queue_address, team_id, status, detail) VALUES ('form', 21, 'h:q1b', 1, 'waiting', 'formulario recente na h:q1b')");
+$pdo->exec("INSERT INTO queue_load (queue_address, at, pending_forms, pending_chats, toa_ok) VALUES ('h:q1b', datetime('now'), 1, 0, 1)");
 $pdo->exec(
     "INSERT INTO analyst_load (address, name, team_id, janela, online, chats_toa, forms_toa, chats_ledger,"
     . " forms_ledger, reservas, casos_total, form_ocioso_min, form_presente_toa, toa_ok, detail)"
@@ -273,10 +291,10 @@ ok(strpos($htmlDash, 'TOTAL FORMS/DIA') !== false, 'aba dashboard: card TOTAL FO
 ok(strpos($htmlDash, '>FILA DE CHAT<') !== false, 'aba dashboard: card FILA DE CHAT');
 ok(strpos($htmlDash, '>FILA FORMS<') !== false, 'aba dashboard: card FILA FORMS');
 // Card FILA FORMS: fonte e queue_load (fila do TOA), nao pending_routes.
-// h:q1 (2 forms, fresca) conta; h:velha (5, 10 min) fica de fora.
+// h:q1 (2, fresca) + h:q1b (1, fresca) somam 3; h:velha (5, 10 min) fica de fora.
 ok(
-    preg_match('/badge bg-info text-dark"[^>]*>2</', $htmlDash) === 1,
-    'aba dashboard: FILA FORMS soma so a coleta fresca (2, nao 7)'
+    preg_match('/badge bg-info text-dark"[^>]*>3</', $htmlDash) === 1,
+    'aba dashboard: FILA FORMS soma so a coleta fresca (3, nao 7 nem 8)'
 );
 ok(
     strpos($htmlDash, 'Formulários presentes na fila') !== false,
@@ -301,15 +319,25 @@ ok(
     'aba dashboard: tabela de analistas oculta o inativo no roteamento por padrao'
 );
 
-// Nova tabela "Fila de chat — agora": chat_id=10 esta com o bot (status
-// awaiting_reply, sem rota 'waiting' — a dele e 'failed'); chat_id=12 tem uma
-// pending_route 'waiting' do time 1 (sem prioridade) — e quem exercita a acao
-// de priorizar.
-ok(strpos($htmlDash, 'Fila de chat — agora') !== false, 'aba dashboard: nova tabela de fila de chat');
+// Nova tabela "Fila de atendimento — agora": chat_id=10 esta com o bot (status
+// awaiting_reply, sem rota 'waiting' — a dele e 'failed', classification='TESTE');
+// chat_id=12 tem uma pending_route 'waiting' do time 1 (sem prioridade) — e quem
+// exercita a acao de priorizar; chat_id=13 e um FORMULARIO 'waiting' do mesmo
+// time — exercita a visao de formulario na fila e a categoria fixa "Validação".
+ok(strpos($htmlDash, 'Fila de atendimento — agora') !== false, 'aba dashboard: nova tabela de fila de atendimento');
 ok(strpos($htmlDash, '>com bot<') !== false, 'aba dashboard: chat com bot aparece na fila');
 ok(strpos($htmlDash, '>aguardando<') !== false, 'aba dashboard: chat aguardando roteamento aparece na fila');
 ok(strpos($htmlDash, 'value="queue_prioritize"') !== false, 'aba dashboard: acao de priorizar presente na fila');
 ok(strpos($htmlDash, '>Priorizar<') !== false, 'aba dashboard: botao Priorizar (sem prioridade ainda)');
+ok(strpos($htmlDash, '<th>Tipo</th>') !== false, 'aba dashboard: coluna Tipo presente na fila');
+ok(strpos($htmlDash, '<th>Categoria</th>') !== false, 'aba dashboard: coluna Categoria presente na fila');
+ok(strpos($htmlDash, '>Formulário<') !== false, 'aba dashboard: formulário aparece na fila de atendimento');
+ok(strpos($htmlDash, '>Validação<') !== false, 'aba dashboard: categoria do formulário é sempre Validação');
+ok(strpos($htmlDash, '>TESTE<') !== false, 'aba dashboard: categoria do chat mostra a classification real');
+ok(strpos($htmlDash, '<td>13</td>') !== false, 'aba dashboard: formulário confirmado pelo TOA (queue_load fresco) aparece');
+ok(strpos($htmlDash, '<td>14</td>') === false, 'aba dashboard: formulário órfão (sem leitura fresca do TOA) não aparece');
+ok(strpos($htmlDash, '<td>21</td>') !== false, 'aba dashboard: com 1 vaga confirmada e 2 candidatos, o formulário RECENTE aparece');
+ok(strpos($htmlDash, '<td>20</td>') === false, 'aba dashboard: o formulário mais ANTIGO fica de fora quando só cabe 1 (corte prioriza o recente)');
 
 // POST queue_prioritize a partir do Dashboard: route_id = id da pending_route
 // do chat_id=12 (unica 'waiting' do fixture).
