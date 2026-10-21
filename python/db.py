@@ -1798,6 +1798,35 @@ def assign_close_stale(conn, ttl_sec: int) -> int:
     return int(cur.rowcount or 0)
 
 
+def close_stale_pending_routes(conn, ttl_sec: int) -> int:
+    """Rede de seguranca: rota 'waiting' parada ha tempo demais para de girar.
+
+    Cobre o que o teto de falhas (`move_max_fail`) nao cobre: `dono_offline`
+    nao consome falha de proposito (espera o dono sair do TOA), e "time sem
+    elegivel" nunca chega a tentar move_chat/invite pra incrementar falha
+    nenhuma — os dois casos giram `retry_route` para sempre, sem isso. Visto
+    em producao uma rota de 29/09 ainda 'waiting' em 21/10, com 28 mil
+    tentativas, disputando toda vez os poucos slots que `due_routes` libera
+    por tick com formulario/chat genuinamente novo.
+
+    Vale pra chat e formulario (o chat ja tem `finish_orphan_routes` pra uma
+    condicao especifica — chat saiu do bot; isso aqui e so o cinto de
+    seguranca generico por tempo, nao substitui aquele).
+    """
+    cur = conn.execute(
+        """UPDATE pending_routes
+              SET status = 'failed', detail = 'ttl: rota parada ha tempo demais (rede de seguranca)',
+                  next_try_at = NULL, claimed_by = '', claim_expires_at = NULL
+            WHERE status = 'waiting'
+              AND datetime(created_at) < datetime('now', '-' || ? || ' seconds')
+              AND (COALESCE(claimed_by, '') = ''
+                   OR claim_expires_at IS NULL
+                   OR datetime(claim_expires_at) <= datetime('now'))""",
+        (str(int(max(ttl_sec, 0))),),
+    )
+    return int(cur.rowcount or 0)
+
+
 def open_chat_assignments(conn) -> list[dict]:
     """Casos de CHAT ainda abertos no ledger (reconciliacao com o chat real).
 

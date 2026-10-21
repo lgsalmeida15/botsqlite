@@ -381,6 +381,45 @@ class QueueTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(routes(conn, "waiting"), [])
         self.assertIn("orphan_route_closed", events(conn))
 
+    async def test_tick_timeouts_fecha_formulario_parado_ha_tempo_demais(self):
+        """Rede de seguranca: 'waiting' antigo demais (dono_offline/sem_elegivel
+        que nunca contam falha) e encerrado pelo tempo, nao gira para sempre."""
+        eng, conn, _sock = self._eng(online=[])
+        eng.cfg["pending_route_stale_ttl_sec"] = "3600"
+        rid = db.enqueue_route(conn, "form", 40, "h:q1", 1, detail="time sem elegivel", delay_sec=0)
+        conn.execute(
+            "UPDATE pending_routes SET created_at = datetime('now', '-2 hours') WHERE id = ?",
+            (rid,),
+        )
+        await eng.tick_timeouts()
+        self.assertEqual(routes(conn, "waiting"), [])
+        falhadas = routes(conn, "failed")
+        self.assertEqual(len(falhadas), 1)
+        self.assertIn("ttl", str(falhadas[0]["detail"] or ""))
+        self.assertIn("pending_route_stale_closed", events(conn))
+
+    async def test_tick_timeouts_nao_fecha_rota_recente(self):
+        """Rota 'waiting' dentro do prazo normal nao e tocada pela rede de seguranca."""
+        eng, conn, _sock = self._eng(online=[])
+        eng.cfg["pending_route_stale_ttl_sec"] = "3600"
+        db.enqueue_route(conn, "form", 41, "h:q1", 1, detail="aguardando normalmente", delay_sec=0)
+        await eng.tick_timeouts()
+        self.assertEqual(len(routes(conn, "waiting")), 1)
+        self.assertNotIn("pending_route_stale_closed", events(conn))
+
+    async def test_pending_route_stale_cleanup_desligado_nao_fecha_nada(self):
+        """Config desligada: a rede de seguranca por tempo nao roda."""
+        eng, conn, _sock = self._eng(online=[])
+        eng.cfg["pending_route_stale_cleanup_enabled"] = "false"
+        rid = db.enqueue_route(conn, "form", 42, "h:q1", 1, detail="muito antigo", delay_sec=0)
+        conn.execute(
+            "UPDATE pending_routes SET created_at = datetime('now', '-200 hours') WHERE id = ?",
+            (rid,),
+        )
+        await eng.tick_timeouts()
+        self.assertEqual(len(routes(conn, "waiting")), 1)
+        self.assertNotIn("pending_route_stale_closed", events(conn))
+
     async def test_priorizar_item_fura_a_fila(self):
         """`set_route_priority` entrega o priorizado antes de quem chegou primeiro."""
         eng, conn, sock = self._eng(online=["ana"])
