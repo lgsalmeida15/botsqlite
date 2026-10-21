@@ -956,8 +956,15 @@ function dash_fila_chat_html(PDO $pdo, array $selList, array $statusBotDash, Clo
         $placeFilaChat = implode(',', array_fill(0, count($idsFilaChat), '?'));
         try {
             $stAutorFila = $pdo->prepare(
-                'SELECT chat_id, author_name, author_addr FROM bot_events'
-                . ' WHERE id IN (SELECT MAX(id) FROM bot_events WHERE chat_id IN (' . $placeFilaChat . ') GROUP BY chat_id)'
+                'SELECT chat_id, author_name, author_addr FROM ('
+                . '  SELECT chat_id, author_name, author_addr,'
+                . '         ROW_NUMBER() OVER ('
+                . '           PARTITION BY chat_id'
+                . '           ORDER BY (author_name <> \'\') DESC, id DESC'
+                . '         ) AS rn'
+                . '  FROM bot_events'
+                . '  WHERE chat_id IN (' . $placeFilaChat . ')'
+                . ') t WHERE rn = 1'
             );
             $stAutorFila->execute($idsFilaChat);
             foreach ($stAutorFila->fetchAll() as $rAutorFila) {
