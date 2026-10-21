@@ -1103,6 +1103,11 @@ class Engine:
                     return 0
         return 0
 
+    @staticmethod
+    def _motivo_recusa(detail: str) -> str:
+        """Rotulo do motivo de desistencia: convite ou move_chat, conforme o detalhe."""
+        return "convite" if "invite_falhou=" in str(detail or "") else "move_chat"
+
     def _move_max_fail(self) -> int:
         """Teto de `move_chat` recusado antes de encerrar a rota (nao gira para sempre).
 
@@ -3369,7 +3374,12 @@ class Engine:
         except Exception as e:
             log.warning("form invite_to_chat %s %s: %s", cid, addr, e)
             self._reserve_drop(addr, "form", case_key)
-            return False, f"{route}; invite_falhou={e}"
+            # Mesmo teto de tentativas do move_chat: sem isso o convite falhava
+            # para sempre no mesmo alvo travado (nunca incrementava `falhas`,
+            # entao o teto de desistencia nunca disparava — visto em producao
+            # com uma rota batendo 1371 tentativas no mesmo invite_falhou).
+            falhas = db.bump_move_fails(self.conn, route_id)
+            return False, f"{route}; invite_falhou={e}; falhas={falhas}"
         db.set_delivery_marks(
             self.conn, route_id,
             invite_target=addr,
@@ -3457,7 +3467,10 @@ class Engine:
                 return
             route = detail
             if self._move_falhas(detail) >= self._move_max_fail():
-                motivo = f"move_chat recusado pelo TOA ({self._move_falhas(detail)}x); rota encerrada"
+                motivo = (
+                    f"{self._motivo_recusa(detail)} recusado pelo TOA "
+                    f"({self._move_falhas(detail)}x); rota encerrada"
+                )
                 db.finish_route(self.conn, rid, "failed", f"{motivo}; {detail}")
                 self._emit("form_move_refused", cid, queue_address, f"{motivo}; {detail}")
                 return
@@ -3707,7 +3720,10 @@ class Engine:
                 await self._deliver_sibling(case_key, str(picked.get("address") or ""), team)
                 continue
             if self._move_falhas(detail) >= self._move_max_fail():
-                motivo = f"move_chat recusado pelo TOA ({self._move_falhas(detail)}x); rota encerrada"
+                motivo = (
+                    f"{self._motivo_recusa(detail)} recusado pelo TOA "
+                    f"({self._move_falhas(detail)}x); rota encerrada"
+                )
                 db.finish_route(self.conn, rid, "failed", f"{motivo}; {detail}")
                 self._emit("form_move_refused", cid, q, f"{motivo}; {detail}")
                 continue

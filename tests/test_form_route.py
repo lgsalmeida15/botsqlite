@@ -26,12 +26,13 @@ class RouteSock:
 
     own_address = "u:bot@claro.com"
 
-    def __init__(self, online=None, chats=None, msgs=None, move_error=""):
+    def __init__(self, online=None, chats=None, msgs=None, move_error="", invite_error=""):
         self.cmds: list[tuple[str, dict]] = []
         self.online = list(online if online is not None else ["ana"])
         self.chats = list(chats or [])
         self.msgs = dict(msgs or {})
         self.move_error = move_error
+        self.invite_error = invite_error
 
     async def command(self, name, payload=None, **kwargs):
         payload = payload or {}
@@ -44,6 +45,8 @@ class RouteSock:
             return {"d": {"messages": list(self.msgs.get(int(payload.get("chat_id")), []))}}
         if name == "move_chat" and self.move_error:
             raise RuntimeError(self.move_error)
+        if name == "invite_to_chat" and self.invite_error:
+            raise RuntimeError(self.invite_error)
         return {"d": {}}
 
     def names(self) -> list[str]:
@@ -135,10 +138,10 @@ class FormRouteTest(unittest.IsolatedAsyncioTestCase):
     def tearDown(self):
         MEM.clear()
 
-    def _eng(self, online=None, chats=None, with_team=True, msgs=None, move_error=""):
+    def _eng(self, online=None, chats=None, with_team=True, msgs=None, move_error="", invite_error=""):
         conn = mem_conn()
         seed_queue_menu(conn, with_team=with_team)
-        sock = RouteSock(online=online, chats=chats, msgs=msgs, move_error=move_error)
+        sock = RouteSock(online=online, chats=chats, msgs=msgs, move_error=move_error, invite_error=invite_error)
         return engine_with(conn, sock), conn, sock
 
     async def test_form_sem_identidade_usa_o_autor_das_mensagens(self):
@@ -163,6 +166,23 @@ class FormRouteTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rota["status"], "failed")
         self.assertIn("form_move_refused", events(conn))
         self.assertGreaterEqual(int(rota["move_fails"] or 0), 2)
+
+    async def test_convite_recusado_tambem_encerra_a_rota(self):
+        """`invite_to_chat` recusado pelo TOA (depois do move ok) tambem para no
+        teto — antes disso, essa falha nunca incrementava `falhas` e a rota
+        girava para sempre no mesmo alvo (visto em producao: 1371 tentativas)."""
+        eng, conn, _sock = self._eng(invite_error="10: erro do TOA sem mensagem")
+        eng.cfg["form_move_max_fail"] = "2"
+        await eng.consider(form_chat())
+        for _ in range(4):
+            conn.execute("UPDATE pending_routes SET next_try_at = datetime('now','-1 seconds')")
+            await eng.tick_routes()
+        rota = conn.execute("SELECT * FROM pending_routes WHERE chat_id = 99").fetchone()
+        self.assertEqual(rota["status"], "failed", "convite recusado tem que parar no teto, nao girar para sempre")
+        self.assertIn("form_move_refused", events(conn))
+        self.assertGreaterEqual(int(rota["move_fails"] or 0), 2)
+        # O motivo registrado diferencia convite de move_chat (nao fica generico).
+        self.assertIn("convite recusado pelo TOA", str(rota["detail"] or ""))
 
     async def test_form_ja_com_analista_e_adotado_sem_mover(self):
         """Formulário já com um analista do time (`user_joined`): adota o dono."""
