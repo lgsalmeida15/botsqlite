@@ -128,22 +128,24 @@ class QueueTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any("N\u00ba 2" in t for t in textos), "acima do topo nao fala numero")
 
     async def test_formulario_nao_espera_a_linha_do_chat(self):
-        """Linhas apartadas: com 10 chats na frente, o formulario e tentado no mesmo tick."""
+        """Linhas apartadas: com 10 chats na frente, o formulario e tentado no mesmo tick
+        — e, com `form_priority_always` (padrao), ganha a unica vaga."""
         eng, conn, sock = self._eng(online=["ana"])
         eng.cfg["max_cases_per_agent"] = "1"   # Ana entrega 1 caso: o resto fica na fila
         for cid in range(11, 21):
             db.enqueue_route(conn, "chat", cid, "h:q1", 1, detail="chat", delay_sec=0)
         db.enqueue_route(conn, "form", 99, "h:q1", 1, detail="formulario", delay_sec=0)
         await eng.tick_routes()
-        # O chat da cabeca foi entregue...
+        # O formulario foi entregue (prioridade sobre o chat)...
         self.assertEqual(len(routes(conn, "done")), 1)
-        self.assertEqual(str(routes(conn, "done")[0]["kind"]), "chat")
-        # ...e o formulario foi tentado NESTE tick (posicao 1 da linha dele).
+        self.assertEqual(str(routes(conn, "done")[0]["kind"]), "form")
+        # ...e os chats do inicio da linha foram tentados NESTE tick, mesmo perdendo a vaga.
         porTipo = {}
         for r in routes(conn, "waiting"):
             porTipo.setdefault(str(r["kind"]), []).append(int(r["attempts"]))
-        self.assertEqual(porTipo.get("form"), [1], "formulario tentado no mesmo tick")
-        # Algum chat do fim da linha nem foi tentado: o form nao esperou os 10.
+        self.assertIn(1, porTipo.get("chat") or [], "chat da cabeca foi tentado mesmo sem vaga")
+        # Algum chat do fim da linha nem foi tentado (devido ao per_line=5): o
+        # tick nao processa a linha do chat inteira so porque o form venceu.
         self.assertIn(0, porTipo.get("chat") or [], porTipo)
 
     async def test_espera_do_formulario_vence_e_encerra_a_rota(self):
@@ -401,6 +403,59 @@ class QueueTest(unittest.IsolatedAsyncioTestCase):
         rid = db.enqueue_route(conn, "chat", 10, "h:q1", 1, delay_sec=0)
         db.finish_route(conn, rid, "done", "")
         self.assertFalse(db.set_route_priority(conn, rid, 1))
+
+    async def test_formulario_sempre_ganha_a_vaga_contra_chat_no_mesmo_tick(self):
+        """Com 1 analista e 1 vaga, formulario e chat chegando juntos: formulario entrega primeiro."""
+        eng, conn, sock = self._eng(online=["ana"])
+        eng.cfg["max_cases_per_agent"] = "1"
+        db.enqueue_route(conn, "chat", 10, "h:q1", 1, detail="chat", delay_sec=0)
+        db.enqueue_route(conn, "form", 20, "h:q1", 1, detail="form", delay_sec=0)
+        await eng.tick_routes()
+        entregues = routes(conn, "done")
+        self.assertEqual(len(entregues), 1)
+        self.assertEqual(int(entregues[0]["chat_id"]), 20, "formulário entregue, não o chat")
+        esperando = routes(conn, "waiting")
+        self.assertEqual(len(esperando), 1)
+        self.assertEqual(int(esperando[0]["chat_id"]), 10)
+
+    async def test_prioridade_manual_do_chat_nao_vence_formulario_sem_prioridade(self):
+        """`priority=1` no chat continua valendo so dentro da propria linha — nao fura o form."""
+        eng, conn, sock = self._eng(online=["ana"])
+        eng.cfg["max_cases_per_agent"] = "1"
+        chat_id = db.enqueue_route(conn, "chat", 10, "h:q1", 1, detail="chat", delay_sec=0)
+        self.assertTrue(db.set_route_priority(conn, chat_id, 1))
+        db.enqueue_route(conn, "form", 20, "h:q1", 1, detail="form", delay_sec=0)
+        await eng.tick_routes()
+        entregues = routes(conn, "done")
+        self.assertEqual(len(entregues), 1)
+        self.assertEqual(int(entregues[0]["chat_id"]), 20, "form ainda ganha mesmo com chat priorizado")
+
+    async def test_dois_formularios_ganham_as_duas_vagas_antes_do_chat(self):
+        """Com 2 vagas, os 2 formularios (linha propria) entram antes do chat."""
+        eng, conn, sock = self._eng(online=["ana"])
+        eng.cfg["max_cases_per_agent"] = "2"
+        db.enqueue_route(conn, "form", 20, "h:q1", 1, detail="form1", delay_sec=0)
+        db.enqueue_route(conn, "form", 21, "h:q1", 1, detail="form2", delay_sec=0)
+        db.enqueue_route(conn, "chat", 10, "h:q1", 1, detail="chat", delay_sec=0)
+        await eng.tick_routes()
+        entregues_ids = sorted(int(r["chat_id"]) for r in routes(conn, "done"))
+        self.assertEqual(entregues_ids, [20, 21], "as 2 vagas vao para os formularios, nao para o chat")
+        esperando = routes(conn, "waiting")
+        self.assertEqual(len(esperando), 1)
+        self.assertEqual(int(esperando[0]["chat_id"]), 10)
+
+    async def test_form_priority_always_desligado_volta_a_alternancia(self):
+        """Com a config desligada, volta o comportamento antigo (alternancia 50/50)."""
+        eng, conn, sock = self._eng(online=["ana"])
+        eng.cfg["max_cases_per_agent"] = "1"
+        eng.cfg["form_priority_always"] = "false"
+        db.enqueue_route(conn, "chat", 10, "h:q1", 1, detail="chat", delay_sec=0)
+        db.enqueue_route(conn, "form", 20, "h:q1", 1, detail="form", delay_sec=0)
+        self.assertEqual(eng._turno_fila, 0, "primeiro tick comeca pelo chat (turno par)")
+        await eng.tick_routes()
+        entregues = routes(conn, "done")
+        self.assertEqual(len(entregues), 1)
+        self.assertEqual(int(entregues[0]["chat_id"]), 10, "com a flag desligada, o chat ganha no turno par")
 
     def test_tentar_agora_ignora_o_backoff(self):
         """`retry_route_now` zera o proximo tick sem esperar o intervalo de retry."""

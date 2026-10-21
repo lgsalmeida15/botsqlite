@@ -854,10 +854,12 @@ function dash_donut(array $slices, string $centro = '', string $legenda = ''): v
 }
 
 /**
- * "Fila de chat — agora" do Dashboard: chats com o bot (ainda sem rota) e chats
- * aguardando roteamento (`pending_routes`), com acao de priorizar. So respeita
- * o filtro de FILA da pagina (retrato do agora, mesmo criterio dos cards FILA
- * DE CHAT/FILA FORMS) — nunca o periodo nem o nome do analista.
+ * "Fila de atendimento — agora" do Dashboard: chats com o bot (ainda sem
+ * rota, sempre kind=chat) e chats/formularios aguardando roteamento
+ * (`pending_routes`, kind IN ('chat','form')), com acao de priorizar e
+ * coluna de Tipo/Categoria. So respeita o filtro de FILA da pagina (retrato
+ * do agora, mesmo criterio dos cards FILA DE CHAT/FILA FORMS) — nunca o
+ * periodo nem o nome do analista.
  */
 function dash_fila_chat_html(PDO $pdo, array $selList, array $statusBotDash, Closure $fmtEspera, string $csrf): string
 {
@@ -879,7 +881,7 @@ function dash_fila_chat_html(PDO $pdo, array $selList, array $statusBotDash, Clo
     try {
         $stFilaBot = $pdo->prepare(
             'SELECT c.chat_id, c.queue_address, c.updated_at, q.name AS queue_name,'
-            . ' tq.team_id AS team_id, t.name AS team_name'
+            . ' tq.team_id AS team_id, t.name AS team_name, c.classification AS categoria'
             . ' FROM chats c'
             . ' LEFT JOIN queues q ON q.address = c.queue_address'
             . ' LEFT JOIN team_queues tq ON tq.queue_address = c.queue_address'
@@ -893,22 +895,61 @@ function dash_fila_chat_html(PDO $pdo, array $selList, array $statusBotDash, Clo
         $filaBotRows = [];
     }
 
-    // (b) rotas de chat aguardando entrega — escopo por TIME (igual a aba
-    // Roteamento) para a posicao bater com a de la; o filtro de fila da pagina
-    // entra DEPOIS de calcular a posicao (senao a numeracao mentiria).
-    $paramsFilaPendAll = [];
-    $wherePendAll = "r.kind = 'chat' AND r.status = 'waiting'"
+    // (b) rotas de chat E formulario aguardando entrega — escopo por TIME
+    // (igual a aba Roteamento) para a posicao bater com a de la; o filtro de
+    // fila da pagina entra DEPOIS de calcular a posicao (senao a numeracao
+    // mentiria). Formulario nao tem linha em `chats` — o LEFT JOIN cobre o
+    // caso (classification vem NULL) e a categoria do formulario e fixa
+    // ("Validação", unico fluxo que o formulario tem hoje).
+    //
+    // Formulario em `pending_routes` pode ficar "waiting" por semanas sem
+    // nunca ser entregue (time sem elegivel, dono_offline que o TOA nunca
+    // tira da lista...) — rota orfa, nao fila de verdade. O card FILA FORMS
+    // ja resolve isso contando pelo que o TOA REALMENTE lista como pendente
+    // (`queue_load.pending_forms`, fresco), em vez de `pending_routes` cru
+    // (comentario original em queue_load: "rotas orfas de form inflavam o
+    // numero"). Aplicamos a MESMA regra aqui: formulario so aparece na fila
+    // se a fila dele tiver leitura fresca do TOA com `pending_forms > 0`, e
+    // no maximo esse tanto de formularios por fila — os MAIS RECENTES primeiro
+    // (um formulario que acabou de chegar e muito mais provavel de ser um dos
+    // que o TOA esta contando agora do que um orfao parado ha semanas; contar
+    // do mais antigo pra frente so garantiria vaga pros proprios orfaos). A
+    // ordem de EXIBICAO da fila continua FIFO/priority normal (isso aqui so
+    // decide quem entra no corte, nao a posicao mostrada). Chat continua sem
+    // esse corte: o problema relatado foi so do formulario.
+    $pollFilaAtendimento = 30;
+    foreach ($pdo->query('SELECT key, value FROM bot_settings') as $rCfgFilaAt) {
+        if ((string) $rCfgFilaAt['key'] === 'load_poll_sec') {
+            $pollFilaAtendimento = max(5, (int) $rCfgFilaAt['value']);
+        }
+    }
+    $janelaFilaAtendimento = max(60, $pollFilaAtendimento * 2);
+    $paramsFilaPendAll = ['-' . $janelaFilaAtendimento . ' seconds'];
+    $wherePendAll = "r.status = 'waiting'"
         . bot_scope_team_where($pdo, 'r.team_id', $paramsFilaPendAll);
     $filaPendAll = [];
     try {
         $stFilaPendAll = $pdo->prepare(
-            'SELECT r.id, r.chat_id, r.queue_address, r.team_id, r.priority, r.created_at,'
-            . ' q.name AS queue_name, t.name AS team_name'
-            . ' FROM pending_routes r'
-            . ' LEFT JOIN queues q ON q.address = r.queue_address'
-            . ' LEFT JOIN teams t ON t.id = r.team_id'
-            . ' WHERE ' . $wherePendAll
-            . ' ORDER BY r.priority DESC, r.id ASC'
+            'SELECT id, chat_id, queue_address, team_id, priority, created_at, kind,'
+            . ' queue_name, team_name, categoria FROM ('
+            . '  SELECT r.id, r.chat_id, r.queue_address, r.team_id, r.priority, r.created_at, r.kind,'
+            . '         q.name AS queue_name, t.name AS team_name,'
+            . '         CASE WHEN r.kind = \'form\' THEN \'Validação\' ELSE c.classification END AS categoria,'
+            . '         l.pending_forms AS fila_toa_forms,'
+            . '         ROW_NUMBER() OVER ('
+            . '           PARTITION BY r.queue_address'
+            . '           ORDER BY r.id DESC'
+            . '         ) AS rn_form'
+            . '  FROM pending_routes r'
+            . '  LEFT JOIN queues q ON q.address = r.queue_address'
+            . '  LEFT JOIN teams t ON t.id = r.team_id'
+            . '  LEFT JOIN chats c ON c.chat_id = r.chat_id'
+            . '  LEFT JOIN queue_load l ON l.queue_address = r.queue_address'
+            . '    AND l.toa_ok = 1 AND l.at >= datetime(\'now\', ?)'
+            . '  WHERE ' . $wherePendAll
+            . ') x'
+            . ' WHERE kind <> \'form\' OR (fila_toa_forms IS NOT NULL AND fila_toa_forms > 0 AND rn_form <= fila_toa_forms)'
+            . ' ORDER BY priority DESC, id ASC'
         );
         $stFilaPendAll->execute($paramsFilaPendAll);
         $filaPendAll = $stFilaPendAll->fetchAll();
@@ -989,17 +1030,18 @@ function dash_fila_chat_html(PDO $pdo, array $selList, array $statusBotDash, Clo
     };
 
     $out = '<div class="card mb-3"><div class="card-body">';
-    $out .= '<h2 class="h6 mb-3">Fila de chat — agora <span class="badge text-bg-secondary">'
+    $out .= '<h2 class="h6 mb-3">Fila de atendimento — agora <span class="badge text-bg-secondary">'
         . (count($filaPendRows) + count($filaBotRows)) . '</span></h2>';
     if (!$filaPendRows && !$filaBotRows) {
-        $out .= '<p class="text-muted mb-0">Nenhum chat com o bot ou aguardando analista agora.</p>';
+        $out .= '<p class="text-muted mb-0">Nenhum chat ou formulário com o bot ou aguardando analista agora.</p>';
     } else {
         $out .= '<div class="table-responsive"><table class="table table-slim table-hover align-middle bg-white mb-0">';
-        $out .= '<thead><tr><th>#</th><th>Fila</th><th>Time</th><th>Chat</th><th>Status</th>'
-            . '<th>Solicitante</th><th>Há quanto tempo</th><th></th></tr></thead><tbody>';
+        $out .= '<thead><tr><th>#</th><th>Fila</th><th>Time</th><th>Chat</th><th>Tipo</th><th>Status</th>'
+            . '<th>Categoria</th><th>Solicitante</th><th>Há quanto tempo</th><th></th></tr></thead><tbody>';
         foreach ($filaPendRows as $rp) {
             $ridFila = (int) $rp['id'];
             $prioritarioFila = (int) ($rp['priority'] ?? 0) > 0;
+            $tipoFila = ((string) $rp['kind'] === 'form') ? 'Formulário' : 'Chat';
             $segFila = max(0, time() - (strtotime((string) $rp['created_at'] . ' UTC') ?: time()));
             $out .= '<tr' . ($prioritarioFila ? ' class="table-warning"' : '') . '>';
             $out .= '<td><span class="badge text-bg-dark">' . $filaPendPos[$ridFila] . 'º</span>'
@@ -1007,7 +1049,9 @@ function dash_fila_chat_html(PDO $pdo, array $selList, array $statusBotDash, Clo
             $out .= '<td><code>' . h((string) ($rp['queue_name'] ?: $rp['queue_address'])) . '</code></td>';
             $out .= '<td>' . h((string) ($rp['team_name'] ?? '-')) . '</td>';
             $out .= '<td>' . (int) $rp['chat_id'] . '</td>';
+            $out .= '<td>' . h($tipoFila) . '</td>';
             $out .= '<td><span class="badge bg-secondary">aguardando</span></td>';
+            $out .= '<td>' . h((string) ($rp['categoria'] ?: '-')) . '</td>';
             $out .= '<td>' . h($filaSolicitante((int) $rp['chat_id'])) . '</td>';
             $out .= '<td>' . h($fmtEspera($segFila)) . '</td>';
             $out .= '<td class="text-end">';
@@ -1025,7 +1069,9 @@ function dash_fila_chat_html(PDO $pdo, array $selList, array $statusBotDash, Clo
             $out .= '<td><code>' . h((string) ($rb['queue_name'] ?: $rb['queue_address'])) . '</code></td>';
             $out .= '<td>' . h((string) ($rb['team_name'] ?? '-')) . '</td>';
             $out .= '<td>' . (int) $rb['chat_id'] . '</td>';
+            $out .= '<td>Chat</td>';
             $out .= '<td><span class="badge bg-warning text-dark">com bot</span></td>';
+            $out .= '<td>' . h((string) ($rb['categoria'] ?: '-')) . '</td>';
             $out .= '<td>' . h($filaSolicitante((int) $rb['chat_id'])) . '</td>';
             $out .= '<td>' . h($fmtEspera($segFilaBot)) . '</td>';
             $out .= '<td></td></tr>';
