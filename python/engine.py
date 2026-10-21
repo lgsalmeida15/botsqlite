@@ -3857,8 +3857,33 @@ class Engine:
             log.info("resgate: %s caso(s) devolvido(s) por analista offline", devolvidos)
         return devolvidos
 
+    def _pending_route_stale_enabled(self) -> bool:
+        valor = str(self.cfg.get("pending_route_stale_cleanup_enabled") or "true").strip().lower()
+        return valor not in ("false", "0", "no")
+
+    def _pending_route_stale_ttl_sec(self) -> int:
+        """Teto de espera de uma rota 'waiting' antes do cinto de seguranca fechar
+        ela sozinha (default 48h — generoso para nao fechar fila legitimamente
+        lenta, curto o bastante pra nao deixar zumbi acumular por semanas)."""
+        try:
+            return max(3600, int(self.cfg.get("pending_route_stale_ttl_sec") or 172800))
+        except (TypeError, ValueError):
+            return 172800
+
     async def tick_timeouts(self) -> None:
         db.assign_close_stale(self.conn, int(self.cfg.get("route_assign_ttl_sec") or 43200))
+        # Rota 'waiting' parada ha tempo demais (dono_offline/sem_elegivel que
+        # nunca contam falha e girariam para sempre): cinto de seguranca.
+        if self._pending_route_stale_enabled():
+            try:
+                fechadas = db.close_stale_pending_routes(self.conn, self._pending_route_stale_ttl_sec())
+                if fechadas:
+                    self._emit(
+                        "pending_route_stale_closed", None, None,
+                        f"{fechadas} rota(s) parada(s) encerrada(s) pelo tempo",
+                    )
+            except Exception:
+                log.exception("close_stale_pending_routes")
         # Visao viva dos formularios (pendente/em atendimento/passado): um por tick.
         try:
             await self._sweep_form_states()
