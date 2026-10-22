@@ -104,6 +104,7 @@ def ensure_schema(conn) -> None:
     _migrate_case_keys(conn)
     _migrate_load(conn)
     _migrate_kinds(conn)
+    _migrate_team_schedules(conn)
     _migrate_form_window(conn)
     _migrate_events_author(conn)
     _migrate_queue_load(conn)
@@ -529,6 +530,64 @@ def _migrate_kinds(conn) -> None:
         conn.execute(
             "UPDATE team_member_routing SET kinds = 'chat'"
             " WHERE kinds = 'both' AND forms_enabled = 0"
+        )
+
+
+def _migrate_team_schedules(conn) -> None:
+    """Janelas de atuacao (turno) e descanso por analista/time.
+
+    Base antiga nao ganha a tabela com o CREATE IF NOT EXISTS do schema.sql
+    rodar de novo? Ganha — a funcao existe para o mesmo padrao das demais
+    migracoes (checagem explicita) e para o painel PHP espelhar a chamada, alem
+    de fazer a migracao de dados abaixo.
+
+    Dados: quem ja tinha `team_members.route_start/route_end` preenchidos e
+    ainda nao tem nenhuma linha em `team_member_schedules` ganha uma linha
+    `shift` (todos os dias) equivalente, para nao perder o plantao configurado
+    na troca de release. Dali em diante a tabela nova e a fonte unica lida pelo
+    motor; as colunas antigas ficam so como historico.
+    """
+    if "team_member_schedules" not in _table_names(conn):
+        conn.execute(
+            """CREATE TABLE team_member_schedules (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+                 address VARCHAR(191),
+                 kind TEXT NOT NULL DEFAULT 'shift' CHECK (kind IN ('shift', 'break')),
+                 days_mask INTEGER NOT NULL DEFAULT 127,
+                 start_time TEXT NOT NULL,
+                 end_time TEXT NOT NULL,
+                 sort_order INTEGER NOT NULL DEFAULT 0,
+                 active INTEGER NOT NULL DEFAULT 1,
+                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
+               )"""
+        )
+        conn.execute(
+            """CREATE INDEX team_member_schedules_lookup
+               ON team_member_schedules (team_id, address, active)"""
+        )
+    if "team_members" not in _table_names(conn):
+        return
+    existentes = {
+        (r["team_id"], str(r["address"] or ""))
+        for r in conn.execute(
+            "SELECT DISTINCT team_id, address FROM team_member_schedules WHERE address IS NOT NULL"
+        ).fetchall()
+    }
+    legados = conn.execute(
+        "SELECT team_id, address, route_start, route_end FROM team_members"
+        " WHERE route_start IS NOT NULL AND route_start != ''"
+        " AND route_end IS NOT NULL AND route_end != ''"
+    ).fetchall()
+    for row in legados:
+        key = (row["team_id"], str(row["address"] or ""))
+        if key in existentes:
+            continue
+        conn.execute(
+            """INSERT INTO team_member_schedules
+                 (team_id, address, kind, days_mask, start_time, end_time)
+               VALUES (?, ?, 'shift', 127, ?, ?)""",
+            (row["team_id"], row["address"], row["route_start"], row["route_end"]),
         )
 
 
@@ -979,6 +1038,72 @@ def team_member_routing(conn, team_id: int) -> dict[str, dict]:
         "SELECT * FROM team_member_routing WHERE team_id = ?", (int(team_id),)
     ).fetchall()
     return {str(r["address"]): r for r in rows}
+
+
+def team_schedules(conn, team_id: int) -> dict[str, list[dict]]:
+    """Janelas (turno/descanso) do time, agrupadas por analista.
+
+    Chave `""` = default do time (`address IS NULL`); demais chaves = override
+    total do analista. Veja `routing.resolve_member_schedule` para a herança.
+    """
+    rows = conn.execute(
+        """SELECT * FROM team_member_schedules
+           WHERE team_id = ? AND active = 1
+           ORDER BY sort_order, id""",
+        (int(team_id),),
+    ).fetchall()
+    out: dict[str, list[dict]] = {}
+    for r in rows:
+        out.setdefault(str(r["address"] or ""), []).append(r)
+    return out
+
+
+def replace_schedules(conn, team_id: int, address: str, rows: list[dict]) -> None:
+    """Substitui por completo as janelas de um escopo (time ou analista).
+
+    `address` vazio/None grava o default do time (`address IS NULL`).
+    """
+    addr = str(address or "").strip()
+    if addr:
+        conn.execute(
+            "DELETE FROM team_member_schedules WHERE team_id = ? AND address = ?",
+            (int(team_id), addr),
+        )
+    else:
+        conn.execute(
+            "DELETE FROM team_member_schedules WHERE team_id = ? AND address IS NULL",
+            (int(team_id),),
+        )
+    for i, row in enumerate(rows or []):
+        kind = str(row.get("kind") or "shift").strip().lower()
+        if kind not in ("shift", "break"):
+            kind = "shift"
+        start = str(row.get("start_time") or "").strip()
+        end = str(row.get("end_time") or "").strip()
+        if not start or not end:
+            continue
+        conn.execute(
+            """INSERT INTO team_member_schedules
+                 (team_id, address, kind, days_mask, start_time, end_time, sort_order)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                int(team_id),
+                addr or None,
+                kind,
+                int(row.get("days_mask") or 127),
+                start,
+                end,
+                i,
+            ),
+        )
+
+
+def clear_member_schedules(conn, team_id: int, address: str) -> None:
+    """Remove as janelas proprias do analista: ele volta a herdar o default do time."""
+    conn.execute(
+        "DELETE FROM team_member_schedules WHERE team_id = ? AND address = ?",
+        (int(team_id), str(address or "").strip()),
+    )
 
 
 def set_last_assigned(conn, team_id: int, kind: str, address: str) -> None:

@@ -263,6 +263,26 @@ CREATE TABLE IF NOT EXISTS team_member_routing (
   PRIMARY KEY (team_id, address)
 );
 
+-- Janelas de atuacao do analista (turno) e de descanso. `address` NULL = default
+-- do time; com `address` = override total do analista (nao soma com o default
+-- do time, substitui). Dias: bit = 1 << weekday() Python (0=seg..6=dom), 127 =
+-- todos os dias. `break` subtrai da disponibilidade; `shift` soma.
+CREATE TABLE IF NOT EXISTS team_member_schedules (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+  address VARCHAR(191),
+  kind TEXT NOT NULL DEFAULT 'shift' CHECK (kind IN ('shift', 'break')),
+  days_mask INTEGER NOT NULL DEFAULT 127,
+  start_time TEXT NOT NULL,
+  end_time TEXT NOT NULL,
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  active INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS team_member_schedules_lookup
+  ON team_member_schedules (team_id, address, active);
+
 -- Retry assíncrono do roteamento (hoje só formulário), drenado pelo tick.
 CREATE TABLE IF NOT EXISTS pending_routes (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

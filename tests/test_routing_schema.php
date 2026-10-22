@@ -190,6 +190,42 @@ foreach ($membros as $m) {
 }
 ok($janelas['u:bia@claro.com'] === ['22:00:00', '06:00:00'], 'pagina le a janela do membro em route_start/route_end');
 
+// Janelas de turno/descanso (team_member_schedules): migracao do legado,
+// override total do analista e CHECK de kind.
+bot_migrate_team_schedules($pdo); // idempotente: migra o route_start/route_end inserido acima
+$tms = bot_table_columns($pdo, 'team_member_schedules');
+foreach (['team_id', 'address', 'kind', 'days_mask', 'start_time', 'end_time', 'sort_order', 'active'] as $col) {
+    ok(isset($tms[$col]), "team_member_schedules.$col");
+}
+$legado = $pdo->query(
+    "SELECT kind, start_time, end_time FROM team_member_schedules WHERE address = 'u:bia@claro.com'"
+)->fetch();
+ok(
+    $legado && $legado['kind'] === 'shift' && $legado['start_time'] === '22:00:00' && $legado['end_time'] === '06:00:00',
+    'migracao converte route_start/route_end legado em janela de turno'
+);
+ok(
+    throws(fn() => $pdo->exec(
+        "INSERT INTO team_member_schedules (team_id, address, kind, start_time, end_time) VALUES (1, 'u:ana@claro.com', 'xpto', '08:00', '18:00')"
+    )),
+    'CHECK recusa kind invalido em team_member_schedules'
+);
+$pdo->exec(
+    "INSERT INTO team_member_schedules (team_id, address, kind, start_time, end_time) VALUES (1, NULL, 'shift', '08:00', '18:00')"
+);
+$pdo->exec(
+    "INSERT INTO team_member_schedules (team_id, address, kind, start_time, end_time) VALUES (1, 'u:ana@claro.com', 'shift', '13:00', '22:00')"
+);
+$pdo->exec(
+    "INSERT INTO team_member_schedules (team_id, address, kind, start_time, end_time) VALUES (1, 'u:ana@claro.com', 'break', '18:00', '19:00')"
+);
+$default = $pdo->query('SELECT COUNT(*) FROM team_member_schedules WHERE address IS NULL')->fetchColumn();
+ok((int) $default === 1, 'default do time fica com address NULL');
+$deAna = $pdo->query(
+    "SELECT COUNT(*) FROM team_member_schedules WHERE address = 'u:ana@claro.com'"
+)->fetchColumn();
+ok((int) $deAna === 2, 'override do analista nao soma com o default do time (fica so no proprio escopo)');
+
 // Estrutura do cabecalho da pagina (sem render): colunas que a aba usa.
 $colunas = ['Ordem', 'Nome', 'Peso', 'Cap chat', 'Cap form', 'Formulario', 'Plantao agora'];
 ok(count($colunas) === 7, 'colunas de membros previstas na aba Roteamento');

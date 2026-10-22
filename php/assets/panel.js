@@ -145,4 +145,80 @@
       renumberAskRows(tbody);
     });
   });
+
+  /* Janelas de turno/descanso (aba Times): adicionar/remover linha, bitmask de
+     dias (7 checkboxes -> 1 input hidden) e fim do descanso = inicio + 1h. */
+  function schRow(el) { return el.closest("[data-sch-row]"); }
+
+  function schUpdateDays(checkbox) {
+    var tr = schRow(checkbox);
+    if (!tr) { return; }
+    var mask = 0;
+    tr.querySelectorAll("[data-sch-day]").forEach(function (b) {
+      if (b.checked) { mask |= (1 << parseInt(b.getAttribute("data-sch-day"), 10)); }
+    });
+    var hidden = tr.querySelector("[data-sch-mask]");
+    if (hidden) { hidden.value = mask || 127; }
+  }
+
+  function schSetAllDays(tr, checked) {
+    tr.querySelectorAll("[data-sch-day]").forEach(function (b) { b.checked = checked; });
+    schUpdateDays(tr.querySelector("[data-sch-day]") || tr);
+  }
+
+  function schAutoEnd(startEl) {
+    var tr = schRow(startEl);
+    if (!tr || !startEl.value) { return; }
+    var kindSel = tr.querySelector("[data-sch-kind]");
+    var endEl = tr.querySelector("[data-sch-end]");
+    if (!kindSel || !endEl || kindSel.value !== "break" || endEl.value) { return; }
+    var parts = startEl.value.split(":");
+    var mins = (parseInt(parts[0], 10) * 60 + parseInt(parts[1], 10) + 60) % 1440;
+    var hh = String(Math.floor(mins / 60)).padStart(2, "0");
+    var mm = String(mins % 60).padStart(2, "0");
+    endEl.value = hh + ":" + mm;
+  }
+
+  function clearSchRow(tr) {
+    var kindSel = tr.querySelector("[data-sch-kind]");
+    if (kindSel) { kindSel.value = "shift"; }
+    tr.querySelectorAll("input[type=time]").forEach(function (i) { i.value = ""; });
+    schSetAllDays(tr, true);
+  }
+
+  document.addEventListener("change", function (ev) {
+    if (ev.target.matches("[data-sch-day]")) { schUpdateDays(ev.target); }
+  });
+  document.addEventListener("input", function (ev) {
+    if (ev.target.matches("[data-sch-start]")) { schAutoEnd(ev.target); }
+  });
+  document.querySelectorAll("[data-sch-allday]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var tr = schRow(btn);
+      if (tr) { schSetAllDays(tr, true); }
+    });
+  });
+  document.querySelectorAll("[data-sch-add]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var tbody = document.getElementById(btn.getAttribute("data-sch-add"));
+      if (!tbody) { return; }
+      var rows = tbody.querySelectorAll("[data-sch-row]");
+      if (!rows.length) { return; }
+      var clone = rows[rows.length - 1].cloneNode(true);
+      clearSchRow(clone);
+      tbody.appendChild(clone);
+    });
+  });
+  document.querySelectorAll("[data-sch-del]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var tr = schRow(btn);
+      var tbody = tr ? tr.parentElement : null;
+      if (!tr || !tbody) { return; }
+      if (tbody.querySelectorAll("[data-sch-row]").length <= 1) {
+        clearSchRow(tr);
+        return;
+      }
+      tbody.removeChild(tr);
+    });
+  });
 })();

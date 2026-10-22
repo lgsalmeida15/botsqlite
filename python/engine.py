@@ -3142,6 +3142,7 @@ class Engine:
             log.info("time %s desabilitado para formulário", team.get("name") or team["id"])
             return None, "time desabilitado para formulário"
         mrouting = db.team_member_routing(self.conn, int(team["id"]))
+        schedules = db.team_schedules(self.conn, int(team["id"]))
         tr = db.team_routing(self.conn, int(team["id"])) or {}
         last_key = "last_assigned_form" if kind == "form" else "last_assigned_chat"
         last = str(tr.get(last_key) or "")
@@ -3177,7 +3178,8 @@ class Engine:
             for m in members:
                 if not _addr_eq(m["address"], force_assignee):
                     continue
-                if not _in_route_window(m, datetime.now(TZ_BRT)):
+                rows = routing.resolve_member_schedule(schedules, m["address"])
+                if not _in_route_window(m, datetime.now(TZ_BRT), rows=rows):
                     return None, f"dono_do_caso={force_assignee} fora_da_janela"
                 # Afinidade NAO e excecao ao online: dono offline nao recebe.
                 if settings.get("require_online", True) and _member_login(m["address"]) not in online:
@@ -3197,7 +3199,8 @@ class Engine:
             for m in members:
                 if not _addr_eq(m["address"], dono):
                     continue
-                if not _in_route_window(m, datetime.now(TZ_BRT)):
+                rows = routing.resolve_member_schedule(schedules, m["address"])
+                if not _in_route_window(m, datetime.now(TZ_BRT), rows=rows):
                     aviso_afinidade = "afinidade=" + dono + " fora_da_janela"
                 elif settings.get("require_online", True) and _member_login(m["address"]) not in online:
                     aviso_afinidade = "afinidade=" + dono + " sem_online"
@@ -3223,6 +3226,7 @@ class Engine:
             # Dupla guarda: o bot nao entra na escolha nem se alguem o readicionar
             # ao time depois do filtro acima.
             exclude={x for x in (self.own, exclude_address) if str(x or "").strip()},
+            schedules=schedules,
         )
         if picked:
             self._reserve_add(str(picked["address"]), kind, case_key)

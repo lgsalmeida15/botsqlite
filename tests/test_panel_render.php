@@ -460,15 +460,14 @@ ok(
     'aba activity: chat_id nao numerico e ignorado (sem filtrar)'
 );
 
-// Ajustes do resgate no Roteamento: globais + por time (linha de cada time).
+// Ajustes do resgate: global no Roteamento, por time na aba Times (consolidado
+// la junto com estrategia, capacidade, demanda e janelas).
 $htmlRoutingOff = (string) ($htmls['routing'] ?? '');
+$htmlTeamsOff = (string) ($htmls['teams'] ?? '');
 ok(strpos($htmlRoutingOff, 'name="offline_requeue_enabled"') !== false, 'aba routing: liga/desliga do resgate');
-ok(strpos($htmlRoutingOff, 'name="offline_requeue_sec"') !== false, 'aba routing: segundos de offline para devolver');
-ok(
-    substr_count($htmlRoutingOff, 'name="offline_requeue_sec"') >= 2,
-    'aba routing: resgate global + por time (linha do time)'
-);
-ok(strpos($htmlRoutingOff, '0 = este time nao devolve') !== false, 'aba routing: explica o 0 do resgate por time');
+ok(strpos($htmlRoutingOff, 'name="offline_requeue_sec"') !== false, 'aba routing: segundos de offline para devolver (global)');
+ok(strpos($htmlTeamsOff, 'name="offline_requeue_sec"') !== false, 'aba teams: segundos de offline para devolver (por time)');
+ok(strpos($htmlTeamsOff, '0 = este time nao devolve') !== false, 'aba teams: explica o 0 do resgate por time');
 
 // Filtro de time: aplica na requisicao, grava na sessao e sobrevive a proxima
 // requisicao (duas execucoes do harness com o MESMO id de sessao).
@@ -499,25 +498,29 @@ ok(
 [$htmlLimpo, $codeLimpo] = render_load('teams=', $uid, 'load_teams');
 ok($codeLimpo === 0 && strpos($htmlLimpo, '<!-- session:load_teams=[] -->') !== false, 'aba load: Limpar zera o filtro na sessao');
 
-// Aba Roteamento: distribuicao (casos global/time/operador) e tipo de atendimento.
+// Aba Roteamento: casos/posicao globais. Aba Times: distribuicao por time e
+// por analista (capacidade, demanda atendida, janelas) - consolidado la.
 $htmlRouting = (string) ($htmls['routing'] ?? '');
+$htmlTeams = (string) ($htmls['teams'] ?? '');
 ok(strpos($htmlRouting, 'name="max_cases_per_agent"') !== false, 'aba routing: campo Casos global');
 ok(strpos($htmlRouting, 'name="cases_all_teams"') !== false, 'aba routing: "fazer valer para todos os times"');
-ok(strpos($htmlRouting, 'name="cases_all_members"') !== false, 'aba routing: replicar casos aos operadores do time');
+ok(strpos($htmlTeams, 'name="cases_all_members"') !== false, 'aba teams: replicar casos aos operadores do time');
 ok(strpos($htmlRouting, 'name="queue_show_pos"') !== false, 'aba routing: falar (ou nao) a posicao ao tecnico');
-ok(strpos($htmlRouting, 'name="kinds_all_members"') !== false, 'aba routing: replicar o tipo de atendimento');
-ok(strpos($htmlRouting, 'name="member_kinds"') !== false, 'aba routing: tipo padrao dos operadores do time');
-ok(strpos($htmlRouting, 'name="kinds"') !== false, 'aba routing: tipo de atendimento por operador');
+ok(strpos($htmlTeams, 'name="kinds_all_members"') !== false, 'aba teams: replicar o tipo de atendimento');
+ok(strpos($htmlTeams, 'name="member_kinds"') !== false, 'aba teams: demanda padrao do time');
+ok(strpos($htmlTeams, 'name="kinds"') !== false, 'aba teams: tipo de atendimento por operador');
 ok(strpos($htmlRouting, 'linhas apartadas') !== false, 'aba routing: explica as duas linhas da fila');
 ok(strpos($htmlRouting, 'value="queue_expire"') !== false, 'aba routing: Encerrar espera do chat na fila');
 ok(
     strpos($htmlRouting, 'name="form_window_margin_min"') !== false,
-    'aba routing: margem de fim de janela do formulario'
+    'aba routing: margem de fim de janela do formulario (global)'
 );
 ok(
-    substr_count($htmlRouting, 'name="form_window_margin_min"') >= 2,
-    'aba routing: margem global + por time (linha do time)'
+    strpos($htmlTeams, 'name="form_window_margin_min"') !== false,
+    'aba teams: margem de fim de janela do formulario (por time)'
 );
+ok(strpos($htmlTeams, 'name="sch_kind[]"') !== false, 'aba teams: editor de janelas (turno/descanso)');
+ok(strpos($htmlTeams, 'name="sch_days[]"') !== false, 'aba teams: bitmask de dias da janela');
 
 // Endereço do PRÓPRIO bot: o engine publica em bot_settings e o painel RECUSA
 // cadastrá-lo como operador (o caso voltaria para quem só repassa).

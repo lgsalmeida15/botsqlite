@@ -110,6 +110,7 @@ function bot_ensure_schema(PDO $pdo): void
     bot_migrate_form_aware($pdo);
     bot_migrate_events_author($pdo);
     bot_migrate_queue_load($pdo);
+    bot_migrate_team_schedules($pdo);
 }
 
 /**
@@ -133,6 +134,67 @@ function bot_migrate_queue_load(PDO $pdo): void
         . ' toa_ok INTEGER NOT NULL DEFAULT 0,'
         . " detail TEXT NOT NULL DEFAULT '')"
     );
+}
+
+/**
+ * Janelas de atuacao (turno) e descanso por analista/time (aba Times).
+ *
+ * Mesmo padrao de `bot_migrate_queue_load`: o CREATE IF NOT EXISTS do
+ * schema.sql ja cobre base nova, a funcao existe para base antiga e para a
+ * migracao de dados abaixo. Quem ja tinha `team_members.route_start/route_end`
+ * preenchidos e ainda nao tem nenhuma linha em `team_member_schedules` ganha
+ * uma linha `shift` (todos os dias) equivalente, para nao perder o plantao
+ * configurado na troca de release.
+ */
+function bot_migrate_team_schedules(PDO $pdo): void
+{
+    if (!bot_table_exists($pdo, 'team_member_schedules')) {
+        $pdo->exec(
+            'CREATE TABLE team_member_schedules ('
+            . ' id INTEGER PRIMARY KEY AUTOINCREMENT,'
+            . ' team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE,'
+            . ' address VARCHAR(191),'
+            . " kind TEXT NOT NULL DEFAULT 'shift' CHECK (kind IN ('shift', 'break')),"
+            . ' days_mask INTEGER NOT NULL DEFAULT 127,'
+            . ' start_time TEXT NOT NULL,'
+            . ' end_time TEXT NOT NULL,'
+            . ' sort_order INTEGER NOT NULL DEFAULT 0,'
+            . ' active INTEGER NOT NULL DEFAULT 1,'
+            . " created_at TEXT NOT NULL DEFAULT (datetime('now')))"
+        );
+        $pdo->exec(
+            'CREATE INDEX team_member_schedules_lookup'
+            . ' ON team_member_schedules (team_id, address, active)'
+        );
+    }
+    if (!bot_table_exists($pdo, 'team_members')) {
+        return;
+    }
+    $existentes = [];
+    foreach (
+        $pdo->query(
+            'SELECT DISTINCT team_id, address FROM team_member_schedules WHERE address IS NOT NULL'
+        ) as $r
+    ) {
+        $existentes[$r['team_id'] . '|' . $r['address']] = true;
+    }
+    $legados = $pdo->query(
+        'SELECT team_id, address, route_start, route_end FROM team_members'
+        . " WHERE route_start IS NOT NULL AND route_start != ''"
+        . " AND route_end IS NOT NULL AND route_end != ''"
+    )->fetchAll();
+    $ins = $pdo->prepare(
+        'INSERT INTO team_member_schedules'
+        . ' (team_id, address, kind, days_mask, start_time, end_time)'
+        . " VALUES (?, ?, 'shift', 127, ?, ?)"
+    );
+    foreach ($legados as $row) {
+        $key = $row['team_id'] . '|' . $row['address'];
+        if (isset($existentes[$key])) {
+            continue;
+        }
+        $ins->execute([$row['team_id'], $row['address'], $row['route_start'], $row['route_end']]);
+    }
 }
 
 /**

@@ -94,7 +94,21 @@ def _clock_minutes(t: dt_time) -> int:
     return t.hour * 60 + t.minute
 
 
-def _window_label(member: dict) -> str:
+def _window_label(member: dict, rows: list[dict] | None = None) -> str:
+    if rows:
+        shifts = [r for r in rows if str(r.get("kind") or "shift") == "shift"]
+        breaks = [r for r in rows if str(r.get("kind") or "shift") == "break"]
+
+        def fmt(r: dict) -> str:
+            s, e = _as_clock(r.get("start_time")), _as_clock(r.get("end_time"))
+            if s is None or e is None:
+                return "?"
+            return f"{s.strftime('%H:%M')}-{e.strftime('%H:%M')}"
+
+        label = ",".join(fmt(r) for r in shifts) or "24h"
+        if breaks:
+            label += "[descanso " + ",".join(fmt(r) for r in breaks) + "]"
+        return label
     start = _as_clock(member.get("route_start"))
     end = _as_clock(member.get("route_end"))
     if start is None or end is None:
@@ -102,44 +116,32 @@ def _window_label(member: dict) -> str:
     return f"{start.strftime('%H:%M')}-{end.strftime('%H:%M')}"
 
 
-def _in_route_window(member: dict, now: datetime | None = None) -> bool:
-    start = _as_clock(member.get("route_start"))
-    end = _as_clock(member.get("route_end"))
-    if start is None or end is None:
-        return True
-    start_m = _clock_minutes(start)
-    end_m = _clock_minutes(end)
-    if start_m == end_m:
-        return True
+def _now_minutes(now: datetime | None) -> int:
     now = now or datetime.now(TZ_BRT)
     if now.tzinfo is None:
         now = now.replace(tzinfo=TZ_BRT)
-    now_m = _clock_minutes(now.astimezone(TZ_BRT).time().replace(microsecond=0))
-    # Mesmo dia: 08:00–18:00. Overnight: 22:00–06:00 → agora >= início OU agora < fim.
+    return _clock_minutes(now.astimezone(TZ_BRT).time().replace(microsecond=0))
+
+
+def _weekday_bit(now: datetime | None) -> int:
+    now = now or datetime.now(TZ_BRT)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=TZ_BRT)
+    return 1 << now.astimezone(TZ_BRT).weekday()
+
+
+def _in_range(start_m: int, end_m: int, now_m: int) -> bool:
+    """Mesmo dia: 08:00-18:00. Overnight: 22:00-06:00 -> agora >= inicio OU agora < fim."""
+    if start_m == end_m:
+        return True
     if start_m < end_m:
         return start_m <= now_m < end_m
     return now_m >= start_m or now_m < end_m
 
 
-def _minutes_to_window_end(member: dict, now: datetime | None = None) -> int | None:
-    """Quantos minutos faltam para o fim da janela do operador (None = 24h).
-
-    A janela e a ESCALA (`team_members.route_start/route_end`), nao a presenca:
-    quem sai as 18:00 nao deve receber um formulario novo as 17:57. Overnight
-    (22:00-06:00) conta a virada do dia; leitura fora da janela devolve 0.
-    """
-    start = _as_clock(member.get("route_start"))
-    end = _as_clock(member.get("route_end"))
-    if start is None or end is None:
-        return None
-    start_m = _clock_minutes(start)
-    end_m = _clock_minutes(end)
+def _minutes_to_end(start_m: int, end_m: int, now_m: int) -> int | None:
     if start_m == end_m:
         return None
-    now = now or datetime.now(TZ_BRT)
-    if now.tzinfo is None:
-        now = now.replace(tzinfo=TZ_BRT)
-    now_m = _clock_minutes(now.astimezone(TZ_BRT).time().replace(microsecond=0))
     if start_m < end_m:
         if not (start_m <= now_m < end_m):
             return 0
@@ -149,6 +151,87 @@ def _minutes_to_window_end(member: dict, now: datetime | None = None) -> int | N
     if now_m < end_m:
         return end_m - now_m
     return 0
+
+
+def _row_active(row: dict, wd_bit: int, now_m: int) -> bool:
+    if not (int(row.get("days_mask") or 127) & wd_bit):
+        return False
+    start = _as_clock(row.get("start_time"))
+    end = _as_clock(row.get("end_time"))
+    if start is None or end is None:
+        return False
+    return _in_range(_clock_minutes(start), _clock_minutes(end), now_m)
+
+
+def resolve_member_schedule(schedules: dict | None, address: str) -> list[dict]:
+    """Herança de janelas: override total do analista, senão default do time.
+
+    `schedules` vem de `db.team_schedules()`: chave `""` = default do time,
+    demais chaves = override por analista (não soma com o default — substitui).
+    """
+    schedules = schedules or {}
+    own = schedules.get(str(address or "")) or []
+    if own:
+        return own
+    return schedules.get("") or []
+
+
+def _in_route_window(member: dict, now: datetime | None = None, rows: list[dict] | None = None) -> bool:
+    if rows:
+        wd_bit = _weekday_bit(now)
+        now_m = _now_minutes(now)
+        shifts = [r for r in rows if str(r.get("kind") or "shift") == "shift"]
+        breaks = [r for r in rows if str(r.get("kind") or "shift") == "break"]
+        em_turno = True if not shifts else any(_row_active(r, wd_bit, now_m) for r in shifts)
+        em_descanso = any(_row_active(r, wd_bit, now_m) for r in breaks)
+        return em_turno and not em_descanso
+    start = _as_clock(member.get("route_start"))
+    end = _as_clock(member.get("route_end"))
+    if start is None or end is None:
+        return True
+    return _in_range(_clock_minutes(start), _clock_minutes(end), _now_minutes(now))
+
+
+def _minutes_to_window_end(
+    member: dict, now: datetime | None = None, rows: list[dict] | None = None
+) -> int | None:
+    """Quantos minutos faltam para o fim da disponibilidade (None = 24h).
+
+    A janela e a ESCALA, nao a presenca: quem sai as 18:00 nao deve receber um
+    formulario novo as 17:57. Overnight (22:00-06:00) conta a virada do dia;
+    leitura fora da janela devolve 0. Com `rows`, tambem conta o inicio do
+    proximo descanso dentro do turno ativo (nao entregar em cima do descanso).
+    """
+    if rows:
+        wd_bit = _weekday_bit(now)
+        now_m = _now_minutes(now)
+        shifts = [r for r in rows if str(r.get("kind") or "shift") == "shift"]
+        breaks = [r for r in rows if str(r.get("kind") or "shift") == "break"]
+        restos: list[int] = []
+        if shifts:
+            ativos = [r for r in shifts if _row_active(r, wd_bit, now_m)]
+            if not ativos:
+                return 0
+            for r in ativos:
+                falta = _minutes_to_end(_clock_minutes(_as_clock(r["start_time"])), _clock_minutes(_as_clock(r["end_time"])), now_m)
+                if falta is not None:
+                    restos.append(falta)
+        # Chamada so chega aqui se o membro NAO esta em descanso agora (ver
+        # `_in_route_window`, checado antes pelo `decide`): o inicio de cada
+        # descanso de hoje esta sempre adiante, por isso o modulo e seguro.
+        for r in breaks:
+            if not (int(r.get("days_mask") or 127) & wd_bit):
+                continue
+            start = _as_clock(r.get("start_time"))
+            if start is None:
+                continue
+            restos.append((_clock_minutes(start) - now_m) % (24 * 60))
+        return min(restos) if restos else None
+    start = _as_clock(member.get("route_start"))
+    end = _as_clock(member.get("route_end"))
+    if start is None or end is None:
+        return None
+    return _minutes_to_end(_clock_minutes(start), _clock_minutes(end), _now_minutes(now))
 
 
 def member_login_raw(addr) -> str:
@@ -191,11 +274,15 @@ def _addr(member: dict | None) -> str:
     return str((member or {}).get("address") or "")
 
 
-def _names(members: list[dict], *, windows: bool = False) -> str:
+def _names(members: list[dict], *, windows: bool = False, rows_by_addr: dict | None = None) -> str:
     parts: list[str] = []
     for m in members:
         login = member_login_raw(_addr(m))
-        parts.append(f"{login}:{_window_label(m)}" if windows else login)
+        if windows:
+            rows = (rows_by_addr or {}).get(_addr(m))
+            parts.append(f"{login}:{_window_label(m, rows)}")
+        else:
+            parts.append(login)
     return ",".join(parts) or "—"
 
 
@@ -355,11 +442,14 @@ def decide(
     team_name: str = "",
     attempts_used: int = 0,
     exclude: set[str] | None = None,
+    schedules: dict | None = None,
 ) -> tuple[dict | None, str]:
     """Filtra e escolhe. Devolve (membro|None, detalhe legível para o log).
 
     `exclude` e a lista de enderecos que NUNCA podem receber: o proprio bot
     (`self.own`) e, no resgate, o analista que acabou de ficar offline.
+    `schedules` e o resultado de `db.team_schedules()` (janelas de turno e
+    descanso); sem ele, cai no legado `route_start`/`route_end` do membro.
     """
     kind = kind_of(kind)
     mrouting = mrouting or {}
@@ -377,9 +467,11 @@ def decide(
     over_cap: list[dict] = []
     cand: list[dict] = []
     weights: dict[str, int] = {}
+    rows_by_addr: dict[str, list[dict]] = {}
 
     for m in members:
         addr = _addr(m)
+        rows_by_addr[addr] = resolve_member_schedule(schedules, addr)
         # Alvo proibido (bot da casa): nao e elegivel por decisao nenhuma.
         if excluidos and any(addr_eq(addr, x) for x in excluidos):
             props.append(m)
@@ -394,15 +486,16 @@ def decide(
             only_form.append(m)
             continue
         weights[addr] = rules["weight"]
-        if settings.get("respect_window", True) and not _in_route_window(m, now):
+        if settings.get("respect_window", True) and not _in_route_window(m, now, rows=rows_by_addr[addr]):
             off_window.append(m)
             continue
         # Fim de janela: nao entrega formulario novo a quem esta saindo (o caso
-        # ficaria preso com um operador que ja foi embora).
+        # ficaria preso com um operador que ja foi embora, ou que ja vai entrar
+        # em descanso).
         if kind == "form":
             margem = int(settings.get("form_window_margin_min") or 0)
             if margem > 0:
-                falta = _minutes_to_window_end(m, now)
+                falta = _minutes_to_window_end(m, now, rows=rows_by_addr[addr])
                 if falta is not None and falta < margem:
                     fim_janela.append(m)
                     continue
@@ -442,13 +535,13 @@ def decide(
     casos = ",".join(f"{member_login_raw(_addr(m))}={int(loads.get(_addr(m), 0))}" for m in members)
     carga = ",".join(f"{member_login_raw(_addr(m))}={int(por_tipo.get(_addr(m), 0))}" for m in members)
     fim = ",".join(
-        f"{member_login_raw(_addr(m))}:{int(_minutes_to_window_end(m, now) or 0)}min"
+        f"{member_login_raw(_addr(m))}:{int(_minutes_to_window_end(m, now, rows=rows_by_addr.get(_addr(m))) or 0)}min"
         for m in fim_janela
     )
     detail = (
         f"time={team_name or '—'}; estrategia={strategy}; cap={settings.get('cap')}; "
-        f"membros={_names(members)}; janela={_names(eligible, windows=True)}; "
-        f"fora_horario={_names(off_window, windows=True)}; fim_janela={fim or '—'}; "
+        f"membros={_names(members)}; janela={_names(eligible, windows=True, rows_by_addr=rows_by_addr)}; "
+        f"fora_horario={_names(off_window, windows=True, rows_by_addr=rows_by_addr)}; fim_janela={fim or '—'}; "
         f"sem_online={_names(offline)}; proprio_bot={_names(props)}; "
         f"so_chat={_names(only_chat)}; so_form={_names(only_form)}; no_cap={_names(over_cap)}; "
         f"casos={casos or '—'}; carga={carga or '—'}; tentativas={int(attempts_used)}"

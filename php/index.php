@@ -315,40 +315,6 @@ function pdo_friendly_error(PDOException $e): string
     return 'Não foi possível salvar. Tente de novo.';
 }
 
-function normalize_time_post(string $raw): ?string
-{
-    $raw = trim($raw);
-    if (!preg_match('/^(\d{1,2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?$/', $raw, $m)) {
-        return null;
-    }
-    $h = (int) $m[1];
-    $i = (int) $m[2];
-    $s = isset($m[3]) && $m[3] !== '' ? (int) $m[3] : 0;
-    if ($h > 23 || $i > 59 || $s > 59) {
-        return null;
-    }
-    return sprintf('%02d:%02d:%02d', $h, $i, $s);
-}
-
-/** @return array{0:?string,1:?string,2:?string} start, end, error */
-function posted_route_times(): array
-{
-    $startRaw = trim((string) ($_POST['route_start'] ?? ''));
-    $endRaw = trim((string) ($_POST['route_end'] ?? ''));
-    if ($startRaw === '' && $endRaw === '') {
-        return [null, null, null];
-    }
-    if ($startRaw === '' || $endRaw === '') {
-        return [null, null, 'Informe horário início e fim, ou deixe os dois vazios (24h).'];
-    }
-    $start = normalize_time_post($startRaw);
-    $end = normalize_time_post($endRaw);
-    if ($start === null || $end === null) {
-        return [null, null, 'Horário inválido. Use HH:MM.'];
-    }
-    return [$start, $end, null];
-}
-
 function time_to_hms($v): ?string
 {
     if ($v === null || $v === '') {
@@ -388,36 +354,208 @@ function route_hms_minutes(?string $hms): ?int
     return ((int) $parts[0]) * 60 + (int) $parts[1];
 }
 
-function route_crosses_midnight($start, $end): bool
+const SCHEDULE_DAY_LABELS = ['Seg', 'Ter', 'Qua', 'Qui', 'Sex', 'Sáb', 'Dom'];
+
+function schedule_weekday_bit(): int
 {
-    $startS = time_to_hms($start);
-    $endS = time_to_hms($end);
+    $now = new DateTimeImmutable('now', new DateTimeZone('America/Sao_Paulo'));
+    // PHP 'N' = 1 (segunda)..7 (domingo); Python weekday() = 0 (segunda)..6 (domingo).
+    return 1 << (((int) $now->format('N')) - 1);
+}
+
+function schedule_now_minutes(): int
+{
+    $now = new DateTimeImmutable('now', new DateTimeZone('America/Sao_Paulo'));
+    return ((int) $now->format('G')) * 60 + (int) $now->format('i');
+}
+
+function schedule_row_active(array $row, int $wdBit, int $nowM): bool
+{
+    if (!((int) ($row['days_mask'] ?? 127) & $wdBit)) {
+        return false;
+    }
+    $startS = time_to_hms($row['start_time'] ?? null);
+    $endS = time_to_hms($row['end_time'] ?? null);
     if ($startS === null || $endS === null) {
         return false;
     }
     $startM = route_hms_minutes($startS);
     $endM = route_hms_minutes($endS);
-    return $startM !== null && $endM !== null && $startM > $endM;
-}
-
-function member_in_route_window($start, $end): bool
-{
-    $startS = time_to_hms($start);
-    $endS = time_to_hms($end);
-    if ($startS === null || $endS === null) {
+    if ($startM === null || $endM === null) {
+        return false;
+    }
+    if ($startM === $endM) {
         return true;
     }
-    $startM = route_hms_minutes($startS);
-    $endM = route_hms_minutes($endS);
-    if ($startM === null || $endM === null || $startM === $endM) {
-        return true;
-    }
-    $now = new DateTimeImmutable('now', new DateTimeZone('America/Sao_Paulo'));
-    $nowM = ((int) $now->format('G')) * 60 + (int) $now->format('i');
     if ($startM < $endM) {
         return $startM <= $nowM && $nowM < $endM;
     }
     return $nowM >= $startM || $nowM < $endM;
+}
+
+function schedule_rows_by_kind(array $rows, string $kind): array
+{
+    return array_values(array_filter($rows, static fn($r) => (string) ($r['kind'] ?? 'shift') === $kind));
+}
+
+/** 'dentro' | 'descanso' | 'fora'. Sem nenhuma linha de turno = sempre dentro (24h). */
+function schedule_state(array $rows): string
+{
+    if (!$rows) {
+        return 'dentro';
+    }
+    $wdBit = schedule_weekday_bit();
+    $nowM = schedule_now_minutes();
+    $shifts = schedule_rows_by_kind($rows, 'shift');
+    $breaks = schedule_rows_by_kind($rows, 'break');
+    $emTurno = !$shifts;
+    foreach ($shifts as $r) {
+        if (schedule_row_active($r, $wdBit, $nowM)) {
+            $emTurno = true;
+            break;
+        }
+    }
+    foreach ($breaks as $r) {
+        if (schedule_row_active($r, $wdBit, $nowM)) {
+            return $emTurno ? 'descanso' : 'fora';
+        }
+    }
+    return $emTurno ? 'dentro' : 'fora';
+}
+
+function schedule_summary_label(array $rows): string
+{
+    if (!$rows) {
+        return '24h';
+    }
+    $fmt = static function (array $r): string {
+        $s = time_input_value($r['start_time'] ?? null);
+        $e = time_input_value($r['end_time'] ?? null);
+        return ($s !== '' ? $s : '?') . '-' . ($e !== '' ? $e : '?');
+    };
+    $shifts = schedule_rows_by_kind($rows, 'shift');
+    $breaks = schedule_rows_by_kind($rows, 'break');
+    $label = $shifts ? implode(', ', array_map($fmt, $shifts)) : '24h';
+    if ($breaks) {
+        $label .= ' (descanso ' . implode(', ', array_map($fmt, $breaks)) . ')';
+    }
+    return $label;
+}
+
+/** Linhas do editor de janelas postadas (arrays paralelos sch_kind[]/sch_days[]/sch_start[]/sch_end[]). */
+function posted_schedule_rows(): array
+{
+    $kinds = (array) ($_POST['sch_kind'] ?? []);
+    $daysByRow = (array) ($_POST['sch_days'] ?? []);
+    $starts = (array) ($_POST['sch_start'] ?? []);
+    $ends = (array) ($_POST['sch_end'] ?? []);
+    $rows = [];
+    foreach ($kinds as $i => $kind) {
+        $start = trim((string) ($starts[$i] ?? ''));
+        $end = trim((string) ($ends[$i] ?? ''));
+        if ($start === '' || $end === '') {
+            continue; // linha em branco (nao preenchida ou removida no cliente)
+        }
+        $startHms = time_to_hms($start);
+        $endHms = time_to_hms($end);
+        if ($startHms === null || $endHms === null) {
+            continue;
+        }
+        $mask = max(0, min(127, (int) ($daysByRow[$i] ?? 127)));
+        if ($mask === 0) {
+            $mask = 127;
+        }
+        $rows[] = [
+            'kind' => ((string) $kind) === 'break' ? 'break' : 'shift',
+            'start_time' => $startHms,
+            'end_time' => $endHms,
+            'days_mask' => $mask,
+        ];
+        if (count($rows) > 20) {
+            break; // trava de bom senso: ninguem precisa de mais de 20 janelas por escopo
+        }
+    }
+    return $rows;
+}
+
+/** Substitui por completo as janelas de um escopo (time ou analista). `$address` vazio = default do time. */
+function save_schedule_rows(PDO $pdo, int $teamId, string $address, array $rows): void
+{
+    if ($address !== '') {
+        $pdo->prepare('DELETE FROM team_member_schedules WHERE team_id = ? AND address = ?')
+            ->execute([$teamId, $address]);
+    } else {
+        $pdo->prepare('DELETE FROM team_member_schedules WHERE team_id = ? AND address IS NULL')
+            ->execute([$teamId]);
+    }
+    $ins = $pdo->prepare(
+        'INSERT INTO team_member_schedules (team_id, address, kind, days_mask, start_time, end_time, sort_order)
+         VALUES (?, ?, ?, ?, ?, ?, ?)'
+    );
+    foreach ($rows as $i => $row) {
+        $ins->execute([
+            $teamId,
+            $address !== '' ? $address : null,
+            $row['kind'],
+            $row['days_mask'],
+            $row['start_time'],
+            $row['end_time'],
+            $i,
+        ]);
+    }
+}
+
+/** Janelas do time, agrupadas por analista (chave '' = default do time). Mesmo formato de `db.team_schedules`. */
+function team_schedules_map(PDO $pdo, int $teamId): array
+{
+    $st = $pdo->prepare(
+        'SELECT * FROM team_member_schedules WHERE team_id = ? AND active = 1 ORDER BY sort_order, id'
+    );
+    $st->execute([$teamId]);
+    $out = [];
+    foreach ($st->fetchAll() as $r) {
+        $out[(string) ($r['address'] ?? '')][] = $r;
+    }
+    return $out;
+}
+
+/** Editor repetivel de janelas (turno/descanso) de um escopo (time ou analista). */
+function echo_schedule_editor(string $tbodyId, array $rows): void
+{
+    if (!$rows) {
+        $rows = [['kind' => 'shift', 'start_time' => '', 'end_time' => '', 'days_mask' => 127]];
+    }
+    echo '<table class="table table-sm align-middle mb-2"><thead><tr>';
+    echo '<th style="width:7rem">Tipo</th><th>Dias</th><th style="width:7rem">Início</th>';
+    echo '<th style="width:7rem">Fim</th><th></th></tr></thead>';
+    echo '<tbody id="' . h($tbodyId) . '">';
+    foreach ($rows as $row) {
+        $mask = (int) ($row['days_mask'] ?? 127);
+        echo '<tr data-sch-row>';
+        echo '<td><select class="form-select form-select-sm" name="sch_kind[]" data-sch-kind>';
+        echo '<option value="shift"' . ((($row['kind'] ?? 'shift') === 'shift') ? ' selected' : '') . '>Turno</option>';
+        echo '<option value="break"' . ((($row['kind'] ?? 'shift') === 'break') ? ' selected' : '') . '>Descanso</option>';
+        echo '</select></td>';
+        echo '<td class="text-nowrap">';
+        foreach (SCHEDULE_DAY_LABELS as $i => $lbl) {
+            $checked = ($mask & (1 << $i)) ? ' checked' : '';
+            echo '<div class="form-check form-check-inline">';
+            echo '<input class="form-check-input" type="checkbox" data-sch-day="' . $i . '"' . $checked . '>';
+            echo '<label class="form-check-label small">' . h($lbl) . '</label></div>';
+        }
+        echo '<input type="hidden" name="sch_days[]" value="' . $mask . '" data-sch-mask>';
+        echo ' <button type="button" class="btn btn-link btn-sm p-0 small" data-sch-allday>todos</button>';
+        echo '</td>';
+        echo '<td><input class="form-control form-control-sm" type="time" name="sch_start[]"'
+            . ' value="' . h(time_input_value($row['start_time'] ?? null)) . '" data-sch-start></td>';
+        echo '<td><input class="form-control form-control-sm" type="time" name="sch_end[]"'
+            . ' value="' . h(time_input_value($row['end_time'] ?? null)) . '" data-sch-end></td>';
+        echo '<td><button type="button" class="btn btn-outline-danger btn-sm" data-sch-del>&times;</button></td>';
+        echo '</tr>';
+    }
+    echo '</tbody></table>';
+    echo '<button type="button" class="btn btn-outline-secondary btn-sm mb-2" data-sch-add="' . h($tbodyId) . '">+ janela</button>';
+    echo '<p class="text-muted small mb-2">Turno soma disponibilidade; descanso subtrai (bloqueia nova entrega, sem tirar o analista do atendimento em curso). Deixe horário em branco para remover a linha. Sem nenhum turno = 24h.</p>';
 }
 
 function action_select(string $name, string $current = '', bool $allowSubmenu = true): void
@@ -1394,6 +1532,14 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && $page !== 'login') {
         }
         if ($page === 'teams') {
             $tid = (int) ($_POST['team_id'] ?? 0);
+            $int_or_null = static function (string $key): ?int {
+                $raw = trim((string) ($_POST[$key] ?? ''));
+                return $raw === '' ? null : max((int) $raw, 0);
+            };
+            $flag_or_null = static function (string $key): ?int {
+                $raw = trim((string) ($_POST[$key] ?? ''));
+                return $raw === '' ? null : ($raw === '1' ? 1 : 0);
+            };
             if ($action === 'create') {
                 $name = trim((string) ($_POST['name'] ?? ''));
                 if ($name === '') {
@@ -1490,38 +1636,27 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && $page !== 'login') {
                         $name = (string) ($st->fetchColumn() ?: $addr);
                     }
                     $ord = (int) ($_POST['sort_order'] ?? 0);
-                    [$routeStart, $routeEnd, $timeErr] = posted_route_times();
-                    if ($timeErr) {
-                        $formError = $timeErr;
-                    } else {
-                        $pdo->prepare(
-                            'INSERT INTO team_members (team_id, address, name, sort_order, active, route_start, route_end)
-                             VALUES (?, ?, ?, ?, 1, ?, ?)
-                             ON CONFLICT (team_id, address) DO UPDATE
-                             SET name = COALESCE(NULLIF(excluded.name, \'\'), team_members.name),
-                                 sort_order = excluded.sort_order,
-                                 active = 1,
-                                 route_start = excluded.route_start,
-                                 route_end = excluded.route_end'
-                        )->execute([$tid, $addr, $name, $ord, $routeStart, $routeEnd]);
-                    }
+                    $pdo->prepare(
+                        'INSERT INTO team_members (team_id, address, name, sort_order, active)
+                         VALUES (?, ?, ?, ?, 1)
+                         ON CONFLICT (team_id, address) DO UPDATE
+                         SET name = COALESCE(NULLIF(excluded.name, \'\'), team_members.name),
+                             sort_order = excluded.sort_order,
+                             active = 1'
+                    )->execute([$tid, $addr, $name, $ord]);
                 }
             } elseif ($action === 'save_member' && $tid > 0) {
                 $addr = (string) ($_POST['address'] ?? '');
                 $name = trim((string) ($_POST['member_name'] ?? ''));
                 $ord = (int) ($_POST['sort_order'] ?? 0);
-                [$routeStart, $routeEnd, $timeErr] = posted_route_times();
                 if ($addr !== '' && addr_is_bot($addr, bot_own_address($pdo))) {
                     $formError = 'Este endereço é o PRÓPRIO bot — ele só repassa o atendimento e não pode ser operador.';
                 } elseif ($addr === '') {
                     $formError = 'Membro inválido.';
-                } elseif ($timeErr) {
-                    $formError = $timeErr;
                 } else {
                     $pdo->prepare(
-                        'UPDATE team_members SET name = ?, sort_order = ?, route_start = ?, route_end = ?
-                         WHERE team_id = ? AND address = ?'
-                    )->execute([$name, $ord, $routeStart, $routeEnd, $tid, $addr]);
+                        'UPDATE team_members SET name = ?, sort_order = ? WHERE team_id = ? AND address = ?'
+                    )->execute([$name, $ord, $tid, $addr]);
                 }
             } elseif ($action === 'toggle_member' && $tid > 0) {
                 $pdo->prepare('UPDATE team_members SET active = NOT active WHERE team_id = ? AND address = ?')
@@ -1529,18 +1664,135 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && $page !== 'login') {
             } elseif ($action === 'delete_member' && $tid > 0) {
                 $pdo->prepare('DELETE FROM team_members WHERE team_id = ? AND address = ?')
                     ->execute([$tid, (string) $_POST['address']]);
+            } elseif ($action === 'save_team_routing') {
+                $st = $pdo->prepare('SELECT 1 FROM teams WHERE id = ?');
+                $st->execute([$tid]);
+                if ($tid < 1 || !$st->fetchColumn()) {
+                    $formError = 'Time inválido.';
+                } else {
+                    $strategy = trim((string) ($_POST['strategy'] ?? ''));
+                    if (!in_array($strategy, ['', 'round_robin', 'priority', 'least_load'], true)) {
+                        $strategy = '';
+                    }
+                    $fallback = trim((string) ($_POST['fallback'] ?? ''));
+                    if (!in_array($fallback, ['', 'close', 'retry', 'monitor'], true)) {
+                        $fallback = '';
+                    }
+                    $memberKinds = (string) ($_POST['member_kinds'] ?? 'both');
+                    if (!in_array($memberKinds, ['both', 'chat', 'form'], true)) {
+                        $memberKinds = 'both';
+                    }
+                    $pdo->prepare(
+                        "INSERT INTO team_routing
+                           (team_id, strategy, cap_chat, cap_form, cap_cases, require_online, respect_window,
+                            attempts, retry_interval_sec, fallback, form_enabled, member_kinds, offline_requeue_sec,
+                            form_window_margin_min)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         ON CONFLICT (team_id) DO UPDATE SET
+                           strategy = excluded.strategy, cap_chat = excluded.cap_chat,
+                           cap_form = excluded.cap_form, cap_cases = excluded.cap_cases,
+                           require_online = excluded.require_online,
+                           respect_window = excluded.respect_window, attempts = excluded.attempts,
+                           retry_interval_sec = excluded.retry_interval_sec, fallback = excluded.fallback,
+                           form_enabled = excluded.form_enabled, member_kinds = excluded.member_kinds,
+                           offline_requeue_sec = excluded.offline_requeue_sec,
+                           form_window_margin_min = excluded.form_window_margin_min,
+                           updated_at = datetime('now')"
+                    )->execute([
+                        $tid,
+                        $strategy === '' ? null : $strategy,
+                        $int_or_null('cap_chat'),
+                        $int_or_null('cap_form'),
+                        $int_or_null('cap_cases'),
+                        $flag_or_null('require_online'),
+                        $flag_or_null('respect_window'),
+                        $int_or_null('attempts'),
+                        $int_or_null('retry_interval_sec'),
+                        $fallback === '' ? null : $fallback,
+                        ((string) ($_POST['form_enabled'] ?? '1')) === '1' ? 1 : 0,
+                        $memberKinds,
+                        $int_or_null('offline_requeue_sec'),
+                        $int_or_null('form_window_margin_min'),
+                    ]);
+                    // "Replicar para todos os operadores": limpa o ajuste individual
+                    // (NULL = herda o time) e, se pedido, o tipo individual tambem.
+                    $replicou = 0;
+                    if (((string) ($_POST['cases_all_members'] ?? '')) === '1') {
+                        $stRep = $pdo->prepare(
+                            'UPDATE team_member_routing SET cap_cases = NULL WHERE team_id = ?'
+                        );
+                        $stRep->execute([$tid]);
+                        $replicou += (int) $stRep->rowCount();
+                    }
+                    if (((string) ($_POST['kinds_all_members'] ?? '')) === '1') {
+                        $stRep = $pdo->prepare(
+                            'UPDATE team_member_routing SET kinds = ?, forms_enabled = ? WHERE team_id = ?'
+                        );
+                        $stRep->execute([$memberKinds, $memberKinds === 'chat' ? 0 : 1, $tid]);
+                        $replicou += (int) $stRep->rowCount();
+                    }
+                    if (((string) ($_POST['schedule_all_members'] ?? '')) === '1') {
+                        $stRep = $pdo->prepare('DELETE FROM team_member_schedules WHERE team_id = ? AND address IS NOT NULL');
+                        $stRep->execute([$tid]);
+                        $replicou += (int) $stRep->rowCount();
+                    }
+                    if ($replicou > 0) {
+                        $queueMsg = 'Ajustes replicados para os operadores do time ('
+                            . $replicou . ' linha(s) atualizada(s)).';
+                    }
+                }
+            } elseif ($action === 'reset_team_routing' && $tid > 0) {
+                $pdo->prepare('DELETE FROM team_routing WHERE team_id = ?')->execute([$tid]);
+            } elseif ($action === 'save_member_routing') {
+                $addr = trim((string) ($_POST['address'] ?? ''));
+                if ($tid < 1 || $addr === '') {
+                    $formError = 'Membro inválido.';
+                } else {
+                    $kindsMembro = (string) ($_POST['kinds'] ?? 'both');
+                    if (!in_array($kindsMembro, ['both', 'chat', 'form'], true)) {
+                        $kindsMembro = 'both';
+                    }
+                    $pdo->prepare(
+                        'INSERT INTO team_member_routing (team_id, address, weight, cap_chat, cap_form, cap_cases, forms_enabled, kinds)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                         ON CONFLICT (team_id, address) DO UPDATE SET
+                           weight = excluded.weight, cap_chat = excluded.cap_chat,
+                           cap_form = excluded.cap_form, cap_cases = excluded.cap_cases,
+                           forms_enabled = excluded.forms_enabled, kinds = excluded.kinds'
+                    )->execute([
+                        $tid,
+                        $addr,
+                        $int_or_null('weight') ?? 0,
+                        $int_or_null('cap_chat'),
+                        $int_or_null('cap_form'),
+                        $int_or_null('cap_cases'),
+                        $kindsMembro === 'chat' ? 0 : 1,
+                        $kindsMembro,
+                    ]);
+                }
+            } elseif ($action === 'reset_member_routing') {
+                $pdo->prepare('DELETE FROM team_member_routing WHERE team_id = ? AND address = ?')
+                    ->execute([$tid, (string) ($_POST['address'] ?? '')]);
+            } elseif ($action === 'save_team_schedules' && $tid > 0) {
+                save_schedule_rows($pdo, $tid, '', posted_schedule_rows());
+            } elseif ($action === 'save_member_schedules' && $tid > 0) {
+                $addr = trim((string) ($_POST['address'] ?? ''));
+                if ($addr === '') {
+                    $formError = 'Membro inválido.';
+                } else {
+                    save_schedule_rows($pdo, $tid, $addr, posted_schedule_rows());
+                }
+            } elseif ($action === 'apply_team_schedule_to_member' && $tid > 0) {
+                $addr = trim((string) ($_POST['address'] ?? ''));
+                if ($addr === '') {
+                    $formError = 'Membro inválido.';
+                } else {
+                    $pdo->prepare('DELETE FROM team_member_schedules WHERE team_id = ? AND address = ?')
+                        ->execute([$tid, $addr]);
+                }
             }
         }
         if ($page === 'routing') {
-            $rid = (int) ($_POST['team_id'] ?? 0);
-            $int_or_null = static function (string $key): ?int {
-                $raw = trim((string) ($_POST[$key] ?? ''));
-                return $raw === '' ? null : max((int) $raw, 0);
-            };
-            $flag_or_null = static function (string $key): ?int {
-                $raw = trim((string) ($_POST[$key] ?? ''));
-                return $raw === '' ? null : ($raw === '1' ? 1 : 0);
-            };
             if ($action === 'save_globals') {
                 $st = $pdo->prepare(
                     'INSERT INTO bot_settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value'
@@ -1681,110 +1933,6 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && $page !== 'login') {
                     )->execute([$cidR]);
                     $queueMsg = 'Caso liberado no ledger (motivo manual): a vaga volta a contar.';
                 }
-            } elseif ($action === 'save_team_routing') {
-                $st = $pdo->prepare('SELECT 1 FROM teams WHERE id = ?');
-                $st->execute([$rid]);
-                if ($rid < 1 || !$st->fetchColumn()) {
-                    $formError = 'Time inválido.';
-                } else {
-                    $strategy = trim((string) ($_POST['strategy'] ?? ''));
-                    if (!in_array($strategy, ['', 'round_robin', 'priority', 'least_load'], true)) {
-                        $strategy = '';
-                    }
-                    $fallback = trim((string) ($_POST['fallback'] ?? ''));
-                    if (!in_array($fallback, ['', 'close', 'retry', 'monitor'], true)) {
-                        $fallback = '';
-                    }
-                    $memberKinds = (string) ($_POST['member_kinds'] ?? 'both');
-                    if (!in_array($memberKinds, ['both', 'chat', 'form'], true)) {
-                        $memberKinds = 'both';
-                    }
-                    $pdo->prepare(
-                        "INSERT INTO team_routing
-                           (team_id, strategy, cap_chat, cap_form, cap_cases, require_online, respect_window,
-                            attempts, retry_interval_sec, fallback, form_enabled, member_kinds, offline_requeue_sec,
-                            form_window_margin_min)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                         ON CONFLICT (team_id) DO UPDATE SET
-                           strategy = excluded.strategy, cap_chat = excluded.cap_chat,
-                           cap_form = excluded.cap_form, cap_cases = excluded.cap_cases,
-                           require_online = excluded.require_online,
-                           respect_window = excluded.respect_window, attempts = excluded.attempts,
-                           retry_interval_sec = excluded.retry_interval_sec, fallback = excluded.fallback,
-                           form_enabled = excluded.form_enabled, member_kinds = excluded.member_kinds,
-                           offline_requeue_sec = excluded.offline_requeue_sec,
-                           form_window_margin_min = excluded.form_window_margin_min,
-                           updated_at = datetime('now')"
-                    )->execute([
-                        $rid,
-                        $strategy === '' ? null : $strategy,
-                        $int_or_null('cap_chat'),
-                        $int_or_null('cap_form'),
-                        $int_or_null('cap_cases'),
-                        $flag_or_null('require_online'),
-                        $flag_or_null('respect_window'),
-                        $int_or_null('attempts'),
-                        $int_or_null('retry_interval_sec'),
-                        $fallback === '' ? null : $fallback,
-                        ((string) ($_POST['form_enabled'] ?? '1')) === '1' ? 1 : 0,
-                        $memberKinds,
-                        $int_or_null('offline_requeue_sec'),
-                        $int_or_null('form_window_margin_min'),
-                    ]);
-                    // "Replicar para todos os operadores": limpa o ajuste individual
-                    // (NULL = herda o time) e, se pedido, o tipo individual tambem.
-                    $replicou = 0;
-                    if (((string) ($_POST['cases_all_members'] ?? '')) === '1') {
-                        $stRep = $pdo->prepare(
-                            'UPDATE team_member_routing SET cap_cases = NULL WHERE team_id = ?'
-                        );
-                        $stRep->execute([$rid]);
-                        $replicou += (int) $stRep->rowCount();
-                    }
-                    if (((string) ($_POST['kinds_all_members'] ?? '')) === '1') {
-                        $stRep = $pdo->prepare(
-                            'UPDATE team_member_routing SET kinds = ?, forms_enabled = ? WHERE team_id = ?'
-                        );
-                        $stRep->execute([$memberKinds, $memberKinds === 'chat' ? 0 : 1, $rid]);
-                        $replicou += (int) $stRep->rowCount();
-                    }
-                    if ($replicou > 0) {
-                        $queueMsg = 'Ajustes replicados para os operadores do time ('
-                            . $replicou . ' linha(s) atualizada(s)).';
-                    }
-                }
-            } elseif ($action === 'reset_team_routing' && $rid > 0) {
-                $pdo->prepare('DELETE FROM team_routing WHERE team_id = ?')->execute([$rid]);
-            } elseif ($action === 'save_member_routing') {
-                $addr = trim((string) ($_POST['address'] ?? ''));
-                if ($rid < 1 || $addr === '') {
-                    $formError = 'Membro inválido.';
-                } else {
-                    $kindsMembro = (string) ($_POST['kinds'] ?? 'both');
-                    if (!in_array($kindsMembro, ['both', 'chat', 'form'], true)) {
-                        $kindsMembro = 'both';
-                    }
-                    $pdo->prepare(
-                        'INSERT INTO team_member_routing (team_id, address, weight, cap_chat, cap_form, cap_cases, forms_enabled, kinds)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                         ON CONFLICT (team_id, address) DO UPDATE SET
-                           weight = excluded.weight, cap_chat = excluded.cap_chat,
-                           cap_form = excluded.cap_form, cap_cases = excluded.cap_cases,
-                           forms_enabled = excluded.forms_enabled, kinds = excluded.kinds'
-                    )->execute([
-                        $rid,
-                        $addr,
-                        $int_or_null('weight') ?? 0,
-                        $int_or_null('cap_chat'),
-                        $int_or_null('cap_form'),
-                        $int_or_null('cap_cases'),
-                        $kindsMembro === 'chat' ? 0 : 1,
-                        $kindsMembro,
-                    ]);
-                }
-            } elseif ($action === 'reset_member_routing') {
-                $pdo->prepare('DELETE FROM team_member_routing WHERE team_id = ? AND address = ?')
-                    ->execute([$rid, (string) ($_POST['address'] ?? '')]);
             }
         }
         if ($page === 'dashboard') {
@@ -2365,7 +2513,7 @@ if ($page === 'menus') {
 
 if ($page === 'teams') {
     echo '<h1 class="h3 mb-1">Times</h1>';
-    echo '<p class="text-muted">Plantão: pessoas + filas que o time atende. Na transferência o bot convida o próximo da rodada entre quem está <strong>ativo</strong>, dentro da janela de horário (Brasília), online no TOA e abaixo do cap (Ajustes). Horários vazios = 24h. <strong>22:00 a 06:00 atravessa a meia-noite</strong> (plantão da madrugada). Desative o membro em ausência. Uma fila só pode estar em um time.</p>';
+    echo '<p class="text-muted">Plantão: pessoas + filas que o time atende, com estratégia, capacidade, demanda atendida (chat/formulário/ambos) e janelas de turno e descanso — sempre herdando o padrão do time, salvo override por analista. Na transferência o bot convida o próximo da rodada entre quem está <strong>ativo</strong>, dentro da janela de horário (Brasília), online no TOA e abaixo do cap. Desative o membro em ausência. Uma fila só pode estar em um time. Detalhe do algoritmo de escolha em <a href="?page=routing">Roteamento</a>.</p>';
     if (!empty($formError)) {
         echo '<div class="alert alert-danger">' . h($formError) . '</div>';
     }
@@ -2411,6 +2559,27 @@ if ($page === 'teams') {
     foreach ($memRows as $r) {
         $byTeamM[(int) $r['team_id']][] = $r;
     }
+    // Ajustes de roteamento (herança global -> time -> analista), consolidados
+    // aqui: janela de trabalho, demanda atendida e capacidade por analista.
+    $map = [];
+    foreach ($pdo->query('SELECT key, value FROM bot_settings') as $r) {
+        $map[$r['key']] = $r['value'];
+    }
+    $trByTeam = [];
+    foreach ($pdo->query('SELECT * FROM team_routing') as $r) {
+        $trByTeam[(int) $r['team_id']] = $r;
+    }
+    $mrByTeam = [];
+    foreach ($pdo->query('SELECT * FROM team_member_routing') as $r) {
+        $mrByTeam[(int) $r['team_id']][(string) $r['address']] = $r;
+    }
+    $schByTeam = [];
+    foreach ($teams as $t) {
+        $schByTeam[(int) $t['id']] = team_schedules_map($pdo, (int) $t['id']);
+    }
+    $numOrNull = static function ($v): string {
+        return $v === null || $v === '' ? '' : (string) (int) $v;
+    };
     $openTeamId = 0;
     if (!empty($formError) && ($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
         $openTeamId = (int) ($_POST['team_id'] ?? 0);
@@ -2467,7 +2636,79 @@ if ($page === 'teams') {
             echo '<div class="alert alert-warning mt-3">Nenhum membro ativo. Filas deste time não terão quem receber na transferência.</div>';
         }
         echo_queues_card($csrf, 'team_id', $id, 'Filas deste time', $queues, $queueTeam, 'time');
-        echo '<form method="post" class="row g-2 align-items-end mb-3 p-2 border rounded bg-white">';
+
+        // Padrao do time: estrategia, capacidade e demanda atendida (herdado por
+        // todo analista sem override proprio) + janelas padrao do time.
+        $tr = $trByTeam[$id] ?? [];
+        echo '<h3 class="h6 mt-4">Padrão do time</h3>';
+        echo '<form method="post" class="row g-2 align-items-end p-2 border rounded bg-white">';
+        echo '<input type="hidden" name="csrf" value="' . h($csrf) . '">';
+        echo '<input type="hidden" name="action" value="save_team_routing"><input type="hidden" name="team_id" value="' . $id . '">';
+        echo '<div class="col-md-2"><label class="form-label">Estratégia</label><select class="form-select form-select-sm" name="strategy">';
+        $stratOpts = ['' => 'herda global', 'round_robin' => 'rodízio', 'priority' => 'prioridade (peso)', 'least_load' => 'menor carga'];
+        foreach ($stratOpts as $k => $l) {
+            echo '<option value="' . h($k) . '"' . (($tr['strategy'] ?? '') === $k ? ' selected' : '') . '>' . h($l) . '</option>';
+        }
+        echo '</select></div>';
+        echo '<div class="col-md-1"><label class="form-label">Cap chat</label><input class="form-control form-control-sm" type="number" min="0" name="cap_chat" value="' . h($numOrNull($tr['cap_chat'] ?? null)) . '" placeholder="' . h($map['max_open_chats_per_agent'] ?? '8') . '"></div>';
+        echo '<div class="col-md-1"><label class="form-label">Cap form</label><input class="form-control form-control-sm" type="number" min="0" name="cap_form" value="' . h($numOrNull($tr['cap_form'] ?? null)) . '" placeholder="' . h($map['max_open_forms_per_agent'] ?? '8') . '"></div>';
+        echo '<div class="col-md-1"><label class="form-label">Casos</label><input class="form-control form-control-sm" type="number" min="0" name="cap_cases" value="' . h($numOrNull($tr['cap_cases'] ?? null)) . '" placeholder="' . h($map['max_cases_per_agent'] ?? '4') . '" title="Casos simultaneos: formulario e chat do MESMO tecnico contam como um"></div>';
+        echo '<div class="col-md-1"><label class="form-label">Tent.</label><input class="form-control form-control-sm" type="number" min="1" name="attempts" value="' . h($numOrNull($tr['attempts'] ?? null)) . '" placeholder="' . h($map['transfer_attempts'] ?? '5') . '"></div>';
+        echo '<div class="col-md-1"><label class="form-label">Intervalo</label><input class="form-control form-control-sm" type="number" min="0" name="retry_interval_sec" value="' . h($numOrNull($tr['retry_interval_sec'] ?? null)) . '" placeholder="' . h($map['transfer_retry_interval_sec'] ?? '60') . '"></div>';
+        echo '<div class="col-md-1"><label class="form-label">Online</label><select class="form-select form-select-sm" name="require_online">';
+        foreach (['' => 'herda', '1' => 'exigir', '0' => 'ignorar'] as $k => $l) {
+            echo '<option value="' . h((string) $k) . '"' . ((string) ($tr['require_online'] ?? '') === $k ? ' selected' : '') . '>' . h($l) . '</option>';
+        }
+        echo '</select></div>';
+        echo '<div class="col-md-1"><label class="form-label">Plantão</label><select class="form-select form-select-sm" name="respect_window">';
+        foreach (['' => 'herda', '1' => 'respeitar', '0' => 'ignorar'] as $k => $l) {
+            echo '<option value="' . h((string) $k) . '"' . ((string) ($tr['respect_window'] ?? '') === $k ? ' selected' : '') . '>' . h($l) . '</option>';
+        }
+        echo '</select></div>';
+        echo '<div class="col-md-1"><label class="form-label">Sem ninguém</label><select class="form-select form-select-sm" name="fallback">';
+        $fbOpts = ['' => 'herda', 'retry' => 'repetir', 'monitor' => 'não insistir', 'close' => 'encerrar (chat)'];
+        foreach ($fbOpts as $k => $l) {
+            echo '<option value="' . h($k) . '"' . (($tr['fallback'] ?? '') === $k ? ' selected' : '') . '>' . h($l) . '</option>';
+        }
+        echo '</select></div>';
+        echo '<div class="col-md-1"><label class="form-label">Formulário</label><select class="form-select form-select-sm" name="form_enabled">';
+        foreach (['1' => 'recebe', '0' => 'não recebe'] as $k => $l) {
+            echo '<option value="' . h((string) $k) . '"' . ((string) (int) ($tr['form_enabled'] ?? 1) === $k ? ' selected' : '') . '>' . h($l) . '</option>';
+        }
+        echo '</select></div>';
+        echo '<div class="col-md-1"><label class="form-label">Offline</label><input class="form-control form-control-sm" type="number" min="0" name="offline_requeue_sec" value="' . h($numOrNull($tr['offline_requeue_sec'] ?? null)) . '" placeholder="' . h($map['offline_requeue_sec'] ?? '120') . '" title="Segundos offline antes de devolver o caso do operador para a fila (0 = este time nao devolve)"></div>';
+        echo '<div class="col-md-1"><label class="form-label">Fim janela</label><input class="form-control form-control-sm" type="number" min="0" name="form_window_margin_min" value="' . h($numOrNull($tr['form_window_margin_min'] ?? null)) . '" placeholder="' . h($map['form_window_margin_min'] ?? '10') . '" title="Minutos antes do fim do turno (ou do inicio do descanso) em que o formulário deixa de ser oferecido (vazio = herda o global; 0 = desligado)"></div>';
+        echo '<div class="col-md-2"><label class="form-label">Demanda padrão</label><select class="form-select form-select-sm" name="member_kinds">';
+        foreach (['both' => 'atende os dois', 'chat' => 'só chat', 'form' => 'só formulário'] as $k => $l) {
+            $atualMK = (string) ($tr['member_kinds'] ?? 'both');
+            if ($atualMK === '' || $atualMK === '0') {
+                $atualMK = 'both';
+            }
+            echo '<option value="' . h($k) . '"' . ($atualMK === $k ? ' selected' : '') . '>' . h($l) . '</option>';
+        }
+        echo '</select></div>';
+        echo '<div class="col-12"><p class="text-muted small mb-1 mt-2">Janelas padrão do time (herdadas por quem não tiver janela própria):</p></div>';
+        echo '<div class="col-12">';
+        echo_schedule_editor('sch-team-' . $id, $schByTeam[$id][''] ?? []);
+        echo '</div>';
+        echo '<div class="col-auto"><button class="btn btn-primary btn-sm">Salvar padrão do time</button></div>';
+        echo '<div class="col-12"><p class="text-muted small mb-0">Vazio = herda o global. <strong>Sem ninguém</strong>: no formulário, <em>repetir</em> tenta de novo a cada intervalo até o limite de tentativas e <em>não insistir</em> registra o evento e para; no chat, <em>encerrar</em> mantém o comportamento atual (bot sai) e <em>não insistir</em> deixa o chat em monitoramento. <strong>Casos</strong> conta solicitantes distintos: formulário e chat do <strong>mesmo autor</strong> são um caso só.</p>';
+        echo '<div class="form-check mt-2">';
+        echo '<input class="form-check-input" type="checkbox" name="cases_all_members" id="casesAllMembers' . $id . '" value="1">';
+        echo '<label class="form-check-label small" for="casesAllMembers' . $id . '">Replicar o <strong>Casos</strong> deste time para <strong>todos os operadores</strong> (limpa o cap de casos individual)</label></div>';
+        echo '<div class="form-check">';
+        echo '<input class="form-check-input" type="checkbox" name="kinds_all_members" id="kindsAllMembers' . $id . '" value="1">';
+        echo '<label class="form-check-label small" for="kindsAllMembers' . $id . '">Replicar a <strong>Demanda padrão</strong> para todos (limpa a demanda individual)</label></div>';
+        echo '<div class="form-check">';
+        echo '<input class="form-check-input" type="checkbox" name="schedule_all_members" id="schAllMembers' . $id . '" value="1">';
+        echo '<label class="form-check-label small" for="schAllMembers' . $id . '">Aplicar as <strong>janelas do time</strong> a todos os operadores (apaga as janelas individuais)</label></div>';
+        echo '</div>';
+        echo '</form>';
+        echo '<form method="post" class="mt-2"><input type="hidden" name="csrf" value="' . h($csrf) . '">';
+        echo '<input type="hidden" name="action" value="reset_team_routing"><input type="hidden" name="team_id" value="' . $id . '">';
+        echo '<button class="btn btn-outline-secondary btn-sm" onclick="return confirm(\'Limpar os ajustes deste time e voltar a herdar o global?\')">Limpar ajustes do time</button></form>';
+
+        echo '<form method="post" class="row g-2 align-items-end mb-3 mt-4 p-2 border rounded bg-white">';
         echo '<input type="hidden" name="csrf" value="' . h($csrf) . '">';
         echo '<input type="hidden" name="action" value="add_member"><input type="hidden" name="team_id" value="' . $id . '">';
         echo '<div class="col-12"><h3 class="h6 mb-0">Adicionar membro</h3></div>';
@@ -2478,53 +2719,84 @@ if ($page === 'teams') {
         }
         echo '</select></div>';
         echo '<div class="col-md-3"><label class="form-label">Ou address manual</label><input class="form-control form-control-sm" name="address" placeholder="u:F123@clarosa"></div>';
-        echo '<div class="col-md-2"><label class="form-label">Nome</label><input class="form-control form-control-sm" name="member_name" placeholder="Opcional"></div>';
-        echo '<div class="col-md-1"><label class="form-label">Ordem</label><input class="form-control form-control-sm" type="number" name="sort_order" value="0"></div>';
-        echo '<div class="col-md-1"><label class="form-label">Início</label><input class="form-control form-control-sm" type="time" name="route_start"></div>';
-        echo '<div class="col-md-1"><label class="form-label">Fim</label><input class="form-control form-control-sm" type="time" name="route_end"></div>';
+        echo '<div class="col-md-3"><label class="form-label">Nome</label><input class="form-control form-control-sm" name="member_name" placeholder="Opcional"></div>';
+        echo '<div class="col-md-2"><label class="form-label">Ordem</label><input class="form-control form-control-sm" type="number" name="sort_order" value="0"></div>';
         echo '<div class="col-auto"><button class="btn btn-primary btn-sm">Adicionar</button></div>';
-        echo '<div class="col-12"><p class="text-muted small mb-0">Vazio nos dois horários = 24h. Preencha os dois para limitar o plantão. 22:00 a 06:00 atravessa a meia-noite (plantão da madrugada).</p></div>';
+        echo '<div class="col-12"><p class="text-muted small mb-0">O analista nasce herdando o padrão do time (janela, demanda e capacidade). Ajuste individualmente depois, na tabela abaixo.</p></div>';
         echo '</form>';
+
         echo '<h3 class="h6">Membros</h3>';
         echo '<div class="table-responsive"><table class="table table-sm table-hover align-middle bg-white">';
-        echo '<thead><tr><th>Ordem</th><th>Nome</th><th>Address</th><th>Janela</th><th>Status</th><th>Agora</th><th></th></tr></thead><tbody>';
+        echo '<thead><tr><th>Ordem</th><th>Nome</th><th>Address</th><th>Demanda</th><th>Janela</th><th>Status</th><th>Agora</th><th></th></tr></thead><tbody>';
         foreach ($members as $mem) {
+            $addr = (string) $mem['address'];
             $memOn = bool_on($mem['active']);
-            $inWin = member_in_route_window($mem['route_start'] ?? null, $mem['route_end'] ?? null);
-            $startVal = time_input_value($mem['route_start'] ?? null);
-            $endVal = time_input_value($mem['route_end'] ?? null);
-            $is24h = $startVal === '' && $endVal === '';
-            echo '<form method="post" class="d-contents">';
-            echo '<tr>';
-            echo '<td style="width:5rem"><input type="hidden" name="csrf" value="' . h($csrf) . '">';
-            echo '<input type="hidden" name="team_id" value="' . $id . '">';
-            echo '<input type="hidden" name="address" value="' . h($mem['address']) . '">';
-            echo '<input class="form-control form-control-sm" type="number" name="sort_order" value="' . (int) $mem['sort_order'] . '"></td>';
-            echo '<td><input class="form-control form-control-sm" name="member_name" value="' . h($mem['name']) . '"></td>';
-            echo '<td><code>' . h($mem['address']) . '</code></td>';
-            echo '<td style="min-width:11rem"><div class="d-flex gap-1">';
-            echo '<input class="form-control form-control-sm" type="time" name="route_start" value="' . h($startVal) . '">';
-            echo '<input class="form-control form-control-sm" type="time" name="route_end" value="' . h($endVal) . '">';
-            echo '</div>';
-            if ($is24h) {
-                echo '<div class="form-text mt-0">24h</div>';
-            } elseif (route_crosses_midnight($mem['route_start'] ?? null, $mem['route_end'] ?? null)) {
-                echo '<div class="form-text mt-0">atravessa meia-noite</div>';
+            $mr = $mrByTeam[$id][$addr] ?? [];
+            $ownRows = $schByTeam[$id][$addr] ?? [];
+            $effRows = $ownRows ?: ($schByTeam[$id][''] ?? []);
+            $estado = $memOn ? schedule_state($effRows) : 'fora';
+            $rowId = 'mem-' . $id . '-' . substr(md5($addr), 0, 10);
+            $kindsAtual = (string) ($mr['kinds'] ?? '');
+            if (!in_array($kindsAtual, ['both', 'chat', 'form'], true)) {
+                $kindsAtual = ((string) (int) ($mr['forms_enabled'] ?? 1)) === '0' ? 'chat' : 'both';
             }
-            echo '</td>';
+            $demandaLbl = ['both' => 'ambos', 'form' => 'formulário', 'chat' => 'só chat'][$kindsAtual] ?? 'ambos';
+            echo '<tr>';
+            echo '<td style="width:4rem">' . (int) $mem['sort_order'] . '</td>';
+            echo '<td>' . h($mem['name'] ?: $addr) . '</td>';
+            echo '<td><code class="small">' . h($addr) . '</code></td>';
+            echo '<td>' . h($demandaLbl) . ($ownRows === [] && !$mr ? '' : '') . '</td>';
+            echo '<td>' . h(schedule_summary_label($effRows)) . ($ownRows ? '' : ' <span class="text-muted small">(padrão do time)</span>') . '</td>';
             echo '<td>' . badge_state($memOn) . '</td>';
             echo '<td>';
             if ($memOn) {
-                echo badge_state($inWin, 'na janela', 'fora do horário');
+                $stLbl = ['dentro' => 'na janela', 'descanso' => 'descanso', 'fora' => 'fora do horário'][$estado] ?? $estado;
+                $stCls = $estado === 'dentro' ? 'text-bg-success' : ($estado === 'descanso' ? 'text-bg-warning' : 'text-bg-secondary');
+                echo '<span class="badge ' . $stCls . '">' . h($stLbl) . '</span>';
             } else {
                 echo '—';
             }
             echo '</td>';
             echo '<td class="text-nowrap">';
-            echo '<button class="btn btn-primary btn-sm me-1" name="action" value="save_member">Salvar</button>';
-            echo '<button class="btn btn-outline-secondary btn-sm me-1" name="action" value="toggle_member">' . ($memOn ? 'Desativar' : 'Ativar') . '</button>';
-            echo '<button class="btn btn-outline-danger btn-sm" name="action" value="delete_member" onclick="return confirm(\'Remover este membro?\')">Remover</button>';
-            echo '</td></tr></form>';
+            echo '<button class="btn btn-outline-primary btn-sm" type="button" data-bs-toggle="collapse" data-bs-target="#' . $rowId . '">Editar</button>';
+            echo '</td></tr>';
+
+            echo '<tr class="collapse" id="' . $rowId . '"><td colspan="8" class="bg-light">';
+            echo '<form method="post" class="row g-2 align-items-end mb-2"><input type="hidden" name="csrf" value="' . h($csrf) . '">';
+            echo '<input type="hidden" name="action" value="save_member"><input type="hidden" name="team_id" value="' . $id . '">';
+            echo '<input type="hidden" name="address" value="' . h($addr) . '">';
+            echo '<div class="col-md-3"><label class="form-label">Nome</label><input class="form-control form-control-sm" name="member_name" value="' . h($mem['name']) . '"></div>';
+            echo '<div class="col-md-2"><label class="form-label">Ordem</label><input class="form-control form-control-sm" type="number" name="sort_order" value="' . (int) $mem['sort_order'] . '"></div>';
+            echo '<div class="col-auto"><button class="btn btn-primary btn-sm">Salvar nome/ordem</button></div>';
+            echo '<div class="col-auto"><button class="btn btn-outline-secondary btn-sm" name="action" value="toggle_member">' . ($memOn ? 'Desativar' : 'Ativar') . '</button></div>';
+            echo '<div class="col-auto"><button class="btn btn-outline-danger btn-sm" name="action" value="delete_member" onclick="return confirm(\'Remover este membro?\')">Remover</button></div>';
+            echo '</form>';
+
+            echo '<form method="post" class="row g-2 align-items-end mb-2"><input type="hidden" name="csrf" value="' . h($csrf) . '">';
+            echo '<input type="hidden" name="action" value="save_member_routing"><input type="hidden" name="team_id" value="' . $id . '">';
+            echo '<input type="hidden" name="address" value="' . h($addr) . '">';
+            echo '<div class="col-md-2"><label class="form-label">Peso</label><input class="form-control form-control-sm" type="number" name="weight" value="' . h((string) (int) ($mr['weight'] ?? 0)) . '" title="Maior peso é titular na estratégia Prioridade"></div>';
+            echo '<div class="col-md-2"><label class="form-label">Cap chat</label><input class="form-control form-control-sm" type="number" min="0" name="cap_chat" value="' . h($numOrNull($mr['cap_chat'] ?? null)) . '" placeholder="' . h((string) ($tr['cap_chat'] ?? ($map['max_open_chats_per_agent'] ?? '8'))) . '"></div>';
+            echo '<div class="col-md-2"><label class="form-label">Cap form</label><input class="form-control form-control-sm" type="number" min="0" name="cap_form" value="' . h($numOrNull($mr['cap_form'] ?? null)) . '" placeholder="' . h((string) ($tr['cap_form'] ?? ($map['max_open_forms_per_agent'] ?? '8'))) . '"></div>';
+            echo '<div class="col-md-2"><label class="form-label">Casos</label><input class="form-control form-control-sm" type="number" min="0" name="cap_cases" value="' . h($numOrNull($mr['cap_cases'] ?? null)) . '" placeholder="' . h((string) ($tr['cap_cases'] ?? ($map['max_cases_per_agent'] ?? '4'))) . '"></div>';
+            echo '<div class="col-md-2"><label class="form-label">Atende</label><select class="form-select form-select-sm" name="kinds">';
+            foreach (['both' => 'ambos', 'form' => 'formulário', 'chat' => 'só chat'] as $k => $l) {
+                echo '<option value="' . h($k) . '"' . ($kindsAtual === $k ? ' selected' : '') . '>' . h($l) . '</option>';
+            }
+            echo '</select></div>';
+            echo '<div class="col-auto"><button class="btn btn-primary btn-sm">Salvar</button></div>';
+            echo '<div class="col-auto"><button class="btn btn-outline-secondary btn-sm" name="action" value="reset_member_routing" onclick="return confirm(\'Limpar peso/cap/demanda deste analista e voltar a herdar do time?\')">Limpar (herdar do time)</button></div>';
+            echo '</form>';
+
+            echo '<form method="post" class="mb-1"><input type="hidden" name="csrf" value="' . h($csrf) . '">';
+            echo '<input type="hidden" name="action" value="save_member_schedules"><input type="hidden" name="team_id" value="' . $id . '">';
+            echo '<input type="hidden" name="address" value="' . h($addr) . '">';
+            echo '<p class="small text-muted mb-1">Janelas próprias deste analista (substituem — não somam com — o padrão do time):</p>';
+            echo_schedule_editor('sch-mem-' . $rowId, $ownRows);
+            echo '<button class="btn btn-primary btn-sm">Salvar janelas do analista</button> ';
+            echo '<button class="btn btn-outline-secondary btn-sm" name="action" value="apply_team_schedule_to_member" onclick="return confirm(\'Remover as janelas proprias e voltar a herdar o padrao do time?\')">Aplicar o padrão do time</button>';
+            echo '</form>';
+            echo '</td></tr>';
         }
         echo '</tbody></table></div>';
         if (!$members) {
@@ -2540,7 +2812,7 @@ if ($page === 'teams') {
 
 if ($page === 'routing') {
     echo '<h1 class="h3 mb-1">Roteamento</h1>';
-    echo '<p class="text-muted">Ajuste o comportamento global e acompanhe/opere a fila de espera abaixo. Ajustes por time, pesos por operador e o detalhe de como a carga, a herança e a escolha do analista funcionam ficam em <a href="#avancado-body">Avançado</a>, no fim da página.</p>';
+    echo '<p class="text-muted">Ajuste o comportamento global e acompanhe/opere a fila de espera abaixo. Ajustes por time e por analista (estratégia, capacidade, demanda atendida e janelas) ficam na aba <a href="?page=teams">Times</a>; o detalhe de como a escolha do analista funciona está no fim desta página.</p>';
     if (!empty($formError)) {
         echo '<div class="alert alert-danger">' . h($formError) . '</div>';
     }
@@ -2820,192 +3092,20 @@ if ($page === 'routing') {
     echo '</div>'; // fim tab-casos
     echo '</div>'; // fim tab-content
     echo '</div></div>'; // fim card-body, card "Administração da fila"
-    $teamParams2 = [];
-    $teamWhere2 = bot_scope_team_where($pdo, 'id', $teamParams2);
-    $stTeam2 = $pdo->prepare('SELECT * FROM teams WHERE 1 = 1' . $teamWhere2 . ' ORDER BY name');
-    $stTeam2->execute($teamParams2);
-    $teams = $stTeam2->fetchAll();
-    $tqRows = $pdo->query(
-        'SELECT tq.team_id, tq.queue_address, q.name AS queue_name FROM team_queues tq
-         LEFT JOIN queues q ON q.address = tq.queue_address ORDER BY tq.queue_address'
-    )->fetchAll();
-    $byTeamQ = [];
-    foreach ($tqRows as $r) {
-        $byTeamQ[(int) $r['team_id']][] = $r;
-    }
-    $trByTeam = [];
-    foreach ($pdo->query('SELECT * FROM team_routing') as $r) {
-        $trByTeam[(int) $r['team_id']] = $r;
-    }
-    $mrByTeam = [];
-    foreach ($pdo->query('SELECT * FROM team_member_routing') as $r) {
-        $mrByTeam[(int) $r['team_id']][(string) $r['address']] = $r;
-    }
-    $numOrNull = static function ($v): string {
-        return $v === null || $v === '' ? '' : (string) (int) $v;
-    };
-    echo '<div class="mt-4">';
-    echo '<button class="btn btn-outline-secondary" type="button" data-bs-toggle="collapse" data-bs-target="#avancado-body" aria-expanded="false" aria-controls="avancado-body">';
-    echo 'Avançado (ajustes por time, peso dos operadores e detalhe do algoritmo)</button></div>';
-    echo '<div class="collapse mt-2" id="avancado-body"><div class="card"><div class="card-body">';
-    echo '<h2 class="h5">Ajustes por time</h2>';
-    if (!$teams) {
-        echo '<p class="text-muted">Nenhum time ainda. Crie o plantão na aba <a href="?page=teams">Times</a>.</p>';
-    }
-    echo '<div class="accordion" id="routing-acc">';
-    foreach ($teams as $t) {
-        $id = (int) $t['id'];
-        $tr = $trByTeam[$id] ?? [];
-        $show = '';
-        $collapsed = ' collapsed';
-        $filas = $byTeamQ[$id] ?? [];
-        echo '<div class="accordion-item" id="team-' . $id . '">';
-        echo '<h3 class="accordion-header"><button class="accordion-button' . $collapsed . '" type="button" data-bs-toggle="collapse" data-bs-target="#rt-' . $id . '" aria-expanded="' . ($show ? 'true' : 'false') . '">';
-        echo h($t['name']) . ' ' . badge_state(bool_on($t['active']));
-        echo ' <span class="badge text-bg-light ms-2">' . count($filas) . ' filas</span>';
-        if ((int) ($tr['form_enabled'] ?? 1) !== 1) {
-            echo ' <span class="badge text-bg-warning ms-1">sem formulário</span>';
-        }
-        echo '</button></h3>';
-        echo '<div id="rt-' . $id . '" class="accordion-collapse collapse' . $show . '" data-bs-parent="#routing-acc">';
-        echo '<div class="accordion-body">';
-        if ($filas) {
-            $nomes = [];
-            foreach ($filas as $f) {
-                $nomes[] = '<code>' . h($f['queue_name'] ?: $f['queue_address']) . '</code>';
-            }
-            echo '<p class="small text-muted mb-2">Filas: ' . implode(', ', $nomes) . ' — <a href="?page=teams#team-' . $id . '">marcar/desmarcar na aba Times</a>.</p>';
-        } else {
-            echo '<p class="small text-muted mb-2">Sem filas: nenhum chat ou formulário vai para este time. <a href="?page=teams#team-' . $id . '">Marcar filas na aba Times</a>.</p>';
-        }
-        echo '<form method="post" class="row g-2 align-items-end"><input type="hidden" name="csrf" value="' . h($csrf) . '">';
-        echo '<input type="hidden" name="action" value="save_team_routing"><input type="hidden" name="team_id" value="' . $id . '">';
-        echo '<div class="col-md-2"><label class="form-label">Estratégia</label><select class="form-select form-select-sm" name="strategy">';
-        $stratOpts = ['' => 'herda global', 'round_robin' => 'rodízio', 'priority' => 'prioridade (peso)', 'least_load' => 'menor carga'];
-        foreach ($stratOpts as $k => $l) {
-            echo '<option value="' . h($k) . '"' . (($tr['strategy'] ?? '') === $k ? ' selected' : '') . '>' . h($l) . '</option>';
-        }
-        echo '</select></div>';
-        echo '<div class="col-md-1"><label class="form-label">Cap chat</label><input class="form-control form-control-sm" type="number" min="0" name="cap_chat" value="' . h($numOrNull($tr['cap_chat'] ?? null)) . '" placeholder="' . h($map['max_open_chats_per_agent'] ?? '8') . '"></div>';
-        echo '<div class="col-md-1"><label class="form-label">Cap form</label><input class="form-control form-control-sm" type="number" min="0" name="cap_form" value="' . h($numOrNull($tr['cap_form'] ?? null)) . '" placeholder="' . h($map['max_open_forms_per_agent'] ?? '8') . '"></div>';
-        echo '<div class="col-md-1"><label class="form-label">Casos</label><input class="form-control form-control-sm" type="number" min="0" name="cap_cases" value="' . h($numOrNull($tr['cap_cases'] ?? null)) . '" placeholder="' . h($map['max_cases_per_agent'] ?? '4') . '" title="Casos simultaneos: formulario e chat do MESMO tecnico contam como um"></div>';
-        echo '<div class="col-md-1"><label class="form-label">Tent.</label><input class="form-control form-control-sm" type="number" min="1" name="attempts" value="' . h($numOrNull($tr['attempts'] ?? null)) . '" placeholder="' . h($map['transfer_attempts'] ?? '5') . '"></div>';
-        echo '<div class="col-md-1"><label class="form-label">Intervalo</label><input class="form-control form-control-sm" type="number" min="0" name="retry_interval_sec" value="' . h($numOrNull($tr['retry_interval_sec'] ?? null)) . '" placeholder="' . h($map['transfer_retry_interval_sec'] ?? '60') . '"></div>';
-        echo '<div class="col-md-1"><label class="form-label">Online</label><select class="form-select form-select-sm" name="require_online">';
-        foreach (['' => 'herda', '1' => 'exigir', '0' => 'ignorar'] as $k => $l) {
-            echo '<option value="' . h((string) $k) . '"' . ((string) ($tr['require_online'] ?? '') === $k ? ' selected' : '') . '>' . h($l) . '</option>';
-        }
-        echo '</select></div>';
-        echo '<div class="col-md-1"><label class="form-label">Plantão</label><select class="form-select form-select-sm" name="respect_window">';
-        foreach (['' => 'herda', '1' => 'respeitar', '0' => 'ignorar'] as $k => $l) {
-            echo '<option value="' . h((string) $k) . '"' . ((string) ($tr['respect_window'] ?? '') === $k ? ' selected' : '') . '>' . h($l) . '</option>';
-        }
-        echo '</select></div>';
-        echo '<div class="col-md-1"><label class="form-label">Sem ninguém</label><select class="form-select form-select-sm" name="fallback">';
-        $fbOpts = ['' => 'herda', 'retry' => 'repetir', 'monitor' => 'não insistir', 'close' => 'encerrar (chat)'];
-        foreach ($fbOpts as $k => $l) {
-            echo '<option value="' . h($k) . '"' . (($tr['fallback'] ?? '') === $k ? ' selected' : '') . '>' . h($l) . '</option>';
-        }
-        echo '</select></div>';
-        echo '<div class="col-md-1"><label class="form-label">Formulário</label><select class="form-select form-select-sm" name="form_enabled">';
-        foreach (['1' => 'recebe', '0' => 'não recebe'] as $k => $l) {
-            echo '<option value="' . h((string) $k) . '"' . ((string) (int) ($tr['form_enabled'] ?? 1) === $k ? ' selected' : '') . '>' . h($l) . '</option>';
-        }
-        echo '</select></div>';
-        echo '<div class="col-md-1"><label class="form-label">Offline</label><input class="form-control form-control-sm" type="number" min="0" name="offline_requeue_sec" value="' . h($numOrNull($tr['offline_requeue_sec'] ?? null)) . '" placeholder="' . h($map['offline_requeue_sec'] ?? '120') . '" title="Segundos offline antes de devolver o caso do operador para a fila (0 = este time nao devolve)"></div>';
-        echo '<div class="col-md-1"><label class="form-label">Fim janela</label><input class="form-control form-control-sm" type="number" min="0" name="form_window_margin_min" value="' . h($numOrNull($tr['form_window_margin_min'] ?? null)) . '" placeholder="' . h($map['form_window_margin_min'] ?? '10') . '" title="Minutos antes do fim da janela do operador em que o formulário deixa de ser oferecido (vazio = herda o global; 0 = desligado)"></div>';
-        echo '<div class="col-md-2"><label class="form-label">Padrão dos operadores</label><select class="form-select form-select-sm" name="member_kinds">';
-        foreach (['both' => 'atende os dois', 'chat' => 'só chat', 'form' => 'só formulário'] as $k => $l) {
-            $atualMK = (string) ($tr['member_kinds'] ?? 'both');
-            if ($atualMK === '' || $atualMK === '0') {
-                $atualMK = 'both';
-            }
-            echo '<option value="' . h($k) . '"' . ($atualMK === $k ? ' selected' : '') . '>' . h($l) . '</option>';
-        }
-        echo '</select></div>';
-        echo '<div class="col-auto"><button class="btn btn-primary btn-sm">Salvar</button></div>';
-        echo '<div class="col-12"><p class="text-muted small mb-0">Vazio = herda o global. <strong>Sem ninguém</strong>: no formulário, <em>repetir</em> tenta de novo a cada intervalo até o limite de tentativas e <em>não insistir</em> registra o evento e para; no chat, <em>encerrar</em> mantém o comportamento atual (bot sai) e <em>não insistir</em> deixa o chat em monitoramento. <strong>Casos</strong> conta solicitantes distintos: formulário e chat do <strong>mesmo autor</strong> são um caso só, e é esse número (não a soma de itens) que a escolha do analista usa.</p>';
-        echo '<div class="form-check mt-2">';
-        echo '<input class="form-check-input" type="checkbox" name="cases_all_members" id="casesAllMembers' . $id . '" value="1">';
-        echo '<label class="form-check-label small" for="casesAllMembers' . $id . '">Replicar o <strong>Casos</strong> deste time para <strong>todos os operadores</strong> (limpa o cap de casos individual)</label></div>';
-        echo '<div class="form-check">';
-        echo '<input class="form-check-input" type="checkbox" name="kinds_all_members" id="kindsAllMembers' . $id . '" value="1">';
-        echo '<label class="form-check-label small" for="kindsAllMembers' . $id . '">Replicar o <strong>Padrão dos operadores</strong> para todos (limpa o tipo individual)</label></div>';
-        echo '</div>';
-        echo '</form>';
-        echo '<form method="post" class="mt-2"><input type="hidden" name="csrf" value="' . h($csrf) . '">';
-        echo '<input type="hidden" name="action" value="reset_team_routing"><input type="hidden" name="team_id" value="' . $id . '">';
-        echo '<button class="btn btn-outline-secondary btn-sm" onclick="return confirm(\'Limpar os ajustes deste time e voltar a herdar o global?\')">Limpar ajustes do time</button></form>';
-        $stM = $pdo->prepare('SELECT * FROM team_members WHERE team_id = ? ORDER BY sort_order, name, address');
-        $stM->execute([$id]);
-        $mRows = $stM->fetchAll();
-        $ultC = trim((string) ($tr['last_assigned_chat'] ?? ($t['last_assigned'] ?? '')));
-        $ultF = trim((string) ($tr['last_assigned_form'] ?? ''));
-        echo '<p class="small text-muted mb-2">Última atribuição — chat: <code>' . h($ultC !== '' ? $ultC : '—') . '</code>; formulário: <code>' . h($ultF !== '' ? $ultF : '—') . '</code>.</p>';
-        echo '<h4 class="h6 mt-3">Membros e prioridade</h4>';
-        if (!$mRows) {
-            echo '<p class="text-muted small">Sem membros. Adicione na aba <a href="?page=teams#team-' . $id . '">Times</a>.</p>';
-        } else {
-            echo '<div class="table-responsive"><table class="table table-sm table-hover align-middle bg-white">';
-            echo '<thead><tr><th>Ordem</th><th>Nome</th><th>Peso</th><th>Cap chat</th><th>Cap form</th><th>Casos</th><th>Atende</th><th>Plantão agora</th><th></th></tr></thead><tbody>';
-            foreach ($mRows as $mem) {
-                $addr = (string) $mem['address'];
-                $mr = $mrByTeam[$id][$addr] ?? [];
-                $naJanela = member_in_route_window($mem['route_start'] ?? null, $mem['route_end'] ?? null);
-                echo '<form method="post" class="d-contents">';
-                echo '<tr>';
-                echo '<td>' . (int) $mem['sort_order'] . '<input type="hidden" name="csrf" value="' . h($csrf) . '"><input type="hidden" name="action" value="save_member_routing"><input type="hidden" name="team_id" value="' . $id . '"><input type="hidden" name="address" value="' . h($addr) . '"></td>';
-                echo '<td>' . h($mem['name'] ?: $addr) . ' ' . badge_state(bool_on($mem['active'])) . '<br><code class="small">' . h($addr) . '</code></td>';
-                echo '<td style="width:6rem"><input class="form-control form-control-sm" type="number" name="weight" value="' . h((string) (int) ($mr['weight'] ?? 0)) . '" title="Maior peso é titular na estratégia Prioridade"></td>';
-                echo '<td style="width:6rem"><input class="form-control form-control-sm" type="number" min="0" name="cap_chat" value="' . h($numOrNull($mr['cap_chat'] ?? null)) . '" placeholder="' . h((string) ($tr['cap_chat'] ?? ($map['max_open_chats_per_agent'] ?? '8'))) . '"></td>';
-                echo '<td style="width:6rem"><input class="form-control form-control-sm" type="number" min="0" name="cap_form" value="' . h($numOrNull($mr['cap_form'] ?? null)) . '" placeholder="' . h((string) ($tr['cap_form'] ?? ($map['max_open_forms_per_agent'] ?? '8'))) . '"></td>';
-                echo '<td style="width:6rem"><input class="form-control form-control-sm" type="number" min="0" name="cap_cases" value="' . h($numOrNull($mr['cap_cases'] ?? null)) . '" placeholder="' . h((string) ($tr['cap_cases'] ?? ($map['max_cases_per_agent'] ?? '4'))) . '"></td>';
-                $kindsAtual = (string) ($mr['kinds'] ?? '');
-                if (!in_array($kindsAtual, ['both', 'chat', 'form'], true)) {
-                    $kindsAtual = ((string) (int) ($mr['forms_enabled'] ?? 1)) === '0' ? 'chat' : 'both';
-                }
-                echo '<td style="width:9rem"><select class="form-select form-select-sm" name="kinds">';
-                foreach (['both' => 'ambos', 'form' => 'formulário', 'chat' => 'só chat'] as $k => $l) {
-                    echo '<option value="' . h($k) . '"' . ($kindsAtual === $k ? ' selected' : '') . '>' . h($l) . '</option>';
-                }
-                echo '</select></td>';
-                echo '<td>' . badge_state($naJanela, 'na janela', 'fora') . '</td>';
-                echo '<td class="text-nowrap"><button class="btn btn-primary btn-sm me-1">Salvar</button>';
-                echo '<button class="btn btn-outline-secondary btn-sm" name="action" value="reset_member_routing" onclick="return confirm(\'Limpar peso/cap deste membro e voltar a herdar?\')">Limpar</button></td>';
-                echo '</tr></form>';
-            }
-            echo '</tbody></table></div>';
-            $naJanelaN = 0;
-            $ativosN = 0;
-            foreach ($mRows as $mem) {
-                if (!bool_on($mem['active'])) {
-                    continue;
-                }
-                $ativosN++;
-                if (member_in_route_window($mem['route_start'] ?? null, $mem['route_end'] ?? null)) {
-                    $naJanelaN++;
-                }
-            }
-            echo '<p class="small text-muted mb-0">Agora: <strong>' . $naJanelaN . '</strong> de ' . count($mRows) . ' membro(s) dentro da janela de plantão, ' . $ativosN . ' ativo(s). A escolha final ainda considera online no TOA, cap e carga do momento.</p>';
-        }
-        echo '</div></div></div>';
-    }
-    echo '</div>';
-    echo '<div class="card mt-3"><div class="card-body">';
+    echo '<div class="card mt-4"><div class="card-body">';
     echo '<h2 class="h6">Como a escolha é feita (ordem exata)</h2>';
     echo '<ol class="small mb-2">';
-    echo '<li><strong>Time da fila</strong> — 1 fila pertence a 1 time (aba Times). O formulário de validação usa o mesmo time da fila dele e não é um chat de menu.</li>';
+    echo '<li><strong>Time da fila</strong> — 1 fila pertence a 1 time (aba <a href="?page=teams">Times</a>). O formulário de validação usa o mesmo time da fila dele e não é um chat de menu.</li>';
     echo '<li><strong>Membros ativos</strong>, na ordem definida pelo campo <em>Ordem</em> na aba Times.</li>';
-    echo '<li><strong>Janela de plantão</strong> do membro (horário de Brasília). Vazio ou início = fim valem 24h; 22:00–06:00 atravessa a meia-noite.</li>';
+    echo '<li><strong>Janela de turno/descanso</strong> do membro (horário de Brasília), herdada do padrão do time salvo override próprio: sem nenhum turno cadastrado vale 24h; 22:00–06:00 atravessa a meia-noite; descanso suspende só a entrega de item novo.</li>';
     echo '<li><strong>Online no TOA</strong> quando <em>Online</em> = exigir. É consultado a cada transferência.</li>';
-    echo '<li><strong>Cap</strong> (membro → time → global) contando chats/formulários em que o analista já está.</li>';
+    echo '<li><strong>Cap</strong> (analista → time → global) contando chats/formulários em que o analista já está.</li>';
     echo '<li><strong>Estratégia</strong>: <em>rodízio</em> pega o próximo depois do último escolhido; <em>prioridade</em> pega o maior peso (no empate, o rodízio, e se o titular estiver no cap cai para o próximo); <em>menor carga</em> pega quem tem menos atendimentos, desempatando por peso e rodízio.</li>';
     echo '</ol>';
     echo '<p class="small text-muted mb-2">No chat, o bot espera o online até o limite de tentativas e então aplica o fallback. No formulário, cada tentativa é agendada em segundo plano (intervalo do formulário), então o atendimento não fica esperando; ao esgotar as tentativas, fica registrado no log. O bot nunca entra nem encerra o formulário.</p>';
     echo '<p class="small text-muted mb-0">Eventos gerados na aba <a href="?page=activity">Atividade</a>: <code>form_routed</code> (entregue), <code>form_no_agent</code> (sem analista), <code>form_route_retry</code> (nova tentativa), <code>form_no_team</code> (fila sem time ou time sem formulário), <code>form_no_queue</code> (formulário sem fila) e <code>closure</code> (formulário recebido).</p>';
-    echo '<p class="small text-muted mb-0 mt-3"><strong>Carga = casos</strong>: formulário e chat do <strong>mesmo solicitante</strong> contam como <strong>um caso</strong> — por isso o chat de quem já tem formulário vai <strong>direto para o mesmo analista</strong>, mesmo com o cap cheio. <strong>Cap de casos</strong> limita solicitantes distintos; <em>Cap chat</em> e <em>Cap form</em> são tetos extras por tipo. A carga vem do TOA (chats em atendimento na fila) somada ao que o bot já entregou. Quem recebe o <strong>chat</strong> e o <strong>formulário de validação</strong>. Herança: <strong>membro → time → global</strong> (vazio = herda). A ordem do rodízio é a <em>Ordem</em> do membro na aba Times; o <em>peso</em> só vale na estratégia <strong>Prioridade</strong>, onde o maior peso é o titular e, se ele estiver no cap, cai para o próximo. Online e carga de cada analista são lidos no TOA a cada transferência, não aqui.</p>';
+    echo '<p class="small text-muted mb-0 mt-3"><strong>Carga = casos</strong>: formulário e chat do <strong>mesmo solicitante</strong> contam como <strong>um caso</strong> — por isso o chat de quem já tem formulário vai <strong>direto para o mesmo analista</strong>, mesmo com o cap cheio. <strong>Cap de casos</strong> limita solicitantes distintos; <em>Cap chat</em> e <em>Cap form</em> são tetos extras por tipo. A carga vem do TOA (chats em atendimento na fila) somada ao que o bot já entregou. Herança: <strong>analista → time → global</strong> (vazio = herda). A ordem do rodízio é a <em>Ordem</em> do membro na aba Times; o <em>peso</em> só vale na estratégia <strong>Prioridade</strong>, onde o maior peso é o titular e, se ele estiver no cap, cai para o próximo. Online e carga de cada analista são lidos no TOA a cada transferência, não aqui. Estratégia, capacidade, demanda atendida e janelas são configuradas por time/analista na aba <a href="?page=teams">Times</a>.</p>';
     echo '</div></div>';
-    echo '</div></div></div>'; // fim card-body/card + collapse "avancado-body"
 }
 
 if ($page === 'settings') {
@@ -4037,8 +4137,7 @@ if ($page === 'dashboard') {
                 $paramsDashLoad[] = $nomeLike;
             }
             $stDashLoad = $pdo->prepare(
-                'SELECT l.*, t.name AS team_name, COALESCE(tm.active, 0) AS roteando,'
-                . ' tm.route_start AS route_start, tm.route_end AS route_end'
+                'SELECT l.*, t.name AS team_name, COALESCE(tm.active, 0) AS roteando'
                 . ' FROM analyst_load l'
                 . ' LEFT JOIN teams t ON t.id = l.team_id'
                 . ' LEFT JOIN team_members tm ON tm.team_id = l.team_id AND tm.address = l.address'
@@ -4047,9 +4146,17 @@ if ($page === 'dashboard') {
                 . ' (l.chats_toa + l.forms_toa) DESC, l.form_ocioso_min DESC, l.name'
             );
             $stDashLoad->execute($paramsDashLoad);
+            $schCacheDash = [];
             foreach ($stDashLoad->fetchAll() as $rLoadDash) {
                 $addrLoadDash = (string) $rLoadDash['address'];
                 $nomeLoadDash = trim((string) $rLoadDash['name']);
+                $tidDash = (int) ($rLoadDash['team_id'] ?? 0);
+                if ($tidDash > 0 && !isset($schCacheDash[$tidDash])) {
+                    $schCacheDash[$tidDash] = team_schedules_map($pdo, $tidDash);
+                }
+                $schMapDash = $schCacheDash[$tidDash] ?? [];
+                $effRowsDash = ($schMapDash[$addrLoadDash] ?? []) ?: ($schMapDash[''] ?? []);
+                $estadoDash = schedule_state($effRowsDash);
                 $dashRows[$addrLoadDash] = [
                     'address' => $addrLoadDash,
                     'name' => $nomeLoadDash !== '' ? $nomeLoadDash : $addrLoadDash,
@@ -4064,7 +4171,8 @@ if ($page === 'dashboard') {
                     'form_velho' => (float) $rLoadDash['form_ocioso_min'],
                     'leitura' => (string) $rLoadDash['at'],
                     'roteando' => (int) ($rLoadDash['roteando'] ?? 0) === 1,
-                    'in_window' => member_in_route_window($rLoadDash['route_start'] ?? null, $rLoadDash['route_end'] ?? null),
+                    'in_window' => $estadoDash === 'dentro',
+                    'window_state' => $estadoDash,
                     'fora_leitura' => false,
                 ];
             }
@@ -4103,6 +4211,7 @@ if ($page === 'dashboard') {
                 'leitura' => '',
                 'roteando' => false,
                 'in_window' => true,
+                'window_state' => 'dentro',
                 'fora_leitura' => true,
             ];
         }
@@ -4186,7 +4295,10 @@ if ($page === 'dashboard') {
                     echo ' <span class="badge text-bg-warning" title="Inativo no roteamento: nao recebe item novo">inativo</span>';
                 }
                 if (!$rTab['in_window']) {
-                    echo ' <span class="badge text-bg-secondary" title="Fora da janela de plantao agora">fora da janela</span>';
+                    $wsTab = (string) ($rTab['window_state'] ?? 'fora');
+                    echo $wsTab === 'descanso'
+                        ? ' <span class="badge text-bg-warning" title="Em descanso agora">descanso</span>'
+                        : ' <span class="badge text-bg-secondary" title="Fora da janela de plantao agora">fora da janela</span>';
                 }
                 echo '<div class="text-muted small"><code>' . h((string) $addrTab) . '</code></div></td>';
                 echo '<td>' . h((string) $rTab['team']) . '</td>';
