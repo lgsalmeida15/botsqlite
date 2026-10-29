@@ -131,6 +131,7 @@ def engine_with(conn, sock) -> Engine:
     eng = Engine(conn, sock)
     eng.cfg["transfer_attempts"] = "1"
     eng.cfg["transfer_retry_interval_sec"] = "0"
+    eng.cfg["form_route_min_wait_sec"] = "0"
     return eng
 
 
@@ -150,6 +151,7 @@ class FormRouteTest(unittest.IsolatedAsyncioTestCase):
             msgs={99: [{"author": TEC, "text": "validando", "time": 1}]}
         )
         await eng.consider(form_sem_identidade())
+        await eng.tick_routes()
         caso = conn.execute("SELECT * FROM route_assignments WHERE chat_id = 99").fetchone()
         self.assertEqual(caso["case_key"], "a:" + TEC)
         self.assertEqual(caso["identity_source"], "autor")
@@ -190,6 +192,7 @@ class FormRouteTest(unittest.IsolatedAsyncioTestCase):
             msgs={99: [{"author": ANA, "system_message": "user_joined", "time": 2}]}
         )
         await eng.consider(form_chat())
+        await eng.tick_routes()
         caso = conn.execute("SELECT * FROM route_assignments WHERE chat_id = 99").fetchone()
         self.assertEqual(caso["assignee"], ANA)
         self.assertEqual(caso["identity_source"], "adocao")
@@ -208,6 +211,7 @@ class FormRouteTest(unittest.IsolatedAsyncioTestCase):
             }
         )
         await eng.consider(form_sem_identidade())
+        await eng.tick_routes()
         caso = conn.execute("SELECT * FROM route_assignments WHERE chat_id = 99").fetchone()
         self.assertEqual(caso["assignee"], ANA)
         self.assertEqual(caso["identity_source"], "adocao")
@@ -224,6 +228,7 @@ class FormRouteTest(unittest.IsolatedAsyncioTestCase):
             }
         )
         await eng.consider(form_chat())
+        await eng.tick_routes()
         self.assertNotIn("move_chat", sock.names())
         self.assertIn("form_skip_past", events(conn))
 
@@ -238,14 +243,25 @@ class FormRouteTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(espera[0]["expires_at"], "espera sem prazo (nao vence sozinha)")
 
     async def test_form_sem_elegivel_com_fila_desligada_marca_falha(self):
+        """A espera minima vale sempre: mesmo com a fila desligada, o formulario
+        entra na fila primeiro e so vira `form_no_agent` apos esgotar as
+        tentativas (nao ha mais encerramento imediato na chegada)."""
         eng, conn, _sock = self._eng(online=[])
         eng.cfg["queue_wait_enabled"] = "false"
+        eng.cfg["form_route_attempts"] = "1"
+        eng.cfg["form_route_retry_interval_sec"] = "0"
         await eng.consider(form_sem_identidade())
+        self.assertIn("queued", events(conn))
+        self.assertNotIn("form_no_agent", events(conn), "ainda nao tentou nenhuma vez")
+        for _ in range(2):
+            await eng.tick_routes()
         self.assertIn("form_no_agent", events(conn))
+        self.assertEqual(len(routes(conn, "failed")), 1)
 
     async def test_form_roteia_para_o_time_da_fila(self):
         eng, conn, sock = self._eng()
         await eng.consider(form_chat())
+        await eng.tick_routes()
         move = sock.last("move_chat")
         self.assertEqual(move["chat_id"], 99)
         self.assertEqual(move["channel_address"], "h:q1")
@@ -265,6 +281,7 @@ class FormRouteTest(unittest.IsolatedAsyncioTestCase):
         eng, conn, sock = self._eng()
         await eng.consider(form_chat())
         await eng.consider(form_chat())
+        await eng.tick_routes()
         self.assertEqual(sock.names().count("move_chat"), 1)
 
     async def test_form_sem_fila_apenas_registra(self):
@@ -325,13 +342,21 @@ class FormRouteTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(int(wait[0]["attempts"]), 0)
         self.assertEqual(wait[0]["queue_address"], "h:q1")
 
-    async def test_fallback_monitor_nao_enfileira_com_fila_desligada(self):
+    async def test_fallback_monitor_com_fila_desligada_tambem_espera_antes_de_falhar(self):
+        """A espera minima vale sempre, mesmo com fallback=monitor e fila
+        desligada: o formulario entra na fila e so falha apos esgotar as
+        tentativas (nao ha mais atalho de encerramento na chegada)."""
         eng, conn, sock = self._eng(online=[])
         eng.cfg["queue_wait_enabled"] = "false"
+        eng.cfg["form_route_attempts"] = "1"
+        eng.cfg["form_route_retry_interval_sec"] = "0"
         conn.execute("INSERT INTO team_routing (team_id, fallback) VALUES (1, 'monitor')")
         await eng.consider(form_chat())
+        self.assertIn("queued", events(conn))
+        for _ in range(2):
+            await eng.tick_routes()
         self.assertIn("form_no_agent", events(conn))
-        self.assertEqual(routes(conn), [])
+        self.assertEqual(len(routes(conn, "failed")), 1)
 
     async def test_fallback_monitor_com_fila_ligada_entra_na_fila(self):
         """Com a fila ligada o formulario espera a vez, mesmo com fallback=monitor."""
@@ -390,6 +415,7 @@ class FormRouteTest(unittest.IsolatedAsyncioTestCase):
         await eng.consider(form_chat())
         conn.execute("UPDATE queues SET enabled = 0")
         eng.reload_config()
+        eng.cfg["form_route_min_wait_sec"] = "0"  # reload_config troca o dict inteiro
         await eng.tick_routes()
         self.assertNotIn("move_chat", sock.names())
         self.assertNotIn("invite_to_chat", sock.names())
@@ -480,6 +506,7 @@ class FormRouteTest(unittest.IsolatedAsyncioTestCase):
             "INSERT INTO team_member_routing (team_id, address, weight) VALUES (1, ?, 5)", (BIA,)
         )
         await eng.consider(form_chat())
+        await eng.tick_routes()
         self.assertEqual(sock.last("invite_to_chat")["address"], BIA)
 
     async def test_cap_de_formulario_por_membro(self):
@@ -489,6 +516,7 @@ class FormRouteTest(unittest.IsolatedAsyncioTestCase):
             "INSERT INTO team_member_routing (team_id, address, cap_form) VALUES (1, ?, 1)", (ANA,)
         )
         await eng.consider(form_chat())
+        await eng.tick_routes()
         self.assertEqual(sock.last("invite_to_chat")["address"], BIA)
 
     async def test_chat_na_carga_nao_consome_cap_de_formulario(self):
@@ -498,6 +526,7 @@ class FormRouteTest(unittest.IsolatedAsyncioTestCase):
             "INSERT INTO team_member_routing (team_id, address, cap_form) VALUES (1, ?, 1)", (ANA,)
         )
         await eng.consider(form_chat())
+        await eng.tick_routes()
         self.assertEqual(sock.last("invite_to_chat")["address"], ANA)
 
     async def test_membro_fora_da_janela_nao_recebe_formulario(self):
@@ -511,6 +540,7 @@ class FormRouteTest(unittest.IsolatedAsyncioTestCase):
         # 08:00 e 09:00 BRT).
         with mock.patch.object(routing, "_in_route_window", return_value=False):
             await eng.consider(form_chat())
+            await eng.tick_routes()
         self.assertNotIn("move_chat", sock.names())
         self.assertIn("queued", events(conn))
         self.assertIn("fora_horario", routes(conn, "waiting")[0]["detail"])

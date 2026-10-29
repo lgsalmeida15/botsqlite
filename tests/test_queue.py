@@ -44,6 +44,7 @@ def chat_row(conn, cid: int = 10) -> dict:
 def engine_cfg(conn, sock) -> Engine:
     eng = Engine(conn, sock)
     eng.cfg["transfer_retry_interval_sec"] = "0"
+    eng.cfg["form_route_min_wait_sec"] = "0"
     return eng
 
 
@@ -147,6 +148,37 @@ class QueueTest(unittest.IsolatedAsyncioTestCase):
         # Algum chat do fim da linha nem foi tentado (devido ao per_line=5): o
         # tick nao processa a linha do chat inteira so porque o form venceu.
         self.assertIn(0, porTipo.get("chat") or [], porTipo)
+
+    async def test_formulario_recente_nao_fura_a_fila_antes_da_janela(self):
+        """Formulario recem-chegado nao e tentado: o chat da frente roteia normalmente
+        ate o formulario completar a janela minima (`form_route_min_wait_sec`)."""
+        eng, conn, sock = self._eng(online=["ana"])
+        eng.cfg["max_cases_per_agent"] = "1"
+        eng.cfg["form_route_min_wait_sec"] = "300"  # o _eng zera isso para os outros testes
+        db.enqueue_route(conn, "chat", 11, "h:q1", 1, detail="chat", delay_sec=0)
+        db.enqueue_route(conn, "form", 99, "h:q1", 1, detail="formulario", delay_sec=0)
+        await eng.tick_routes()
+        done = routes(conn, "done")
+        self.assertEqual(len(done), 1)
+        self.assertEqual(str(done[0]["kind"]), "chat", "formulario na janela minima: o chat passa na frente")
+        forms_waiting = [r for r in routes(conn, "waiting") if r["kind"] == "form"]
+        self.assertEqual(len(forms_waiting), 1)
+        self.assertEqual(int(forms_waiting[0]["attempts"]), 0, "formulario nem foi tentado")
+
+    async def test_formulario_assume_prioridade_apos_a_janela_minima(self):
+        """Apos completar a janela minima, o formulario volta a furar a fila do chat."""
+        eng, conn, sock = self._eng(online=["ana"])
+        eng.cfg["max_cases_per_agent"] = "1"
+        eng.cfg["form_route_min_wait_sec"] = "300"
+        db.enqueue_route(conn, "chat", 11, "h:q1", 1, detail="chat", delay_sec=0)
+        rid = db.enqueue_route(conn, "form", 99, "h:q1", 1, detail="formulario", delay_sec=0)
+        conn.execute(
+            "UPDATE pending_routes SET created_at = datetime('now', '-6 minutes') WHERE id = ?", (rid,)
+        )
+        await eng.tick_routes()
+        done = routes(conn, "done")
+        self.assertEqual(len(done), 1)
+        self.assertEqual(str(done[0]["kind"]), "form", "janela vencida: formulario tem prioridade de novo")
 
     async def test_espera_do_formulario_vence_e_encerra_a_rota(self):
         """Formulario sem elegivel nao gira para sempre: a espera vence e a rota para."""

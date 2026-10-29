@@ -302,6 +302,7 @@ class FormAwareEngineTest(unittest.IsolatedAsyncioTestCase):
         eng = Engine(conn, sock)
         eng.cfg["transfer_retry_interval_sec"] = "0"
         eng.cfg["form_route_retry_interval_sec"] = "0"
+        eng.cfg["form_route_min_wait_sec"] = "0"
         return eng, conn, sock
 
     async def test_sem_formulario_o_menu_normal_continua(self):
@@ -317,6 +318,7 @@ class FormAwareEngineTest(unittest.IsolatedAsyncioTestCase):
         """Ocioso além da janela de fechamento: sai do índice e o caso fecha."""
         eng, conn, sock = self._eng()
         await eng.consider(form_agente())
+        await eng.tick_routes()
         eng.cfg["form_idle_close_min"] = "60"
         _envelhece_caso(conn)
         sock.msgs[99] = [
@@ -335,6 +337,7 @@ class FormAwareEngineTest(unittest.IsolatedAsyncioTestCase):
         """Parado há muito tempo COM analista dentro: fecha (o TOA não avisa a saída)."""
         eng, conn, sock = self._eng()
         await eng.consider(form_agente())
+        await eng.tick_routes()
         eng.cfg["form_idle_owner_close_min"] = "60"
         _envelhece_caso(conn)
         sock.msgs[99] = [
@@ -354,6 +357,7 @@ class FormAwareEngineTest(unittest.IsolatedAsyncioTestCase):
         """Caso encerrado de verdade: sai do índice (a varredura para de ler no TOA)."""
         eng, conn, _sock = self._eng()
         await eng.consider(form_agente())
+        await eng.tick_routes()
         db.assign_close(conn, 99, "form_done")
         self.assertEqual(eng._prune_open_forms(), 1)
         self.assertNotIn(99, eng._open_forms)
@@ -389,6 +393,7 @@ class FormAwareEngineTest(unittest.IsolatedAsyncioTestCase):
         """Reidratado do ledger: o relógio de vida é a abertura do caso (`assigned_at`)."""
         eng, conn, _sock = self._eng()
         await eng.consider(form_agente())
+        await eng.tick_routes()
         conn.execute(
             "UPDATE route_assignments SET assigned_at = datetime('now','-5 hours') WHERE chat_id = 99"
         )
@@ -420,6 +425,7 @@ class FormIndexRobustnessTest(unittest.IsolatedAsyncioTestCase):
         eng = Engine(conn, sock)
         eng.cfg["transfer_retry_interval_sec"] = "0"
         eng.cfg["form_route_retry_interval_sec"] = "0"
+        eng.cfg["form_route_min_wait_sec"] = "0"
         return eng, conn, sock
 
     async def test_ended_time_epoch_nao_indexa_e_avisa(self):
@@ -493,6 +499,7 @@ class FormStateTest(unittest.IsolatedAsyncioTestCase):
         eng = Engine(conn, sock)
         eng.cfg["transfer_retry_interval_sec"] = "0"
         eng.cfg["form_route_retry_interval_sec"] = "0"
+        eng.cfg["form_route_min_wait_sec"] = "0"
         return eng, conn, sock
 
     def _msg(self, text: str = "1", autor: str = TEC, cid: int = 10) -> dict:
@@ -631,6 +638,7 @@ class DistribuicaoECapTest(unittest.IsolatedAsyncioTestCase):
         eng.cfg["max_cases_per_agent"] = str(cap_cases)
         eng.cfg["transfer_retry_interval_sec"] = "0"
         eng.cfg["form_route_retry_interval_sec"] = "0"
+        eng.cfg["form_route_min_wait_sec"] = "0"
         return eng, conn, sock
 
     @staticmethod
@@ -643,6 +651,7 @@ class DistribuicaoECapTest(unittest.IsolatedAsyncioTestCase):
         eng, conn, _sock = self._eng(cap_cases=1)
         for i, tec in enumerate(["u:t1@x", "u:t2@x", "u:t3@x", "u:t4@x"]):
             await eng.consider(self._form(900 + i, tec))
+        await eng.tick_routes()
         abertos = conn.execute(
             "SELECT assignee FROM route_assignments WHERE closed_at IS NULL"
         ).fetchall()
@@ -658,6 +667,7 @@ class DistribuicaoECapTest(unittest.IsolatedAsyncioTestCase):
         for i, tec in enumerate(["u:t1@x", "u:t2@x"]):
             await eng.consider(self._form(900 + i, tec))
         await eng.consider(self._form(910, "u:t3@x"))
+        await eng.tick_routes()
         self.assertEqual(len(routes(conn, "waiting")), 1, "terceiro espera")
         ana = conn.execute(
             "SELECT chat_id FROM route_assignments WHERE assignee = ? AND closed_at IS NULL", (ANA,)
@@ -675,6 +685,7 @@ class DistribuicaoECapTest(unittest.IsolatedAsyncioTestCase):
         eng, conn, _sock = self._eng(cap_cases=1)
         await eng.consider(self._form(900, "u:t1@x"))  # rodizio: Ana
         await eng.consider(self._form(901, "u:t1@x"))  # mesmo tecnico: afinidade
+        await eng.tick_routes()
         abertos = conn.execute(
             "SELECT assignee, case_key FROM route_assignments WHERE closed_at IS NULL"
         ).fetchall()

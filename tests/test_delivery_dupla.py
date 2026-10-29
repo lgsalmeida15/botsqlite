@@ -47,6 +47,7 @@ class DuplaEntregaTest(unittest.IsolatedAsyncioTestCase):
         eng = engine_with(conn, sock)
         eng.cfg["form_route_retry_interval_sec"] = "0"
         await asyncio.gather(eng.consider(form_chat()), eng.consider(form_chat()))
+        await eng.tick_routes()
         self.assertEqual(sock.names().count("move_chat"), 1)
         self.assertEqual(sock.names().count("invite_to_chat"), 1)
         self.assertEqual(len(db.open_assignments(conn)), 1)
@@ -74,8 +75,9 @@ class DuplaEntregaTest(unittest.IsolatedAsyncioTestCase):
         eng = engine_with(conn, sock)
         eng.cfg["form_route_retry_interval_sec"] = "0"
         await eng.consider(form_chat())
+        await eng.tick_routes()  # 1a tentativa: move + convite (falha, agenda retry)
         conn.execute("UPDATE pending_routes SET next_try_at = datetime('now', '-1 seconds')")
-        await eng.tick_routes()
+        await eng.tick_routes()  # 2a tentativa: so reconvida, nao move de novo
         self.assertEqual(sock.names().count("move_chat"), 1)
         self.assertEqual(sock.invites, 2)
         self.assertEqual(routes(conn, "done")[0]["invite_target"], ANA)
