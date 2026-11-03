@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlencode, urlsplit
 
 from . import db
 from . import form_open
@@ -131,6 +133,50 @@ def _msg_epoch(v) -> float | None:
     if n > 1e12:
         n /= 1000.0
     return n
+
+
+def _msg_time_text(v) -> str | None:
+    """Epoch da mensagem do TOA -> texto UTC `datetime('now')` (convencao do schema)."""
+    epoch = _msg_epoch(v)
+    if epoch is None:
+        return None
+    return datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _message_dedupe_key(
+    chat_id: int, message_id: str, author_addr: str, text: str, msg_time: str | None, system_message: str,
+) -> str:
+    """Chave de idempotencia de `chat_messages` (ver schema.sql: coluna `dedupe_key`).
+
+    Usa o `message_id` do TOA quando o payload traz; sem ele (ex. nota de
+    sistema `user_joined`/`user_left`, ou campo ausente), cai no hash do
+    conteudo -- o mesmo poll/replay nao duplica a linha.
+    """
+    if message_id:
+        return f"mid:{message_id}"
+    raw = f"{chat_id}|{author_addr}|{text}|{msg_time or ''}|{system_message}"
+    return "h:" + hashlib.sha1(raw.encode("utf-8", "replace")).hexdigest()
+
+
+# Teto de tamanho do anexo baixado (mesmo valor usado por uma extensao de
+# referencia deste mesmo TOA): alem de limitar memoria/banco, fica dentro do
+# `MEDIUMBLOB` (16 MB) da coluna `chat_messages.attachment_data`.
+_ATTACHMENT_MAX_BYTES = 8 * 1024 * 1024
+
+# Mesma tabela usada por uma extensao de referencia deste mesmo TOA: o endpoint
+# de anexo sempre responde `application/octet-stream`, entao o MIME real tem
+# que ser inferido pela extensao do nome do arquivo.
+_ATTACHMENT_MIME_BY_EXT = {
+    "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "gif": "image/gif",
+    "webp": "image/webp", "bmp": "image/bmp", "svg": "image/svg+xml",
+    "tif": "image/tiff", "tiff": "image/tiff", "pdf": "application/pdf",
+}
+
+
+def _infer_attachment_mime(name: str, served: str | None = None) -> str:
+    nome = str(name or "")
+    ext = nome.rsplit(".", 1)[-1].lower() if "." in nome else ""
+    return _ATTACHMENT_MIME_BY_EXT.get(ext, served or "application/octet-stream")
 
 
 def _as_utc(v) -> datetime | None:
@@ -525,6 +571,17 @@ class Engine:
                 self._mark_present(cid)
         elif n == "chat_removed" and d.get("chat_id"):
             cid = int(d["chat_id"])
+            # Rede de seguranca da reproducao do chat: ultima leitura antes de
+            # esquecer o caso, para cobrir mensagem perdida entre o ultimo
+            # poll/WS e o encerramento (best-effort -- falha aqui nao bloqueia
+            # o encerramento do caso logo abaixo).
+            try:
+                kind_final = "form" if cid in self._open_forms else "chat"
+                fila_final = MEM.get(cid, {}).get("queue_address") or queue_of(self._open_forms.get(cid) or {})
+                for msg in await self._chat_messages(cid, 200):
+                    await self._record_message(cid, kind_final, "in", msg, queue_address=str(fila_final or ""))
+            except Exception:
+                log.warning("captura final de mensagens falhou chat=%s", cid, exc_info=True)
             self._forget_open_form(cid, "chat_removed")
             self._close_case(cid, "chat_removed")
             db.finish_routes_for_chat(self.conn, cid, "failed", "chat removido")
@@ -707,10 +764,16 @@ class Engine:
         self._form_checked[fid] = agora
         linha = db.open_assignment(self.conn, fid) or {}
         tecnico = str(linha.get("requester_addr") or "")
-        msgs = await self._chat_messages(fid, 20)
+        # Count maior que o `10` usado em chat de fila: aqui e a UNICA leitura do
+        # formulario (o bot nunca entra na sala), entao e tambem quem alimenta a
+        # reproducao no painel -- vale tentar capturar o historico inteiro, nao
+        # so o suficiente para o estado (join/left) que a logica abaixo precisa.
+        msgs = await self._chat_messages(fid, 100)
         # Sem caso no ledger, a fila vem do payload indexado (o time da fila e o
         # que separa tecnico de analista nas mensagens).
         fila = linha.get("queue_address") or queue_of(self._open_forms.get(int(fid)) or {})
+        for msg in msgs:
+            await self._record_message(fid, "form", "in", msg, queue_address=str(fila or ""))
         ops = self._operadores_da_fila(fila)
         estado = form_open.form_state_from_messages(msgs, self.own, tecnico)
         # Identidade viva deste formulario (o payload pode nao trazer o address do
@@ -1415,6 +1478,11 @@ class Engine:
             "send_message",
             {"chat_id": cid, "mark_read": False, "message": {"delivery_id": int(time.time() * 1000), "text": text}},
         )
+        # Grava a saida do bot em `chat_messages` (reproducao do chat no painel).
+        # So depois do `command` ter sucesso -- envio que falhou nao vai pro TOA.
+        await self._record_message(
+            cid, "chat", "out", {"author": self.own, "text": text, "time": time.time()}, is_bot=True,
+        )
 
     async def send_guarded(self, cid: int, text: str, q: str | None = None) -> bool:
         """Envio que nao derruba o fluxo: registra `send_failed` e devolve False."""
@@ -1425,6 +1493,122 @@ class Engine:
             log.warning("send_message %s: %s", cid, e)
             self._emit("send_failed", cid, q, str(e)[:200])
             return False
+
+    async def _record_inbound_chat(self, cid: int, m: dict) -> None:
+        """Grava mensagem recebida de chat de fila (qualquer autor, qualquer status).
+
+        Roda ANTES de qualquer filtro de `on_message` (autor, status, `started_addr`)
+        de proposito: e exatamente ali que mensagem de analista/terceiro e mensagem
+        em chat `monitoring` sao descartadas sem deixar rastro hoje. A saida do
+        proprio bot ja e gravada em `send()` -- aqui so grava quando NAO e o bot
+        (evita duplicar o mesmo envio: um como `out` explicito, outro como eco do WS).
+        """
+        autor = m.get("author")
+        if isinstance(autor, dict):
+            autor = autor.get("address")
+        if not autor:
+            participante = m.get("participant")
+            if isinstance(participante, dict):
+                autor = participante.get("address")
+        if autor and _addr_eq(str(autor), self.own):
+            return
+        direction = "system" if m.get("system_message") else "in"
+        await self._record_message(cid, "chat", direction, m)
+
+    async def _record_message(
+        self, cid: int, kind: str, direction: str, m: dict, *,
+        is_bot: bool = False, queue_address: str | None = None,
+    ) -> None:
+        """Grava uma linha em `chat_messages` (ver schema.sql) -- nunca lanca.
+
+        Efeito colateral de `on_message`/`send`/`_refresh_form_state`: uma falha
+        aqui (download de anexo, banco fora do ar) nao pode derrubar o fluxo de
+        atendimento que chamou. Idempotente via `dedupe_key` (UNIQUE em
+        `chat_messages`, `INSERT OR IGNORE` em `db.record_message`).
+        """
+        try:
+            autor = m.get("author")
+            if isinstance(autor, dict):
+                autor = autor.get("address")
+            if not autor:
+                participante = m.get("participant")
+                if isinstance(participante, dict):
+                    autor = participante.get("address")
+            author_addr = str(autor or "")
+            text = str(m.get("text") or "")
+            system_message = str(m.get("system_message") or "")
+            msg_time = _msg_time_text(m.get("time"))
+            message_id = str(m.get("message_id") or m.get("id") or "")
+            dedupe_key = _message_dedupe_key(cid, message_id, author_addr, text, msg_time, system_message)
+            fila = str(queue_address) if queue_address is not None else str((MEM.get(cid) or {}).get("queue_address") or "")
+
+            has_attachment = False
+            attachment_name = attachment_mime = attachment_fetch_status = ""
+            attachment_size = 0
+            attachment_data = None
+            attachment = m.get("attachment")
+            if isinstance(attachment, dict):
+                has_attachment = True
+                (
+                    attachment_data, attachment_mime, attachment_name,
+                    attachment_size, attachment_fetch_status,
+                ) = await self._download_attachment(attachment)
+
+            db.record_message(
+                self.conn, cid, kind, direction, dedupe_key,
+                queue_address=fila, message_id=message_id,
+                author_addr=author_addr, author_name="",
+                is_bot=is_bot or bool(author_addr and _addr_eq(author_addr, self.own)),
+                system_message=system_message, text=text,
+                has_attachment=has_attachment, attachment_name=attachment_name,
+                attachment_mime=attachment_mime, attachment_size=attachment_size,
+                attachment_data=attachment_data, attachment_fetch_status=attachment_fetch_status,
+                msg_time=msg_time,
+            )
+        except Exception:
+            log.warning("_record_message chat=%s kind=%s: falhou", cid, kind, exc_info=True)
+
+    async def _download_attachment(self, attachment: dict) -> tuple[bytes | None, str, str, int, str]:
+        """Baixa o binario do anexo citado na mensagem (bytes, mime, nome, tamanho, status).
+
+        A URL e construivel sem token a partir de `attachment.data.fileName`
+        (`m=filestorage&a=get&file_name=...&display_name=...`), mas o endpoint
+        exige os cookies da sessao TOA -- por isso o download roda pela MESMA
+        pagina Playwright autenticada do bot (`self.sock.page`), nunca por um
+        cliente HTTP solto (sem o cookie da e 401/403). Falha aqui NUNCA deve
+        impedir gravar o texto/metadado da mensagem (`attachment_fetch_status`
+        registra o que aconteceu).
+        """
+        data = attachment.get("data") if isinstance(attachment, dict) else None
+        data = data if isinstance(data, dict) else {}
+        file_name = str(data.get("fileName") or "").strip()
+        display_name = str(data.get("displayName") or "").strip()
+        if not file_name:
+            return None, "", display_name, 0, ""
+        page = getattr(self.sock, "page", None)
+        if page is None:
+            return None, "", display_name, 0, "failed"
+        try:
+            partes = urlsplit(page.url)
+            origin = f"{partes.scheme}://{partes.netloc}" if partes.netloc else ""
+        except Exception:
+            origin = ""
+        if not origin:
+            return None, "", display_name, 0, "failed"
+        query = urlencode({"m": "filestorage", "a": "get", "file_name": file_name, "display_name": display_name})
+        url = f"{origin}/index.php?{query}"
+        try:
+            resp = await page.context.request.get(url, timeout=15000)
+            if not resp.ok:
+                return None, "", display_name, 0, "failed"
+            body = await resp.body()
+            if len(body) > _ATTACHMENT_MAX_BYTES:
+                return None, "", display_name, len(body), "too_large"
+            mime = _infer_attachment_mime(display_name or file_name, resp.headers.get("content-type"))
+            return bytes(body), mime, display_name, len(body), "ok"
+        except Exception as e:
+            log.warning("download de anexo falhou file_name=%s: %s", file_name, e)
+            return None, "", display_name, 0, "failed"
 
     def _note_ignored_message(self, cid: int, status, q: str | None) -> None:
         """Mensagem do tecnico em status que o bot nao trata: registra.
@@ -1442,6 +1626,7 @@ class Engine:
         if cid is None:
             return
         cid = int(cid)
+        await self._record_inbound_chat(cid, m)
         remember({"chat_id": cid, "started_addr": MEM.get(cid, {}).get("started_addr")})
         sysm = m.get("system_message")
         if sysm == "user_joined":

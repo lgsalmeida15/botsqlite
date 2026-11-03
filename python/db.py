@@ -1276,6 +1276,58 @@ def script_run_timeouts(conn, seconds: int = 60) -> list[dict]:
     ).fetchall()
 
 
+def record_message(
+    conn,
+    chat_id: int,
+    kind: str,
+    direction: str,
+    dedupe_key: str,
+    *,
+    queue_address: str = "",
+    message_id: str = "",
+    author_addr: str = "",
+    author_name: str = "",
+    is_bot: bool = False,
+    system_message: str = "",
+    text: str = "",
+    has_attachment: bool = False,
+    attachment_name: str = "",
+    attachment_mime: str = "",
+    attachment_size: int = 0,
+    attachment_data: bytes | None = None,
+    attachment_fetch_status: str = "",
+    msg_time: str | None = None,
+) -> None:
+    """Grava uma linha de `chat_messages` (ver schema.sql) -- reproducao do chat no painel.
+
+    Idempotente: `dedupe_key` e UNIQUE por `chat_id` e o insert usa
+    `INSERT OR IGNORE`, entao o mesmo poll/replay nao duplica a linha. Nunca
+    lanca para o chamador -- gravar a conversa e efeito colateral de
+    `on_message`/`send`/`_refresh_form_state`, nao motivo deles existirem
+    (mesmo espirito de `log_event`).
+    """
+    try:
+        conn.execute(
+            """INSERT OR IGNORE INTO chat_messages
+                 (chat_id, kind, direction, queue_address, message_id, dedupe_key,
+                  author_addr, author_name, is_bot, system_message, text,
+                  has_attachment, attachment_name, attachment_mime, attachment_size,
+                  attachment_data, attachment_fetch_status, msg_time)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                int(chat_id), kind, direction, str(queue_address or ""),
+                str(message_id or ""), dedupe_key,
+                str(author_addr or ""), str(author_name or ""), 1 if is_bot else 0,
+                str(system_message or ""), str(text or ""),
+                1 if has_attachment else 0, str(attachment_name or ""),
+                str(attachment_mime or ""), int(attachment_size or 0),
+                attachment_data, str(attachment_fetch_status or ""), msg_time,
+            ),
+        )
+    except Exception:
+        log.warning("chat_messages: insert falhou chat=%s", chat_id, exc_info=True)
+
+
 def log_event(
     conn,
     reason: str,

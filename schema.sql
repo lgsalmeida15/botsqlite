@@ -558,3 +558,58 @@ INSERT OR IGNORE INTO permission_groups (id, name, active, is_super) VALUES (1, 
 -- Flags da migracao: '0' = passo ainda nao executado.
 INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('rbac_seeded', '0');
 INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('rbac_scope_groups', '0');
+
+-- ---------------------------------------------------------------------------
+-- Reproducao do chat (painel, em outro repositorio): grava TODA mensagem de
+-- chat e de formulario (texto + anexo), de qualquer autor (solicitante,
+-- analista ou o proprio bot). Ate aqui o banco so guardava `chat_id` e estado
+-- de roteamento (ver comentario do topo deste arquivo) -- esta tabela muda essa
+-- postura de proposito, a pedido do negocio, sem politica de retencao por ora
+-- (decisao adiada para uma v2).
+-- `kind` distingue chat de fila de formulario (os dois sao o mesmo tipo de
+-- `chat_id` no TOA). `queue_address` vem desnormalizado (igual `bot_events`)
+-- para quem ler esta tabela de fora nao precisar de JOIN em `chats` para achar
+-- o escopo por fila. Nao ha filtro de RBAC aqui dentro -- quem le aplica o
+-- escopo (ver `group_teams`/`team_queues`/`queues` acima).
+CREATE TABLE IF NOT EXISTS chat_messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  chat_id INTEGER NOT NULL,
+  kind VARCHAR(191) NOT NULL DEFAULT 'chat' CHECK (kind IN ('chat', 'form')),
+  direction VARCHAR(191) NOT NULL DEFAULT 'in' CHECK (direction IN ('in', 'out', 'system')),
+  queue_address VARCHAR(191) NOT NULL DEFAULT '',
+  -- Id real da mensagem no TOA, quando o payload trouxer (so leitura/debug).
+  message_id VARCHAR(191) NOT NULL DEFAULT '',
+  -- Chave de idempotencia (sempre preenchida antes do insert): "mid:<message_id>"
+  -- quando o TOA manda id, senao sha1(chat_id|author_addr|text|msg_time|system_message).
+  -- E o alvo do conflito de unicidade (INSERT OR IGNORE) -- por isso e indice
+  -- UNIQUE simples, sem WHERE.
+  dedupe_key VARCHAR(191) NOT NULL,
+  author_addr TEXT NOT NULL DEFAULT '',
+  author_name TEXT NOT NULL DEFAULT '',
+  is_bot INTEGER NOT NULL DEFAULT 0,
+  -- 'user_joined'/'user_left' (presenca) ou vazio (mensagem normal).
+  system_message VARCHAR(191) NOT NULL DEFAULT '',
+  text TEXT NOT NULL DEFAULT '',
+  has_attachment INTEGER NOT NULL DEFAULT 0,
+  attachment_name TEXT NOT NULL DEFAULT '',
+  attachment_mime VARCHAR(191) NOT NULL DEFAULT '',
+  attachment_size INTEGER NOT NULL DEFAULT 0,
+  -- Binario do anexo (guardado no banco de proposito: quem le de fora so tem
+  -- acesso ao banco, nao a pasta `data/` deste host). `MEDIUMBLOB` (nao so
+  -- `BLOB`) de proposito: o MySQL limita BLOB puro a 64 KB, pequeno demais
+  -- para anexo de chat (imagem/PDF chegam a alguns MB); `MEDIUMBLOB` (ate 16 MB)
+  -- e palavra valida nos dois bancos sem precisar de traducao no sqlcompat (o
+  -- SQLite reconhece afinidade BLOB em qualquer tipo que contenha "BLOB").
+  attachment_data MEDIUMBLOB,
+  -- '' (sem anexo), 'ok', 'failed' (download falhou) ou 'too_large' (passou do
+  -- teto de tamanho) -- em qualquer caso de falha o texto/metadado da mensagem
+  -- e gravado do mesmo jeito.
+  attachment_fetch_status VARCHAR(191) NOT NULL DEFAULT '',
+  -- Timestamp ORIGINAL da mensagem no TOA (nao o de gravacao aqui).
+  msg_time VARCHAR(191),
+  at VARCHAR(191) NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS chat_messages_dedupe
+  ON chat_messages (chat_id, dedupe_key);
+CREATE INDEX IF NOT EXISTS chat_messages_chat_idx ON chat_messages (chat_id, msg_time);
