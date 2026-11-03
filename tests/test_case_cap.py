@@ -73,9 +73,6 @@ class RajadaTest(unittest.IsolatedAsyncioTestCase):
         conn, eng = monta(**caps)
         forms = [form_de("u:tec%d@claro.com" % (i + 1), 90 + i) for i in range(n)]
         await asyncio.gather(*[eng.consider(f) for f in forms])
-        # Formulario nao entrega mais na hora: entra na fila e so e tentado no tick,
-        # apos a janela minima (zerada pelo engine_with nos testes).
-        await eng.tick_routes()
         return conn, eng
 
     async def test_um_formulario_por_vez_respeita_o_cap(self):
@@ -85,16 +82,12 @@ class RajadaTest(unittest.IsolatedAsyncioTestCase):
     async def test_rajada_de_tres_com_cap_form_um_entrega_um(self):
         conn, eng = await self._rajada(3, cap_form=1)
         self.assertEqual(eng.sock.names().count("move_chat"), 1)
-        # Todo formulario emite queued ao chegar (3); quem nao e escolhido no
-        # tick ganha mais um queued da 1a notificacao de posicao (2) = 5.
-        self.assertEqual(eventos(conn).count("queued"), 5)
+        self.assertEqual(eventos(conn).count("queued"), 2)   # fila ligada: esperam a vez
 
     async def test_rajada_de_seis_com_cap_form_um_entrega_um(self):
         conn, eng = await self._rajada(6, cap_form=1)
         self.assertEqual(eng.sock.names().count("move_chat"), 1)
-        # 6 chegadas + 4 notificacoes de posicao (per_line=5 tenta so 5 no tick;
-        # 1 entregue, 4 ficam sem analista e notificam a 1a posicao).
-        self.assertEqual(eventos(conn).count("queued"), 10)
+        self.assertEqual(eventos(conn).count("queued"), 5)   # fila ligada: esperam a vez
 
     async def test_rajada_de_quatro_com_cap_form_dois_entrega_dois(self):
         _conn, eng = await self._rajada(4, cap_form=2)
@@ -115,7 +108,6 @@ class AfinidadeTest(unittest.IsolatedAsyncioTestCase):
     async def test_chat_do_mesmo_solicitante_vai_para_quem_tem_o_formulario(self):
         conn, eng = monta(cap_casos=1)
         await eng.consider(form_de(TEC, 99))
-        await eng.tick_routes()
         self.assertEqual(len(db.open_assignments(conn)), 1)
         MEM.clear()
         MEM[10] = {
@@ -140,10 +132,8 @@ class AfinidadeTest(unittest.IsolatedAsyncioTestCase):
         conn, eng = monta(cap_casos=1)
         await eng.consider(form_de(TEC, 99))
         await eng.consider(form_de(TEC2, 98))
-        await eng.tick_routes()
         self.assertEqual(eng.sock.names().count("move_chat"), 1)
-        # 2 chegadas + 1 notificacao de posicao do que nao foi escolhido no tick.
-        self.assertEqual(eventos(conn).count("queued"), 3)
+        self.assertEqual(eventos(conn).count("queued"), 1)   # o segundo espera a vez
 
 
 class CasoUnicoTest(unittest.IsolatedAsyncioTestCase):
@@ -173,7 +163,6 @@ class FalhaToaTest(unittest.IsolatedAsyncioTestCase):
         _conn, eng = monta(cap_form=1, sock=LoadFailSock(online=["ana"]))
         await eng.consider(form_de(TEC, 99))
         await eng.consider(form_de(TEC2, 98))
-        await eng.tick_routes()
         self.assertEqual(eng.sock.names().count("move_chat"), 1)
 
 
@@ -186,21 +175,17 @@ class ReservaTest(unittest.IsolatedAsyncioTestCase):
     async def test_entrega_que_falha_devolve_a_reserva(self):
         _conn, eng = monta(cap_form=1, sock=FailMoveSock(online=["ana"]))
         await eng.consider(form_de(TEC, 99))
-        await eng.tick_routes()
         self.assertEqual(len(eng._reserved()), 0)
         await eng.consider(form_de(TEC2, 98))
-        await eng.tick_routes()
         self.assertEqual(eng.sock.names().count("move_chat"), 2)
 
     async def test_caso_encerrado_libera_a_vaga_na_hora(self):
         conn, eng = monta(cap_casos=1)
         await eng.consider(form_de(TEC, 99))
-        await eng.tick_routes()
         await eng.on_note("chat_removed", {"chat_id": 99})
         self.assertEqual(len(db.open_assignments(conn)), 0)
         self.assertEqual(len(eng._reserved()), 0)
         await eng.consider(form_de(TEC2, 98))
-        await eng.tick_routes()
         self.assertEqual(eng.sock.names().count("move_chat"), 2)
 
     async def test_ttl_fecha_caso_orfao(self):

@@ -1549,37 +1549,23 @@ def finish_orphan_routes(conn, status: str = "failed",
     return int(cur.rowcount or 0)
 
 
-def due_routes(conn, per_line: int = 5, form_min_wait_sec: int = 300) -> dict[str, list[dict]]:
+def due_routes(conn, per_line: int = 5) -> dict[str, list[dict]]:
     """Rotas vencidas por LINHA: chat e formulario esperam em filas apartadas.
 
     Devolve as duas listas (cada uma FIFO por `id`, priorizados primeiro) para o
     tick tentar a cabeca de cada linha na mesma passada — um formulario enviado
     depois de 10 chats e o 1o da linha dele, nao o 11. `priority` (painel, acao
     manual) fura a fila da propria linha/time sem quebrar o FIFO entre iguais.
-
-    `form_min_wait_sec` (padrao 5 min): o formulario so entra na linha dele
-    depois de esperar isso desde a chegada (`created_at`, nunca atualizado
-    apos o INSERT). Enquanto nao completa a espera, o chat continua sendo
-    roteado normalmente. `0` desliga a espera (usado pelos testes que nao
-    testam esta regra). Nao usa `next_try_at` para isso porque
-    `wake_team_routes` zera o backoff de qualquer rota do time ao fechar um
-    caso, o que anularia esse atraso.
     """
     linhas: dict[str, list[dict]] = {}
     for kind in ("chat", "form"):
-        extra_sql = ""
-        extra_args: list = []
-        if kind == "form" and form_min_wait_sec > 0:
-            extra_sql = " AND datetime(created_at) <= datetime('now', '-' || ? || ' seconds')"
-            extra_args = [str(int(form_min_wait_sec))]
         linhas[kind] = conn.execute(
             """SELECT * FROM pending_routes
                WHERE status = 'waiting' AND kind = ?
-                 AND (next_try_at IS NULL OR datetime(next_try_at) <= datetime('now'))"""
-            + extra_sql +
-            """ ORDER BY priority DESC, id
+                 AND (next_try_at IS NULL OR datetime(next_try_at) <= datetime('now'))
+               ORDER BY priority DESC, id
                LIMIT ?""",
-            (kind, *extra_args, max(1, int(per_line))),
+            (kind, max(1, int(per_line))),
         ).fetchall()
     return linhas
 

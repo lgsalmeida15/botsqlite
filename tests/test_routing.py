@@ -512,40 +512,22 @@ class MigracaoRoutingTest(unittest.TestCase):
 
     def test_due_routes_respeita_o_agendamento(self):
         db.enqueue_route(self.conn, "form", 1, "h:q1", 1, delay_sec=300)
-        self.assertEqual(
-            db.due_routes(self.conn, form_min_wait_sec=0), {"chat": [], "form": []}
-        )
+        self.assertEqual(db.due_routes(self.conn), {"chat": [], "form": []})
         db.enqueue_route(self.conn, "form", 2, "h:q1", 1, delay_sec=0)
-        due = db.due_routes(self.conn, form_min_wait_sec=0)
+        due = db.due_routes(self.conn)
         self.assertEqual([int(r["chat_id"]) for r in due["form"]], [2])
         self.assertEqual(due["chat"], [], "linha do chat e apartada")
         db.retry_route(self.conn, int(due["form"][0]["id"]), 1, 0, "sem analista")
-        self.assertEqual(int(db.due_routes(self.conn, form_min_wait_sec=0)["form"][0]["attempts"]), 1)
+        self.assertEqual(int(db.due_routes(self.conn)["form"][0]["attempts"]), 1)
 
     def test_due_routes_separa_as_linhas_do_chat_e_do_formulario(self):
         """Um formulario novo nao entra na fila atras dos chats (linhas apartadas)."""
         for cid in range(1, 4):
             db.enqueue_route(self.conn, "chat", cid, "h:q1", 1, delay_sec=0)
         db.enqueue_route(self.conn, "form", 9, "h:q1", 1, delay_sec=0)
-        due = db.due_routes(self.conn, form_min_wait_sec=0)
+        due = db.due_routes(self.conn)
         self.assertEqual([int(r["chat_id"]) for r in due["chat"]], [1, 2, 3])
         self.assertEqual([int(r["chat_id"]) for r in due["form"]], [9], "form e a cabeca da linha dele")
-
-    def test_due_routes_respeita_a_janela_minima_do_formulario(self):
-        """Formulario recem-chegado nao aparece; apos a janela, aparece; `0` desliga."""
-        rid = db.enqueue_route(self.conn, "form", 5, "h:q1", 1, delay_sec=0)
-        self.assertEqual(db.due_routes(self.conn)["form"], [], "recem-chegado, ainda na janela")
-        self.assertEqual(
-            [int(r["id"]) for r in db.due_routes(self.conn, form_min_wait_sec=0)["form"]], [rid],
-            "form_min_wait_sec=0 desliga a espera",
-        )
-        self.conn.execute(
-            "UPDATE pending_routes SET created_at = datetime('now', '-6 minutes') WHERE id = ?", (rid,)
-        )
-        self.assertEqual(
-            [int(r["id"]) for r in db.due_routes(self.conn)["form"]], [rid],
-            "6 min depois (> 5 min padrao), aparece",
-        )
 
     def test_waiting_routes_lista_o_que_espera_mesmo_adiado(self):
         """Bot desligado: o tick precisa de TODAS as rotas em espera, nas duas linhas.

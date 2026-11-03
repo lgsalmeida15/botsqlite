@@ -2389,17 +2389,6 @@ class Engine:
         valor = str(self.cfg.get("form_priority_always") or "true").strip().lower()
         return valor not in ("false", "0", "no")
 
-    def _form_route_min_wait_sec(self) -> int:
-        """Formulario so entra na disputa por vaga apos esperar isso desde a chegada.
-
-        Fixo por padrao (5 min); NAO exposto no painel. `0` desliga a espera
-        (usado pelos testes que nao testam esta regra).
-        """
-        try:
-            return max(0, int(self.cfg.get("form_route_min_wait_sec") or 300))
-        except (TypeError, ValueError):
-            return 300
-
     def _fila_desligada(self, q: str | None) -> bool:
         """A fila deste item esta DESABILITADA no painel (o bot nao atua nela)?"""
         return bool(q) and q not in self.enabled
@@ -3455,19 +3444,60 @@ class Engine:
         if not settings["form_enabled"]:
             self._emit("form_no_team", cid, queue_address, "time sem formulário habilitado")
             return
-        # Sempre enfileira: nao ha mais entrega imediata mesmo com analista
-        # livre na chegada — o formulario so entra na disputa por vaga depois
-        # de esperar `_form_route_min_wait_sec()` (padrao 5 min, ver
-        # `due_routes`). Quem decide analista, entrega, retry e fallback por
-        # tentativas esgotadas e sempre o loop de `tick_routes`.
+        req = form_open.requester_key(chat, self.own)
+        case_key = req[0]
+        picked, route = await self.pick_assignee(
+            queue_address, kind="form", retry_online=False, case_key=case_key
+        )
+        if picked:
+            token = self._claim_token()
+            claimed = db.claim_delivery(
+                self.conn, "form", cid, queue_address, int(team["id"]), token,
+                detail="formulario recebido", lease_sec=self._claim_lease(),
+            )
+            if claimed is None:
+                # Alguma execucao (tick/handler) ja esta entregando este formulario.
+                log.info("form %s ja esta em entrega por outra execucao", cid)
+                return
+            rid = int(claimed["id"])
+            db.set_delivery_marks(self.conn, rid, case_key=case_key, requester_addr=req[1])
+            ok, detail = await self._deliver_form(
+                cid, queue_address, picked, route, case_key, route_id=rid
+            )
+            if ok:
+                db.finish_route(self.conn, rid, "done", detail)
+                # Caso unico: o chat que esperava este formulario vai junto.
+                await self._deliver_sibling(case_key, str(picked.get("address") or ""), team)
+                return
+            route = detail
+            if self._move_falhas(detail) >= self._move_max_fail():
+                motivo = (
+                    f"{self._motivo_recusa(detail)} recusado pelo TOA "
+                    f"({self._move_falhas(detail)}x); rota encerrada"
+                )
+                db.finish_route(self.conn, rid, "failed", f"{motivo}; {detail}")
+                self._emit("form_move_refused", cid, queue_address, f"{motivo}; {detail}")
+                return
+            db.retry_route(self.conn, rid, 1, settings["retry_interval_sec"], detail)
+            self._emit("form_route_retry", cid, queue_address, f"tentativa 1; {detail}")
+            return
+        detail = route or "nenhum analista disponível no time"
+        if settings["fallback"] == "monitor" and not self._queue_on():
+            # Sem retry: fica registrado para ação manual (com a FILA ligada o
+            # formulario entra na fila normal e espera a vez, como o chat).
+            self._emit("form_no_agent", cid, queue_address, f"{detail}; fallback=monitor")
+            return
         db.enqueue_route(
             self.conn, "form", cid, queue_address, int(team["id"]),
-            detail="aguardando janela minima de roteamento", delay_sec=0,
+            detail=detail, delay_sec=settings["retry_interval_sec"],
         )
-        self._emit(
-            "queued", cid, queue_address,
-            "formulario na fila; aguardando janela minima de roteamento",
-        )
+        # A fila ligada ENFILEIRA (nao falha): o evento tem que dizer isso — antes
+        # saia `form_no_agent` e o painel mostrava "sem analista" para um item que
+        # estava esperando a vez (19 eventos em 3 h no banco real).
+        if self._queue_on():
+            self._emit("queued", cid, queue_address, f"sem analista elegivel; na fila; {detail}")
+        else:
+            self._emit("form_no_agent", cid, queue_address, detail)
 
     def _recover_classified(self) -> int:
         """Chats classificados sem nenhuma rota (crash entre classificar e entregar).
@@ -3522,7 +3552,7 @@ class Engine:
         # de um quadro que o operador tirou dele (nao ha rota em espera para o
         # loop acima ver).
         await self._devolver_chats_ao_quadro()
-        linhas = db.due_routes(self.conn, form_min_wait_sec=self._form_route_min_wait_sec())
+        linhas = db.due_routes(self.conn)
         if self._form_priority_always():
             # Formulario sempre primeiro, por inteiro: todas as rotas de form
             # devidas neste tick sao tentadas antes de qualquer chat — nao so a
