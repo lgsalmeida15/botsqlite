@@ -12,7 +12,7 @@ sys.path.insert(0, str(ROOT))
 
 from python import db  # noqa: E402
 from python.engine import MEM, Engine  # noqa: E402
-from tests.test_form_route import ANA, TEC, RouteSock, events, routes  # noqa: E402
+from tests.test_form_route import ANA, BIA, TEC, RouteSock, add_member, events, routes  # noqa: E402
 from tests.test_submenu import awaiting, insert_option, mem_conn, seed_queue_menu  # noqa: E402
 
 PERGUNTAS = [("Qual o protocolo?", "text", "")]
@@ -535,6 +535,25 @@ class QueueTest(unittest.IsolatedAsyncioTestCase):
         devidas = db.due_routes(conn)["chat"]
         self.assertEqual(len(devidas), 1, "a fila foi acordada na hora, sem esperar o backoff")
         self.assertEqual(int(devidas[0]["id"]), rid11)
+
+    async def test_time_travado_nao_bloqueia_outro_time_no_mesmo_tick(self):
+        """Reproduz o chat 17766107: backlog velho de 1 time (sem elegivel) nao
+        pode impedir OUTRO time, com elegivel disponivel, de ser atendido no
+        mesmo tick (antes, `due_routes` so olhava os 5 IDs mais antigos da
+        linha, globalmente — o time travado monopolizava os slots para sempre)."""
+        eng, conn, _sock = self._eng(online=["bia"])  # so bia (time 2) esta online; ana (time 1) nao
+        conn.execute("INSERT INTO queues (address, name, enabled) VALUES ('h:q2', 'Q2', 1)")
+        conn.execute("INSERT INTO teams (name, active) VALUES ('T2', 1)")
+        conn.execute("INSERT INTO team_queues (team_id, queue_address) VALUES (2, 'h:q2')")
+        add_member(conn, BIA, "Bia", team_id=2, sort_order=0)
+        eng.reload_config()  # h:q2 foi criada depois do Engine: precisa recarregar `self.enabled`
+        for cid in range(1, 11):
+            db.enqueue_route(conn, "form", cid, "h:q1", 1, detail="formulario", delay_sec=0)
+        db.enqueue_route(conn, "form", 99, "h:q2", 2, detail="formulario", delay_sec=0)
+        await eng.tick_routes()
+        done = routes(conn, "done")
+        self.assertEqual([int(r["chat_id"]) for r in done], [99], "time 2 foi atendido no mesmo tick")
+        self.assertEqual(len(routes(conn, "waiting")), 10, "time 1 segue esperando (continua sem elegivel)")
 
 
 class QueueSchemaTest(unittest.TestCase):

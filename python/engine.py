@@ -3284,6 +3284,55 @@ class Engine:
                 self._form_absent.pop(fid, None)
         return fechados
 
+    async def _resolve_online(
+        self, members: list[dict], settings: dict, *, retry_online: bool
+    ) -> tuple[set[str], int]:
+        """Quem do time esta online, para fins de ELEGIBILIDADE (routing).
+
+        Fonte primaria: a leitura ja cacheada em `analyst_load`
+        (`db.online_reading`) — o MESMO dado que `_capacidade` ja usa para
+        carga, com o mesmo criterio de frescor (`_load_fresh_sec`). So cai
+        para a chamada AO VIVO (`get_online_users`) para quem NAO tem leitura
+        fresca; com o cache resolvendo todo mundo, nenhuma chamada e feita.
+
+        Antes, toda chamada (inclusive as do tick de retentativa,
+        `retry_online=False`) ia direto ao TOA: um timeout isolado marcava o
+        TIME INTEIRO como offline so para aquela tentativa, mesmo com todos
+        sabidamente online pela leitura periodica da aba Carga.
+        """
+        fresh = self._load_fresh_sec()
+        online: set[str] = set()
+        stale: list[dict] = []
+        for m in members:
+            addr = str(m["address"])
+            lido = db.online_reading(self.conn, addr, fresh_sec=fresh)
+            if lido is None:
+                stale.append(m)
+                continue
+            if int(lido.get("online") or 0):
+                online.add(_member_login(addr))
+        if not stale:
+            return online, 0
+        logins = [_member_login_raw(m["address"]) for m in stale]
+        attempts = 0
+        for attempt in range(1, settings["attempts"] + 1):
+            attempts = attempt
+            parsed: list[str] | None = None
+            try:
+                ack = await self.sock.command(
+                    "get_online_users", {"users": logins}, timeout=12.0
+                )
+                parsed = _online_logins_from_ack(ack)
+            except Exception as e:
+                log.warning("get_online_users: %s", e)
+            if parsed:
+                online |= {_member_login(x) for x in parsed}
+            if parsed or not retry_online:
+                break
+            if attempt < settings["attempts"]:
+                await asyncio.sleep(settings["retry_interval_sec"])
+        return online, attempts
+
     async def pick_assignee(
         self,
         queue_address: str | None,
@@ -3333,27 +3382,13 @@ class Engine:
         last = str(tr.get(last_key) or "")
         if not last and kind == "chat":
             last = str(team.get("last_assigned") or "")
-        logins = [_member_login_raw(m["address"]) for m in members]
-        raw_online: list[str] = []
+        online: set[str] = set()
         attempts = 0
         if settings["require_online"]:
-            for attempt in range(1, settings["attempts"] + 1):
-                attempts = attempt
-                parsed: list[str] | None = None
-                try:
-                    ack = await self.sock.command(
-                        "get_online_users", {"users": logins}, timeout=12.0
-                    )
-                    parsed = _online_logins_from_ack(ack)
-                except Exception as e:
-                    log.warning("get_online_users: %s", e)
-                if parsed is not None:
-                    raw_online = parsed
-                if raw_online or not retry_online:
-                    break
-                if attempt < settings["attempts"]:
-                    await asyncio.sleep(settings["retry_interval_sec"])
-        online = {_member_login(x) for x in raw_online}
+            online, attempts = await self._resolve_online(members, settings, retry_online=retry_online)
+        raw_online = sorted(
+            _member_login_raw(m["address"]) for m in members if _member_login(m["address"]) in online
+        )
         casos, por_tipo, info = await self._capacidade(members, kind, queue_address)
         if force_assignee and _addr_eq(force_assignee, self.own):
             # O dono gravado e o proprio bot (config antiga): nao entrega — o caso

@@ -417,6 +417,42 @@ class FormRouteTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(picked)
         self.assertIn("excluido", detalhe)
 
+    async def test_elegibilidade_usa_o_cache_da_carga_sem_chamar_o_toa(self):
+        """Com leitura fresca em `analyst_load`, o 'online' nao depende de chamada
+        ao vivo — a mesma fonte que ja alimenta a carga resolve a elegibilidade."""
+        eng, conn, sock = self._eng(online=[])  # TOA nao veria ninguem online
+        db.load_upsert(conn, ANA, online=1, online_ok=1, toa_ok=1)
+        picked, _detalhe = await eng.pick_assignee("h:q1", kind="chat", retry_online=False)
+        self.assertIsNotNone(picked, "cache fresco deveria bastar para considerar ana online")
+        self.assertEqual(picked["address"], ANA)
+        self.assertNotIn("get_online_users", sock.names(), "cache resolveu todo mundo; sem chamada ao vivo")
+
+    async def test_elegibilidade_sobrevive_a_falha_do_toa_quando_cache_diz_online(self):
+        """Timeout/erro do TOA so afeta quem NAO tinha leitura fresca (bia, sem
+        cache); ana (com cache fresco) continua elegivel mesmo com a chamada
+        ao vivo falhando — antes, uma falha dessas marcava o TIME INTEIRO como
+        offline para aquela tentativa."""
+        eng, conn, sock = self._eng(online=[])
+        add_member(conn, BIA, "Bia", sort_order=1)  # sem leitura em analyst_load: fica "stale"
+
+        async def falha(name, payload=None, **kwargs):
+            if name == "get_online_users":
+                raise RuntimeError("timeout simulado do TOA")
+            return await RouteSock.command(sock, name, payload, **kwargs)
+
+        db.load_upsert(conn, ANA, online=1, online_ok=1, toa_ok=1)
+        sock.command = falha
+        picked, _detalhe = await eng.pick_assignee("h:q1", kind="chat", retry_online=False)
+        self.assertIsNotNone(picked, "cache fresco de ana protege da falha ao vivo (que so cobria bia)")
+        self.assertEqual(picked["address"], ANA)
+
+    async def test_elegibilidade_cai_para_chamada_ao_vivo_sem_cache(self):
+        """Sem leitura em `analyst_load` (comportamento de sempre): fallback ao vivo."""
+        eng, conn, sock = self._eng(online=["ana"])
+        picked, _detalhe = await eng.pick_assignee("h:q1", kind="chat", retry_online=False)
+        self.assertIsNotNone(picked)
+        self.assertIn("get_online_users", sock.names(), "sem cache, a checagem ao vivo roda normalmente")
+
     async def test_tick_com_o_bot_desligado_devolve_o_que_esperava(self):
         """Bot desligado no painel: as esperas sao ENCERRADAS, nao guardadas.
 

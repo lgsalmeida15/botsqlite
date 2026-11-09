@@ -529,6 +529,33 @@ class MigracaoRoutingTest(unittest.TestCase):
         self.assertEqual([int(r["chat_id"]) for r in due["chat"]], [1, 2, 3])
         self.assertEqual([int(r["chat_id"]) for r in due["form"]], [9], "form e a cabeca da linha dele")
 
+    def test_due_routes_e_justo_entre_times_no_mesmo_tick(self):
+        """Backlog antigo de 1 time nao pode monopolizar o `per_line` da linha.
+
+        Reproduz o caso real (chat 17766107): time 1 tinha dezenas de rotas de
+        formulario mais antigas (sem elegivel ha horas) e, por serem sempre as
+        de menor `id`, ocupavam os 5 slots do tick para sempre — nenhuma rota
+        de outro time era sequer tentada.
+        """
+        for cid in range(1, 11):
+            db.enqueue_route(self.conn, "form", cid, "h:q1", 1, delay_sec=0)
+        db.enqueue_route(self.conn, "form", 99, "h:q2", 2, delay_sec=0)
+        due = db.due_routes(self.conn, per_line=5)
+        times = {int(r["team_id"]) for r in due["form"]}
+        self.assertIn(2, times, "time 2 entra na rodada mesmo com time 1 tendo 10 rotas mais antigas")
+        self.assertEqual(len(due["form"]), 5, "o orcamento do tick continua o mesmo")
+
+    def test_due_routes_mantem_fifo_e_prioridade_dentro_do_time(self):
+        """A justica e ENTRE times; dentro do mesmo time a ordem de sempre vale."""
+        for cid in range(1, 4):
+            db.enqueue_route(self.conn, "form", cid, "h:q1", 1, delay_sec=0)
+        rid2 = [r for r in db.due_routes(self.conn)["form"] if int(r["chat_id"]) == 2][0]["id"]
+        db.set_route_priority(self.conn, int(rid2), 1)
+        db.enqueue_route(self.conn, "form", 50, "h:q2", 2, delay_sec=0)
+        due = db.due_routes(self.conn, per_line=5)
+        do_time1 = [int(r["chat_id"]) for r in due["form"] if int(r["team_id"]) == 1]
+        self.assertEqual(do_time1, [2, 1, 3], "priorizado fura a fila do proprio time; resto segue FIFO")
+
     def test_waiting_routes_lista_o_que_espera_mesmo_adiado(self):
         """Bot desligado: o tick precisa de TODAS as rotas em espera, nas duas linhas.
 

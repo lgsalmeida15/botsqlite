@@ -692,6 +692,27 @@ def load_reading(conn, address: str, fresh_sec: float = 90.0) -> dict | None:
     return row
 
 
+def online_reading(conn, address: str, fresh_sec: float = 90.0) -> dict | None:
+    """Ultima leitura de PRESENCA do analista — so se recente E bem sucedida.
+
+    Mesmo padrao do `load_reading` (carga), mas o gate aqui e `online_ok`: diz
+    se a leitura de `get_online_users` respondeu nesta volta — nao `toa_ok`,
+    que e sobre as listas de chat (outra chamada ao TOA). Confundir os dois
+    fazia a elegibilidade "online" (routing) nunca reaproveitar o cache da
+    aba Carga e depender de uma chamada ao vivo em toda retentativa.
+    """
+    row = conn.execute(
+        "SELECT *, (julianday('now') - julianday(at)) * 86400 AS idade"
+        " FROM analyst_load WHERE address = ?",
+        (str(address),),
+    ).fetchone()
+    if not row or not int(row.get("online_ok") or 0):
+        return None
+    if float(row.get("idade") or 0) > float(fresh_sec):
+        return None
+    return row
+
+
 def load_case_keys(row: dict | None) -> set[str]:
     """Chaves de caso (autor) que a ultima leitura viu no TOA para o analista."""
     if not row:
@@ -1601,24 +1622,60 @@ def finish_orphan_routes(conn, status: str = "failed",
     return int(cur.rowcount or 0)
 
 
-def due_routes(conn, per_line: int = 5) -> dict[str, list[dict]]:
+def _fair_round_robin(rows: list[dict], budget: int) -> list[dict]:
+    """1 rota por TIME a cada rodada antes de repetir — sem isso o backlog de
+    um time (sem analista elegivel ha horas) monopoliza os poucos slots do
+    tick para sempre, porque suas rotas sao sempre as mais antigas (menor
+    `id`) e `due_routes` so olhava `id`, nunca `team_id`. A ordem relativa
+    dentro de cada time (priority DESC, id) e preservada.
+    """
+    por_time: dict = {}
+    ordem: list = []
+    for r in rows:
+        tid = r.get("team_id")
+        fila_time = por_time.setdefault(tid, [])
+        if not fila_time:
+            ordem.append(tid)
+        fila_time.append(r)
+    escolhidos: list[dict] = []
+    rodada = 0
+    while len(escolhidos) < budget:
+        avancou = False
+        for tid in ordem:
+            fila_time = por_time[tid]
+            if rodada < len(fila_time):
+                escolhidos.append(fila_time[rodada])
+                avancou = True
+                if len(escolhidos) >= budget:
+                    break
+        if not avancou:
+            break
+        rodada += 1
+    return escolhidos
+
+
+def due_routes(conn, per_line: int = 5, scan_limit: int = 2000) -> dict[str, list[dict]]:
     """Rotas vencidas por LINHA: chat e formulario esperam em filas apartadas.
 
-    Devolve as duas listas (cada uma FIFO por `id`, priorizados primeiro) para o
-    tick tentar a cabeca de cada linha na mesma passada — um formulario enviado
-    depois de 10 chats e o 1o da linha dele, nao o 11. `priority` (painel, acao
-    manual) fura a fila da propria linha/time sem quebrar o FIFO entre iguais.
+    Devolve as duas listas, uma rodada de round-robin POR TIME (ver
+    `_fair_round_robin`) dentro de cada linha, para o tick tentar a cabeca de
+    cada time na mesma passada — um formulario enviado depois de 10 chats e o
+    1o da linha dele, nao o 11, e um time com backlog velho sem elegivel nao
+    engole os slots de todo mundo. `priority` (painel, acao manual) fura a
+    fila do proprio time sem quebrar o FIFO entre iguais. `scan_limit` e so
+    uma rede de seguranca de performance — nao e o orcamento real por tick.
     """
     linhas: dict[str, list[dict]] = {}
     for kind in ("chat", "form"):
-        linhas[kind] = conn.execute(
+        vencidas = conn.execute(
             """SELECT * FROM pending_routes
                WHERE status = 'waiting' AND kind = ?
                  AND (next_try_at IS NULL OR datetime(next_try_at) <= datetime('now'))
                ORDER BY priority DESC, id
                LIMIT ?""",
-            (kind, max(1, int(per_line))),
+            (kind, max(1, int(scan_limit))),
         ).fetchall()
+        linhas[kind] = _fair_round_robin(vencidas, max(1, int(per_line)))
     return linhas
 
 
