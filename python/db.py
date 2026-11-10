@@ -1367,9 +1367,12 @@ def form_messages_text(conn, chat_id: int) -> list[str]:
 def realocado_resolvido(conn, activity_id: int, desde_brt) -> bool:
     """O robo (outro schema, mesmo servidor) ja marcou sucesso para esta atividade?
 
-    `desde_brt` e o inicio do formulario convertido para horario de Brasilia
-    (o relogio que a tabela `robo.toa__validacao_realocado` usa) -- sem isso o
-    filtro de data compara fusos diferentes e erra.
+    `desde_brt` e o inicio do formulario (convertido para horario de Brasilia,
+    o relogio que a tabela `robo.toa__validacao_realocado` usa -- sem isso o
+    filtro de data compara fusos diferentes e erra) MENOS a margem de
+    tolerancia (ver `Engine._realocado_tolerancia_sec`): o robo as vezes
+    resolve poucos segundos ANTES de um formulario duplicado chegar para o
+    mesmo `activityId`, e sem essa margem esse sucesso real seria descartado.
     """
     row = conn.execute(
         """SELECT 1 FROM robo.toa__validacao_realocado

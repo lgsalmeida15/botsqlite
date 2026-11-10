@@ -2595,6 +2595,20 @@ class Engine:
         except (TypeError, ValueError):
             return 30.0
 
+    def _realocado_tolerancia_sec(self) -> float:
+        """Margem ANTES do inicio do formulario que ainda conta como sucesso valido.
+
+        Formularios duplicados chegam as vezes poucos segundos depois do robo
+        ja ter resolvido o mesmo `activityId` (o robo sempre processa primeiro;
+        o segundo formulario e so um reenvio/race do lado do TOA) -- sem essa
+        margem, um sucesso real do robo minutos antes deste formulario
+        especifico e descartado por engano.
+        """
+        try:
+            return max(0.0, float(self.cfg.get("realocado_tolerancia_sec") or 300.0))
+        except (TypeError, ValueError):
+            return 300.0
+
     async def _realocado_segurar(self, row: dict, rid: int, cid: int, q: str | None, used: int) -> bool:
         """Formulario "TAREFA REALOCADA": segura e confere o robo antes de entregar.
 
@@ -2622,8 +2636,9 @@ class Engine:
         if activity_id is None:
             return False
         inicio_brt = datetime.fromtimestamp(epoch, tz=TZ_BRT).replace(tzinfo=None)
+        limite_brt = inicio_brt - timedelta(seconds=self._realocado_tolerancia_sec())
         try:
-            resolvido = db.realocado_resolvido(self.conn, activity_id, inicio_brt)
+            resolvido = db.realocado_resolvido(self.conn, activity_id, limite_brt)
         except Exception as e:
             log.warning("realocado_resolvido %s (activityId=%s): %s", cid, activity_id, e)
             return False

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -17,6 +18,7 @@ sys.path.insert(0, str(ROOT))
 from python import db  # noqa: E402
 from python import realocado  # noqa: E402
 from python.engine import MEM  # noqa: E402
+from python.routing import TZ_BRT  # noqa: E402
 from tests.test_form_open import form_chat  # noqa: E402
 from tests.test_form_route import RouteSock, engine_with, events, routes  # noqa: E402
 from tests.test_submenu import mem_conn, seed_queue_menu  # noqa: E402
@@ -136,6 +138,26 @@ class RealocadoEngineTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rota["status"], "done")
         self.assertIn("resolvido pela automacao de realocacao", str(rota["detail"] or ""))
         self.assertIn("form_realocado_resolvido", events(conn))
+
+    async def test_tick_aplica_margem_de_tolerancia_antes_do_inicio(self):
+        """Formulario duplicado: robo pode ter resolvido poucos segundos ANTES
+        deste formulario especifico (o robo sempre roda primeiro) -- o limite
+        passado para a consulta precisa recuar a margem de tolerancia, senao
+        esse sucesso real seria descartado por engano."""
+        eng, conn, sock = self._eng(msgs={99: [{"author": "CREATEDBYMESSAGESCENARIO", "text": TEXTO_REALOCADO, "time": 1}]})
+        await eng.consider(form_chat())
+        self._torna_elegivel_para_checagem(conn)
+        rota_antes = routes(conn)[0]
+        inicio_brt = datetime.fromisoformat(str(rota_antes["created_at"]).replace(" ", "T")).replace(
+            tzinfo=None
+        ) - timedelta(hours=3)
+        with mock.patch.object(db, "realocado_resolvido", return_value=False) as fake:
+            await eng.tick_routes()
+        fake.assert_called_once()
+        limite_usado = fake.call_args.args[2]
+        self.assertAlmostEqual(
+            (inicio_brt - limite_usado).total_seconds(), 300.0, delta=2.0
+        )
 
     async def test_tick_nao_resolvido_segue_fluxo_normal(self):
         eng, conn, sock = self._eng(msgs={99: [{"author": "CREATEDBYMESSAGESCENARIO", "text": TEXTO_REALOCADO, "time": 1}]})
