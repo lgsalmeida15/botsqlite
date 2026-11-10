@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -1350,10 +1351,13 @@ def record_message(
 
 
 # ---------------------------------------------------------------------- #
-# Checagem TEMPORARIA do formulario "TAREFA REALOCADA" (ver python/realocado.py
-# e Engine._realocado_segurar). Remover junto com o resto da feature quando a
-# ponte com o robo de realocacao nao for mais necessaria.
+# Formulario: utilitarios PERMANENTES (dedup por activityId do TOA e leitura
+# do texto gravado). Nao removiveis -- ao contrario da checagem do robo logo
+# abaixo, isto nao depende da automacao de realocacao.
 # ---------------------------------------------------------------------- #
+
+_ACTIVITY_ID_RE = re.compile(r"activityId=(\d+)")
+
 
 def form_messages_text(conn, chat_id: int) -> list[str]:
     """Textos ja gravados do formulario (ver `chat_messages`), para classificar."""
@@ -1363,6 +1367,47 @@ def form_messages_text(conn, chat_id: int) -> list[str]:
     ).fetchall()
     return [str(r.get("text") or "") for r in rows]
 
+
+def form_duplicate_of(conn, chat_id: int, desde_utc) -> tuple[int, int] | None:
+    """Este formulario repete o activityId de um chat_id MAIS ANTIGO, dentro da
+    janela (`desde_utc`)? Devolve `(chat_id_original, activity_id)` quando sim,
+    senao `None` (sem activityId neste formulario, ou nenhum mais antigo com o
+    mesmo id dentro da janela).
+
+    O TOA as vezes reenvia o mesmo formulario de validacao mais de uma vez
+    (mesmo activityId, conteudo identico) -- so o PRIMEIRO (menor chat_id)
+    deve chegar a disputar vaga de analista. `desde_utc` existe porque o MESMO
+    activityId pode ser reaproveitado pelo TOA dias depois para uma
+    reatribuicao nova de verdade: sem o limite de tempo, um formulario
+    legitimo seria descartado por engano so por reciclar o mesmo id.
+    """
+    textos = form_messages_text(conn, chat_id)
+    activity_id = None
+    for t in textos:
+        m = _ACTIVITY_ID_RE.search(t or "")
+        if m:
+            activity_id = int(m.group(1))
+            break
+    if activity_id is None:
+        return None
+    candidatos = conn.execute(
+        """SELECT chat_id, text FROM chat_messages
+            WHERE kind = 'form' AND chat_id < ? AND at >= ?
+            ORDER BY chat_id ASC""",
+        (int(chat_id), desde_utc),
+    ).fetchall()
+    for row in candidatos:
+        m = _ACTIVITY_ID_RE.search(str(row.get("text") or ""))
+        if m and int(m.group(1)) == activity_id:
+            return int(row["chat_id"]), activity_id
+    return None
+
+
+# ---------------------------------------------------------------------- #
+# Checagem TEMPORARIA do formulario "TAREFA REALOCADA" (ver python/realocado.py
+# e Engine._realocado_segurar). Remover junto com o resto da feature quando a
+# ponte com o robo de realocacao nao for mais necessaria.
+# ---------------------------------------------------------------------- #
 
 def realocado_resolvido(conn, activity_id: int, desde_brt) -> bool:
     """O robo (outro schema, mesmo servidor) ja marcou sucesso para esta atividade?

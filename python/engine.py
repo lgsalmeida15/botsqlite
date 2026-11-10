@@ -2649,6 +2649,44 @@ class Engine:
         self._emit("form_realocado_resolvido", cid, q, detail)
         return True
 
+    # ------------- Formulario duplicado (mesmo activityId do TOA) --------- #
+    # Regra PERMANENTE (nao e workaround do robo): o TOA as vezes reenvia o
+    # mesmo formulario de validacao mais de uma vez -- confirmado em producao
+    # (~16% dos formularios em 7 dias tem par, sempre mesmo activityId e
+    # conteudo identico, nunca mais de ~3h30 de diferenca). So o primeiro
+    # (menor chat_id) chega a disputar vaga de analista; os demais sao
+    # encerrados aqui, na chegada.
+
+    def _form_dedupe_enabled(self) -> bool:
+        valor = str(self.cfg.get("form_dedupe_enabled") or "true").strip().lower()
+        return valor not in ("false", "0", "no")
+
+    def _form_dedupe_window_sec(self) -> float:
+        try:
+            return max(0.0, float(self.cfg.get("form_dedupe_window_sec") or 21600.0))
+        except (TypeError, ValueError):
+            return 21600.0
+
+    async def _descarta_form_duplicado(self, cid: int, queue_address: str | None, team: dict | None) -> bool:
+        """Formulario repetido: mesmo activityId de um chat_id mais antigo dentro
+        da janela. Encerra aqui (como resolvido, sem analista) e devolve True
+        para o chamador nao prosseguir com o roteamento normal.
+        """
+        if not self._form_dedupe_enabled():
+            return False
+        desde_utc = (
+            datetime.now(timezone.utc).replace(tzinfo=None)
+            - timedelta(seconds=self._form_dedupe_window_sec())
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        achado = db.form_duplicate_of(self.conn, cid, desde_utc)
+        if achado is None:
+            return False
+        original, activity_id = achado
+        detail = f"formulario duplicado; mesmo activityId={activity_id} do chat {original}"
+        self._mark_route_done(cid, queue_address, int(team["id"]) if team else None, detail)
+        self._emit("form_duplicado_descartado", cid, queue_address, detail)
+        return True
+
     async def _realocado_primeiro_contato(self, cid: int, queue_address: str | None, team: dict | None) -> bool:
         """Primeiro contato do formulario (`route_form`, fora do tick): TAREFA
         REALOCADA nunca tenta entrega de cara -- so enfileira (sem rota ainda
@@ -2658,9 +2696,6 @@ class Engine:
         """
         if not self._realocado_check_enabled():
             return False
-        # Forca a leitura: no primeiro contato ainda nao existe mensagem gravada
-        # (so acontece hoje dentro de `_deliver_form`, que aqui queremos evitar).
-        await self._refresh_form_state(cid, motivo="realocado_check", forcar=True)
         textos = db.form_messages_text(self.conn, cid)
         if not realocado.is_realocado(textos):
             return False
@@ -3761,6 +3796,13 @@ class Engine:
             return
         if not settings["form_enabled"]:
             self._emit("form_no_team", cid, queue_address, "time sem formulário habilitado")
+            return
+        if self._form_dedupe_enabled() or self._realocado_check_enabled():
+            # Forca a leitura: no primeiro contato ainda nao existe mensagem
+            # gravada (so aconteceria dentro de `_deliver_form`, que as duas
+            # checagens abaixo precisam adiantar).
+            await self._refresh_form_state(cid, motivo="form_primeiro_contato_check", forcar=True)
+        if await self._descarta_form_duplicado(cid, queue_address, team):
             return
         if await self._realocado_primeiro_contato(cid, queue_address, team):
             return
