@@ -1349,6 +1349,37 @@ def record_message(
         log.warning("chat_messages: insert falhou chat=%s", chat_id, exc_info=True)
 
 
+# ---------------------------------------------------------------------- #
+# Checagem TEMPORARIA do formulario "TAREFA REALOCADA" (ver python/realocado.py
+# e Engine._realocado_segurar). Remover junto com o resto da feature quando a
+# ponte com o robo de realocacao nao for mais necessaria.
+# ---------------------------------------------------------------------- #
+
+def form_messages_text(conn, chat_id: int) -> list[str]:
+    """Textos ja gravados do formulario (ver `chat_messages`), para classificar."""
+    rows = conn.execute(
+        "SELECT text FROM chat_messages WHERE kind = 'form' AND chat_id = ?",
+        (int(chat_id),),
+    ).fetchall()
+    return [str(r.get("text") or "") for r in rows]
+
+
+def realocado_resolvido(conn, activity_id: int, desde_brt) -> bool:
+    """O robo (outro schema, mesmo servidor) ja marcou sucesso para esta atividade?
+
+    `desde_brt` e o inicio do formulario convertido para horario de Brasilia
+    (o relogio que a tabela `robo.toa__validacao_realocado` usa) -- sem isso o
+    filtro de data compara fusos diferentes e erra.
+    """
+    row = conn.execute(
+        """SELECT 1 FROM robo.toa__validacao_realocado
+            WHERE activityId = ? AND sucesso = 1 AND criado_em > ?
+            LIMIT 1""",
+        (int(activity_id), desde_brt),
+    ).fetchone()
+    return row is not None
+
+
 def log_event(
     conn,
     reason: str,

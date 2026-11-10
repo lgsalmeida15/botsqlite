@@ -11,6 +11,7 @@ from urllib.parse import urlencode, urlsplit
 
 from . import db
 from . import form_open
+from . import realocado
 from . import resource_profile
 from . import routing
 from .resume import resume_action
@@ -2574,6 +2575,88 @@ class Engine:
         valor = str(self.cfg.get("form_priority_always") or "true").strip().lower()
         return valor not in ("false", "0", "no")
 
+    # ------------- Checagem TEMPORARIA "TAREFA REALOCADA" (robo) ---------- #
+    # Ver python/realocado.py: tudo aqui some junto quando a feature deixar de
+    # ser necessaria (ponte com a automacao externa de realocacao de tarefa).
+
+    def _realocado_check_enabled(self) -> bool:
+        valor = str(self.cfg.get("realocado_check_enabled") or "true").strip().lower()
+        return valor not in ("false", "0", "no")
+
+    def _realocado_delay_sec(self) -> float:
+        try:
+            return max(0.0, float(self.cfg.get("realocado_delay_sec") or 300.0))
+        except (TypeError, ValueError):
+            return 300.0
+
+    def _realocado_poll_sec(self) -> float:
+        try:
+            return float(self.cfg.get("realocado_poll_sec") or 30.0)
+        except (TypeError, ValueError):
+            return 30.0
+
+    async def _realocado_segurar(self, row: dict, rid: int, cid: int, q: str | None, used: int) -> bool:
+        """Formulario "TAREFA REALOCADA": segura e confere o robo antes de entregar.
+
+        Devolve True quando o tick NAO deve prosseguir com a entrega normal
+        neste passo (ainda dentro do atraso, ou ja resolvido pelo robo).
+        Qualquer problema (sem classificacao, sem activityId, consulta ao
+        schema `robo` falhou) devolve False e o fluxo de hoje segue intacto.
+        """
+        if not self._realocado_check_enabled():
+            return False
+        textos = db.form_messages_text(self.conn, cid)
+        if not realocado.is_realocado(textos):
+            return False
+        epoch = _sql_epoch(row.get("created_at"))
+        if epoch is None:
+            return False
+        decorrido = time.time() - epoch
+        if decorrido < self._realocado_delay_sec():
+            db.retry_route(
+                self.conn, rid, used, self._realocado_poll_sec(),
+                "aguardando checagem de realocacao automatica",
+            )
+            return True
+        activity_id = realocado.extract_activity_id(textos)
+        if activity_id is None:
+            return False
+        inicio_brt = datetime.fromtimestamp(epoch, tz=TZ_BRT).replace(tzinfo=None)
+        try:
+            resolvido = db.realocado_resolvido(self.conn, activity_id, inicio_brt)
+        except Exception as e:
+            log.warning("realocado_resolvido %s (activityId=%s): %s", cid, activity_id, e)
+            return False
+        if not resolvido:
+            return False
+        detail = f"resolvido pela automacao de realocacao; activityId={activity_id}"
+        db.finish_route(self.conn, rid, "done", detail)
+        self._emit("form_realocado_resolvido", cid, q, detail)
+        return True
+
+    async def _realocado_primeiro_contato(self, cid: int, queue_address: str | None, team: dict | None) -> bool:
+        """Primeiro contato do formulario (`route_form`, fora do tick): TAREFA
+        REALOCADA nunca tenta entrega de cara -- so enfileira (sem rota ainda
+        criada, `pick_assignee`/`_deliver_form` nao foram chamados). A partir
+        dai quem cuida do atraso de 5 min + checagem do robo e o tick normal
+        (`_realocado_segurar`, que roda sobre a rota ja existente).
+        """
+        if not self._realocado_check_enabled():
+            return False
+        # Forca a leitura: no primeiro contato ainda nao existe mensagem gravada
+        # (so acontece hoje dentro de `_deliver_form`, que aqui queremos evitar).
+        await self._refresh_form_state(cid, motivo="realocado_check", forcar=True)
+        textos = db.form_messages_text(self.conn, cid)
+        if not realocado.is_realocado(textos):
+            return False
+        detail = "TAREFA REALOCADA: aguardando checagem da automacao antes de entregar"
+        db.enqueue_route(
+            self.conn, "form", cid, queue_address, int(team["id"]) if team else None,
+            detail=detail, delay_sec=0,
+        )
+        self._emit("form_realocado_aguardando", cid, queue_address, detail)
+        return True
+
     def _fila_desligada(self, q: str | None) -> bool:
         """A fila deste item esta DESABILITADA no painel (o bot nao atua nela)?"""
         return bool(q) and q not in self.enabled
@@ -3664,6 +3747,8 @@ class Engine:
         if not settings["form_enabled"]:
             self._emit("form_no_team", cid, queue_address, "time sem formulário habilitado")
             return
+        if await self._realocado_primeiro_contato(cid, queue_address, team):
+            return
         req = form_open.requester_key(chat, self.own)
         case_key = req[0]
         picked, route = await self.pick_assignee(
@@ -3808,6 +3893,8 @@ class Engine:
             cid = int(row["chat_id"])
             q = row.get("queue_address")
             used = int(row.get("attempts") or 0)
+            if kind == "form" and await self._realocado_segurar(row, rid, cid, q, used):
+                continue
             if self._fila_desligada(q):
                 # Fila desabilitada no painel: o bot nao atua nela. Encerra a rota
                 # com o motivo e sai do chat em silencio — o atendimento volta
