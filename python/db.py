@@ -1712,31 +1712,37 @@ def finish_orphan_routes(conn, status: str = "failed",
     return int(cur.rowcount or 0)
 
 
-def _fair_round_robin(rows: list[dict], budget: int) -> list[dict]:
-    """1 rota por TIME a cada rodada antes de repetir — sem isso o backlog de
-    um time (sem analista elegivel ha horas) monopoliza os poucos slots do
-    tick para sempre, porque suas rotas sao sempre as mais antigas (menor
-    `id`) e `due_routes` so olhava `id`, nunca `team_id`. A ordem relativa
-    dentro de cada time (priority DESC, id) e preservada.
+def _fair_round_robin(rows: list[dict], budget: int | None = None) -> list[dict]:
+    """1 rota por HELPDESK a cada rodada antes de repetir.
+
+    Agrupa por `queue_address` (a fila e por HELPDESK — cada helpdesk tem 1
+    time responsavel via `team_queues`, 1:1), nao por `team_id`: um time com
+    mais de um helpdesk nao deve deixar um helpdesk comer o espaco do outro.
+    Sem `budget` (ou `budget=None`), devolve TODAS as linhas recebidas, so
+    reordenadas de forma justa entre helpdesks — avaliar nao tem custo de TOA
+    (usa capacidade em cache), so a ENTREGA de fato precisa de teto (ver
+    `Engine.tick_routes`). A ordem relativa dentro de cada helpdesk
+    (priority DESC, id) e preservada. Ver docs/plano-correcao-fila-esquecida.md.
     """
-    por_time: dict = {}
+    por_fila: dict = {}
     ordem: list = []
     for r in rows:
-        tid = r.get("team_id")
-        fila_time = por_time.setdefault(tid, [])
-        if not fila_time:
-            ordem.append(tid)
-        fila_time.append(r)
+        chave = r.get("queue_address")
+        fila_helpdesk = por_fila.setdefault(chave, [])
+        if not fila_helpdesk:
+            ordem.append(chave)
+        fila_helpdesk.append(r)
+    limite = len(rows) if budget is None else max(0, int(budget))
     escolhidos: list[dict] = []
     rodada = 0
-    while len(escolhidos) < budget:
+    while len(escolhidos) < limite:
         avancou = False
-        for tid in ordem:
-            fila_time = por_time[tid]
-            if rodada < len(fila_time):
-                escolhidos.append(fila_time[rodada])
+        for chave in ordem:
+            fila_helpdesk = por_fila[chave]
+            if rodada < len(fila_helpdesk):
+                escolhidos.append(fila_helpdesk[rodada])
                 avancou = True
-                if len(escolhidos) >= budget:
+                if len(escolhidos) >= limite:
                     break
         if not avancou:
             break
@@ -1744,16 +1750,17 @@ def _fair_round_robin(rows: list[dict], budget: int) -> list[dict]:
     return escolhidos
 
 
-def due_routes(conn, per_line: int = 5, scan_limit: int = 2000) -> dict[str, list[dict]]:
+def due_routes(conn, scan_limit: int = 2000) -> dict[str, list[dict]]:
     """Rotas vencidas por LINHA: chat e formulario esperam em filas apartadas.
 
-    Devolve as duas listas, uma rodada de round-robin POR TIME (ver
-    `_fair_round_robin`) dentro de cada linha, para o tick tentar a cabeca de
-    cada time na mesma passada — um formulario enviado depois de 10 chats e o
-    1o da linha dele, nao o 11, e um time com backlog velho sem elegivel nao
-    engole os slots de todo mundo. `priority` (painel, acao manual) fura a
-    fila do proprio time sem quebrar o FIFO entre iguais. `scan_limit` e so
-    uma rede de seguranca de performance — nao e o orcamento real por tick.
+    Devolve TODA rota vencida de TODO helpdesk (sem orcamento fixo por tick) —
+    reordenada por rodizio justo (`_fair_round_robin`) entre helpdesks, para
+    nenhum ficar sem ser reavaliado quando ha muitos sem analista elegivel ao
+    mesmo tempo (era o `per_line` antigo; ver
+    docs/plano-correcao-fila-esquecida.md). Avaliar e barato — usa capacidade
+    em cache, sem chamada ao TOA; quem precisa de teto e a ENTREGA de fato,
+    aplicado em `Engine.tick_routes`. `scan_limit` e so rede de seguranca de
+    performance, nao o orcamento do tick.
     """
     linhas: dict[str, list[dict]] = {}
     for kind in ("chat", "form"):
@@ -1765,7 +1772,7 @@ def due_routes(conn, per_line: int = 5, scan_limit: int = 2000) -> dict[str, lis
                LIMIT ?""",
             (kind, max(1, int(scan_limit))),
         ).fetchall()
-        linhas[kind] = _fair_round_robin(vencidas, max(1, int(per_line)))
+        linhas[kind] = _fair_round_robin(vencidas)
     return linhas
 
 
@@ -1821,6 +1828,21 @@ def wake_team_routes(conn, team_id) -> int:
         " WHERE status = 'waiting' AND team_id IS ?"
         " AND next_try_at IS NOT NULL AND datetime(next_try_at) > datetime('now')",
         (team_id,),
+    )
+    return int(cur.rowcount or 0)
+
+
+def wake_all_routes(conn) -> int:
+    """Acorda TODA a fila (todos os times) de uma vez.
+
+    Usada no boot (`Engine.bootstrap`): sem isso, uma rota que ficou parada
+    durante a queda so seria reavaliada no primeiro `snapshot_load` natural
+    (ate `load_poll_sec`, padrao 30s) depois do processo voltar.
+    """
+    cur = conn.execute(
+        "UPDATE pending_routes SET next_try_at = datetime('now')"
+        " WHERE status = 'waiting'"
+        " AND next_try_at IS NOT NULL AND datetime(next_try_at) > datetime('now')"
     )
     return int(cur.rowcount or 0)
 

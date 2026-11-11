@@ -481,6 +481,16 @@ class Engine:
         self._recent: dict[int, list[dict]] = {}
         # Fila em duas linhas (chat e formulario): de qual delas o tick comeca.
         self._turno_fila = 0
+        # Elegibilidade do analista (janela + online + abaixo do cap) na ultima
+        # leitura de `snapshot_load`, por "team_id:address" — usado so para
+        # detectar a TRANSICAO para disponivel e acordar a fila do time dele
+        # (ver docs/plano-correcao-fila-esquecida.md). Reinicia no restart, sem
+        # risco: na pior hipotese perde 1 deteccao de transicao logo apos boot.
+        self._elegivel_cache: dict[str, bool] = {}
+        # Leitura degradada por fila: desde quando `toa_ok` esta falso (chave
+        # ausente = leitura ok) e se o alerta ja foi emitido para nao repetir.
+        self._queue_read_bad_since: dict[str, float] = {}
+        self._queue_read_degraded_alerted: set[str] = set()
 
     def reload_config(self) -> None:
         self.cfg = db.settings(self.conn)
@@ -3242,6 +3252,23 @@ class Engine:
             fontes.update(vistos)
             ok_geral = ok_geral or ok
             if q:
+                if ok:
+                    self._queue_read_bad_since.pop(q, None)
+                    self._queue_read_degraded_alerted.discard(q)
+                else:
+                    desde = self._queue_read_bad_since.setdefault(q, time.monotonic())
+                    limite = float(self.cfg.get("queue_read_degraded_sec") or 300)
+                    if time.monotonic() - desde >= limite and q not in self._queue_read_degraded_alerted:
+                        # So uma vez por degradacao (nao a cada ciclo de 30s) —
+                        # some sozinho no proximo `ok` (acima). Antes isso era
+                        # silencioso: nem a deteccao de fechamento de caso nem o
+                        # aviso de disponibilidade (ver `_elegivel_cache` abaixo)
+                        # enxergam liberacao de vaga quando a leitura falha.
+                        self._queue_read_degraded_alerted.add(q)
+                        self._emit(
+                            "queue_read_degraded", None, q,
+                            f"leitura do TOA falhando ha {int(time.monotonic() - desde)}s",
+                        )
                 # Fila do TOA (card FILA FORMS): o que a lista `pending` mostrou
                 # PARA ESTA fila, deduplicado por chat_id — inclusive entre
                 # filas do MESMO snapshot (um chat em duas filas nao pode virar
@@ -3299,6 +3326,9 @@ class Engine:
             reservas[str(addr)] = reservas.get(str(addr), 0) + 1
         total = 0
         for tid, _nome in equipes:
+            settings_tid = routing.resolve_settings(self.cfg, db.team_routing(self.conn, tid), "chat")
+            mrouting_tid = db.team_member_routing(self.conn, tid)
+            schedules_tid = db.team_schedules(self.conn, tid)
             for m in membros_por_time[tid]:
                 addr = str(m.get("address") or "")
                 if not addr:
@@ -3320,6 +3350,37 @@ class Engine:
                 # chat do mesmo solicitante = 1 caso). O ledger so entra como piso
                 # quando a leitura falhou — senao a tabela zeraria com caso aberto.
                 casos = set(casos_toa) if ok_geral else set(info["casos"])
+                if ok_geral and (online_ok or not settings_tid.get("require_online", True)):
+                    # So decide com leitura boa, de casos E de online (mesma
+                    # regra da deteccao de fechamento de caso) — sem isso uma
+                    # falha de leitura podia "achar" o analista disponivel por
+                    # engano.
+                    rules = routing.member_rules(mrouting_tid.get(addr), settings_tid, "chat")
+                    limite_cap = rules.get("cap_cases")
+                    if limite_cap is None:
+                        limite_cap = rules.get("cap")
+                    abaixo_do_cap = limite_cap is None or len(casos) < int(limite_cap)
+                    na_janela = (not settings_tid.get("respect_window", True)) or _in_route_window(
+                        m, datetime.now(TZ_BRT),
+                        rows=routing.resolve_member_schedule(schedules_tid, addr),
+                    )
+                    precisa_online = bool(settings_tid.get("require_online", True))
+                    esta_online = (not precisa_online) or (_member_login(addr) in online)
+                    elegivel_agora = bool(na_janela and esta_online and abaixo_do_cap)
+                    chave_cache = f"{tid}:{addr}"
+                    elegivel_antes = self._elegivel_cache.get(chave_cache)
+                    if elegivel_antes is False and elegivel_agora:
+                        # Analista acabou de ficar disponivel (fechou caso,
+                        # ficou online ou entrou na janela do turno): acorda so
+                        # a fila do time dele, sem esperar o proximo tick achar
+                        # por acaso (ver docs/plano-correcao-fila-esquecida.md).
+                        acordadas = db.wake_team_routes(self.conn, tid)
+                        if acordadas:
+                            self._emit(
+                                "analyst_available", None, None,
+                                f"{addr}; time={tid}; rotas_acordadas={acordadas}",
+                            )
+                    self._elegivel_cache[chave_cache] = elegivel_agora
                 ocioso = 0.0
                 presente = 0
                 for fid in info["forms_ids"]:
@@ -3948,6 +4009,13 @@ class Engine:
                 if i < len(segunda):
                     fila.append(segunda[i])
         self._turno_fila += 1
+        # Teto so da ENTREGA de fato (chamada real ao TOA: move_chat/invite),
+        # nao da avaliacao — `due_routes` ja devolve toda fila devida (sem
+        # orcamento global) e aqui ela e varrida inteira; sem isso uma rajada
+        # grande demais (ex.: depois de uma queda longa) poderia sobrecarregar
+        # o TOA com entregas simultaneas demais no mesmo tick de 5s.
+        entregas_tick = 0
+        cap_entregas = max(1, int(self.cfg.get("transfer_deliveries_per_tick") or 20))
         for row in fila:
             rid = int(row["id"])
             atual = db.delivery_marks(self.conn, rid)
@@ -4066,6 +4134,15 @@ class Engine:
                         cid, q, f"tentativa {used + 1}; {route}",
                     )
                 continue
+            if entregas_tick >= cap_entregas:
+                # Orcamento de ENTREGA deste tick esgotado: a rota ja foi
+                # avaliada (achou analista), so a chamada ao TOA fica para o
+                # proximo tick, 5s depois — sem contar como tentativa sem
+                # analista (nao incrementa `used`) e sem perder a vaga achada
+                # (o proximo tick refaz o `pick_assignee`).
+                db.retry_route(self.conn, rid, used, 5, f"orcamento de entregas do tick ({cap_entregas}); {route}")
+                continue
+            entregas_tick += 1
             if kind != "form":
                 ok, detail = await self._deliver_chat(
                     cid, q, picked, route, case_key, req=req, route_id=rid, token=token
@@ -4319,6 +4396,15 @@ class Engine:
             await self.resume_open_chats()
         except Exception:
             log.exception("resume_open_chats")
+        try:
+            # Acorda toda a fila no boot: sem isso, uma rota parada durante a
+            # queda so seria reavaliada no primeiro `snapshot_load` natural
+            # (ate `load_poll_sec`, padrao 30s) depois do processo voltar.
+            acordadas = db.wake_all_routes(self.conn)
+            if acordadas:
+                self._emit("queue_wake_boot", None, None, f"rotas_acordadas={acordadas}")
+        except Exception:
+            log.exception("wake_all_routes no boot")
         log.info("bootstrap fim filas_habilitadas=%s", len(self.enabled))
 
     async def discover_catalog(self) -> None:

@@ -144,9 +144,10 @@ class QueueTest(unittest.IsolatedAsyncioTestCase):
         for r in routes(conn, "waiting"):
             porTipo.setdefault(str(r["kind"]), []).append(int(r["attempts"]))
         self.assertIn(1, porTipo.get("chat") or [], "chat da cabeca foi tentado mesmo sem vaga")
-        # Algum chat do fim da linha nem foi tentado (devido ao per_line=5): o
-        # tick nao processa a linha do chat inteira so porque o form venceu.
-        self.assertIn(0, porTipo.get("chat") or [], porTipo)
+        # Sem orcamento fixo de avaliacao (ver docs/plano-correcao-fila-esquecida.md),
+        # a linha do chat INTEIRA e tentada neste tick, mesmo perdendo a vaga
+        # para o form — nenhum fica para tras so por posicao na fila.
+        self.assertEqual(porTipo.get("chat"), [1] * 10, porTipo)
 
     async def test_espera_do_formulario_vence_e_encerra_a_rota(self):
         """Formulario sem elegivel nao gira para sempre: a espera vence e a rota para."""
@@ -554,6 +555,27 @@ class QueueTest(unittest.IsolatedAsyncioTestCase):
         done = routes(conn, "done")
         self.assertEqual([int(r["chat_id"]) for r in done], [99], "time 2 foi atendido no mesmo tick")
         self.assertEqual(len(routes(conn, "waiting")), 10, "time 1 segue esperando (continua sem elegivel)")
+
+    async def test_teto_de_entregas_por_tick_nao_bloqueia_avaliacao(self):
+        """So a ENTREGA de fato tem teto por tick (Mudanca 1); a avaliacao e de todos.
+
+        Com o teto de entregas em 1, 3 chats elegiveis no mesmo tick so podem
+        ser entregues 1 por vez — os outros 2 ficam `waiting` prontos para o
+        PROXIMO tick (5s depois), sem contar como tentativa sem analista
+        (`attempts` nao sobe, perderam a vaga por orcamento, nao por falta
+        de elegivel).
+        """
+        eng, conn, _sock = self._eng(online=["ana"])
+        eng.cfg["transfer_deliveries_per_tick"] = "1"
+        for cid in range(30, 33):
+            db.enqueue_route(conn, "chat", cid, "h:q1", 1, detail="chat", delay_sec=0)
+        await eng.tick_routes()
+        done = routes(conn, "done")
+        waiting = routes(conn, "waiting")
+        self.assertEqual(len(done), 1, "so 1 entrega efetiva neste tick (teto=1)")
+        self.assertEqual(len(waiting), 2, "os outros 2 ficam esperando o proximo tick")
+        for r in waiting:
+            self.assertEqual(int(r["attempts"]), 0, "nao conta como tentativa sem analista")
 
 
 class QueueSchemaTest(unittest.TestCase):

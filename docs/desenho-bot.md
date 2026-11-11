@@ -582,6 +582,10 @@ flowchart TD
 - A coleta de perguntas (`chats.ask_option_id`) tambem: no boot o bot reenvia a pergunta ou a
   confirmacao atual (dentro do `reply_timeout_sec`) e a rota de transferencia enfileirada segue
   sendo drenada pelo tick.
+- Logo depois do `resume_open_chats`, o boot chama `db.wake_all_routes` (evento
+  `queue_wake_boot` quando acorda alguma): zera o backoff de TODA a fila pendente, para o
+  primeiro tick depois do restart ja reavaliar tudo, sem esperar o primeiro `snapshot_load`
+  natural (ate `load_poll_sec`, padrao 30s). Ver `docs/plano-correcao-fila-esquecida.md`.
 
 ## 11. Banco de dados: 31 tabelas e o papel de cada uma
 
@@ -706,6 +710,7 @@ O DDL e **um so** (`schema.sql`) e o dialeto tambem: o codigo continua escrito e
 | Alvo proibido | `self_target_blocked` (o alvo da entrega era o **proprio bot**: nada e enviado ao TOA) |
 | Analista offline (resgate) | `case_reclaimed` (caso devolvido a fila), `reclaim_invite_only` (chat: move recusado, so convida), `reclaim_no_queue` (caso sem fila) |
 | Analista entra na fila | `chat_adopted` (analista do time entrou no chat que esperava: caso e dele e o bot sai) |
+| Fila a prova de reinicio (ver `docs/plano-correcao-fila-esquecida.md`) | `analyst_available` (`snapshot_load` detectou que um analista ficou disponivel e acordou a fila do time dele, sem esperar o tick achar por acaso); `queue_read_degraded` (leitura do TOA falhando ha muito tempo para uma fila — antes disso era silencioso); `queue_wake_boot` (boot acordou toda a fila, para nao esperar o 1o `snapshot_load` depois de voltar) |
 
 ## 14. Status possiveis do chat
 

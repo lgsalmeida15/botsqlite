@@ -577,6 +577,68 @@ class QueueLoadTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("queue_load", db._table_names(conn))
 
 
+class DisponibilidadeWakeTest(unittest.IsolatedAsyncioTestCase):
+    """Mudanca 2 (docs/plano-correcao-fila-esquecida.md): o `snapshot_load`
+    acorda a fila do time assim que detecta a TRANSICAO para disponivel —
+    sem depender da detecao (fragil) de fechamento de caso."""
+
+    def tearDown(self):
+        MEM.clear()
+
+    def _conn(self):
+        conn = mem_conn()
+        seed_queue_menu(conn, with_team=True)
+        return conn
+
+    async def test_analista_disponivel_acorda_rota_em_backoff(self):
+        conn = self._conn()
+        eng = base_engine(
+            conn, LoadSock(in_process=[chat_toa()], online=["ana"]),
+            max_cases_per_agent="1",
+        )
+        rid = db.enqueue_route(conn, "chat", 55, "h:q1", 1, delay_sec=120)
+        await eng.snapshot_load("t1")
+        # Ana no limite (1 caso, cap=1): a rota continua esperando o backoff.
+        self.assertEqual(db.due_routes(conn)["chat"], [], "ainda em backoff; ninguem ficou disponivel")
+        self.assertNotIn("analyst_available", events(conn))
+        eng.sock.in_process = []  # caso resolvido no TOA: ana libera a vaga
+        await eng.snapshot_load("t2")
+        due = db.due_routes(conn)["chat"]
+        self.assertEqual(
+            [int(r["id"]) for r in due], [rid],
+            "liberacao acordou a rota na hora, sem esperar o backoff vencer sozinho",
+        )
+        self.assertIn("analyst_available", events(conn))
+
+    async def test_analista_fica_indisponivel_nao_acorda(self):
+        conn = self._conn()
+        eng = base_engine(
+            conn, LoadSock(in_process=[], online=["ana"]),
+            max_cases_per_agent="1",
+        )
+        db.enqueue_route(conn, "chat", 56, "h:q1", 1, delay_sec=120)
+        await eng.snapshot_load("t1")  # ana ja disponivel desde a 1a leitura
+        eng.sock.in_process = [chat_toa()]  # agora ela pega um caso: fica indisponivel
+        await eng.snapshot_load("t2")
+        self.assertEqual(db.due_routes(conn)["chat"], [], "ficou indisponivel: nao acorda a fila")
+        self.assertNotIn("analyst_available", events(conn))
+
+    async def test_leitura_degradada_alerta_uma_vez(self):
+        conn = self._conn()
+        eng = base_engine(
+            conn, LoadSock(online=["ana"], timeout=True),
+            queue_read_degraded_sec="0",
+        )
+        await eng.snapshot_load("t1")
+        self.assertEqual(events(conn).count("queue_read_degraded"), 1)
+        await eng.snapshot_load("t2")  # continua ruim: nao repete o alerta
+        self.assertEqual(events(conn).count("queue_read_degraded"), 1)
+        eng.sock.timeout = False
+        await eng.snapshot_load("t3")  # volta a ler bem: limpa o estado de degradacao
+        await eng.snapshot_load("t4")
+        self.assertEqual(events(conn).count("queue_read_degraded"), 1, "sem nova falha, sem novo alerta")
+
+
 if __name__ == "__main__":
     unittest.main()
 
