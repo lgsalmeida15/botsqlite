@@ -145,17 +145,26 @@ def _msg_time_text(v) -> str | None:
 
 
 def _message_dedupe_key(
-    chat_id: int, message_id: str, author_addr: str, text: str, msg_time: str | None, system_message: str,
+    chat_id: int, kind: str, message_id: str, author_addr: str, text: str, msg_time: str | None, system_message: str,
 ) -> str:
     """Chave de idempotencia de `chat_messages` (ver schema.sql: coluna `dedupe_key`).
 
     Usa o `message_id` do TOA quando o payload traz; sem ele (ex. nota de
     sistema `user_joined`/`user_left`, ou campo ausente), cai no hash do
     conteudo -- o mesmo poll/replay nao duplica a linha.
+
+    Inclui `kind`: a MESMA mensagem passa tanto por `_record_inbound_chat`
+    (sempre grava como `kind='chat'`, antes de qualquer classificacao) quanto
+    por `_refresh_form_state` (grava como `kind='form'`). Sem o `kind` aqui as
+    duas tentativas geram a mesma chave e a segunda (quase sempre a de
+    `kind='form'`) e descartada pelo `INSERT OR IGNORE` -- o conteudo do
+    formulario fica preso como `kind='chat'` para sempre. Com o `kind` na
+    chave, as duas gravacoes coexistem (uma linha por `kind`), que e o
+    comportamento que `form_messages_text`/`form_duplicate_of` esperam.
     """
     if message_id:
-        return f"mid:{message_id}"
-    raw = f"{chat_id}|{author_addr}|{text}|{msg_time or ''}|{system_message}"
+        return f"mid:{kind}:{message_id}"
+    raw = f"{chat_id}|{kind}|{author_addr}|{text}|{msg_time or ''}|{system_message}"
     return "h:" + hashlib.sha1(raw.encode("utf-8", "replace")).hexdigest()
 
 
@@ -1540,7 +1549,7 @@ class Engine:
             system_message = str(m.get("system_message") or "")
             msg_time = _msg_time_text(m.get("time"))
             message_id = str(m.get("message_id") or m.get("id") or "")
-            dedupe_key = _message_dedupe_key(cid, message_id, author_addr, text, msg_time, system_message)
+            dedupe_key = _message_dedupe_key(cid, kind, message_id, author_addr, text, msg_time, system_message)
             fila = str(queue_address) if queue_address is not None else str((MEM.get(cid) or {}).get("queue_address") or "")
 
             has_attachment = False

@@ -1360,9 +1360,17 @@ _ACTIVITY_ID_RE = re.compile(r"activityId=(\d+)")
 
 
 def form_messages_text(conn, chat_id: int) -> list[str]:
-    """Textos ja gravados do formulario (ver `chat_messages`), para classificar."""
+    """Textos ja gravados do formulario (ver `chat_messages`), para classificar.
+
+    Nao filtra por `kind = 'form'`: uma corrida de gravacao (mesma mensagem
+    processada por `_record_inbound_chat` antes de `_refresh_form_state`, ver
+    `_message_dedupe_key`) pode deixar o conteudo do formulario gravado como
+    `kind='chat'`. Como esta consulta ja e restrita ao `chat_id` dedicado da
+    conversa do formulario, ler os dois `kind` aqui e seguro e evita cegar a
+    classificacao por causa dessa corrida.
+    """
     rows = conn.execute(
-        "SELECT text FROM chat_messages WHERE kind = 'form' AND chat_id = ?",
+        "SELECT text FROM chat_messages WHERE chat_id = ?",
         (int(chat_id),),
     ).fetchall()
     return [str(r.get("text") or "") for r in rows]
@@ -1390,9 +1398,12 @@ def form_duplicate_of(conn, chat_id: int, desde_utc) -> tuple[int, int] | None:
             break
     if activity_id is None:
         return None
+    # Mesmo motivo de `form_messages_text`: nao filtra por `kind = 'form'`
+    # aqui (a corrida de gravacao pode ter deixado o formulario original como
+    # `kind='chat'`), senao o candidato mais antigo nunca e encontrado.
     candidatos = conn.execute(
         """SELECT chat_id, text FROM chat_messages
-            WHERE kind = 'form' AND chat_id < ? AND at >= ?
+            WHERE chat_id < ? AND at >= ?
             ORDER BY chat_id ASC""",
         (int(chat_id), desde_utc),
     ).fetchall()

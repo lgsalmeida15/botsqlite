@@ -186,6 +186,21 @@ class FormMessageTest(BaseTest):
         await eng._refresh_form_state(99, forcar=True)
         self.assertEqual(len(chat_messages(conn, 99)), 1)
 
+    async def test_mesma_mensagem_via_on_message_e_refresh_nao_se_descartam(self):
+        """A mesma mensagem do TOA passa por `on_message` (sempre `kind='chat'`,
+        ver `_record_inbound_chat`) e, quando o chat vira formulario, tambem
+        por `_refresh_form_state` (`kind='form'`). Sem `kind` na chave de
+        idempotencia (`_message_dedupe_key`) a segunda gravacao era descartada
+        pelo `INSERT OR IGNORE` e o conteudo do formulario ficava preso como
+        `kind='chat'` -- cegando `form_messages_text`/`form_duplicate_of`."""
+        msg = {"author": TEC, "text": "TAREFA REALOCADA", "time": 1, "message_id": "m1"}
+        eng, conn, sock = self._eng(messages=[msg])
+        await eng.on_message({"chat_id": 99, **msg})
+        await eng._refresh_form_state(99, forcar=True)
+        rows = chat_messages(conn, 99)
+        kinds = sorted(r["kind"] for r in rows)
+        self.assertEqual(kinds, ["chat", "form"])
+
 
 class AttachmentTest(BaseTest):
     """Anexo: metadado vem na mensagem, binario e baixado via pagina autenticada do bot."""
