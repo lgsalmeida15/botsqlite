@@ -2682,9 +2682,9 @@ class Engine:
 
     def _form_dedupe_window_sec(self) -> float:
         try:
-            return max(0.0, float(self.cfg.get("form_dedupe_window_sec") or 21600.0))
+            return max(0.0, float(self.cfg.get("form_dedupe_window_sec") or 600.0))
         except (TypeError, ValueError):
-            return 21600.0
+            return 600.0
 
     async def _descarta_form_duplicado(self, cid: int, queue_address: str | None, team: dict | None) -> bool:
         """Formulario repetido: mesmo activityId de um chat_id mais antigo dentro
