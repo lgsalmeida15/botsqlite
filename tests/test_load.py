@@ -635,8 +635,23 @@ class DisponibilidadeWakeTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events(conn).count("queue_read_degraded"), 1)
         eng.sock.timeout = False
         await eng.snapshot_load("t3")  # volta a ler bem: limpa o estado de degradacao
+        self.assertEqual(events(conn).count("queue_read_recovered"), 1, "espelha o degradado, uma vez")
         await eng.snapshot_load("t4")
         self.assertEqual(events(conn).count("queue_read_degraded"), 1, "sem nova falha, sem novo alerta")
+        self.assertEqual(events(conn).count("queue_read_recovered"), 1, "ja recuperado: nao repete")
+
+    async def test_leitura_curta_sem_alerta_nao_gera_recuperacao(self):
+        """Falha curta (nunca cruzou o teto de degradacao) nao vira ruido na recuperacao."""
+        conn = self._conn()
+        eng = base_engine(
+            conn, LoadSock(online=["ana"], timeout=True),
+            queue_read_degraded_sec="300",  # teto alto: a falha curta nunca alerta
+        )
+        await eng.snapshot_load("t1")
+        self.assertNotIn("queue_read_degraded", events(conn))
+        eng.sock.timeout = False
+        await eng.snapshot_load("t2")
+        self.assertNotIn("queue_read_recovered", events(conn), "nunca alertou degradado: nao avisa recuperacao")
 
 
 if __name__ == "__main__":

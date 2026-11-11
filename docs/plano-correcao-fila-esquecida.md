@@ -176,10 +176,14 @@ sem custo de TOA).
 - **Ponto cego que continua existindo e não tem solução estrutural simples:**
   se a leitura do TOA falhar de forma persistente para um helpdesk
   específico, nem a detecção de fechamento de caso nem a Mudança 2 enxergam a
-  liberação (ambas dependem do mesmo dado). Proposta mínima: emitir
-  `queue_read_degraded` quando `toa_ok` ficar falso por mais que um teto (ex.:
-  5 min) para um helpdesk — só visibilidade, não resolve sozinho, mas tira o
-  silêncio de hoje.
+  liberação (ambas dependem do mesmo dado). Emite `queue_read_degraded`
+  quando `toa_ok` ficar falso por mais que um teto (ex.: 5 min) para um
+  helpdesk — só visibilidade, não resolve sozinho, mas tira o silêncio de
+  hoje — **e `queue_read_recovered`** quando a leitura volta a funcionar
+  (só se o degradado foi emitido antes, sem ruído de falha curta). Esse par
+  simétrico existe **especificamente para o painel** poder ligar/desligar um
+  alerta de forma confiável, sem precisar de heurística por tempo (ver seção
+  "Impacto no painel").
 
 ---
 
@@ -243,11 +247,23 @@ Testes novos:
 
 ## Impacto no painel (outro repositório)
 
-Um evento novo em `bot_events.reason`: `queue_read_degraded`. Não muda schema
-de tabela nem contrato de endpoint existente — é dado novo que o painel pode
-querer exibir como alerta de "leitura da fila degradada". **Ajuste manual
-necessário no outro repositório, se decidirem exibir esse evento** — não é
-automático.
+Eventos novos em `bot_events.reason`, todos com `chat_id` NULL:
+- `analyst_available` (`queue_address` NULL; endereço do analista só no texto
+  de `detail`) e `queue_wake_boot` (`queue_address` NULL) — informativos.
+- `queue_read_degraded` / `queue_read_recovered` — **par simétrico**,
+  `queue_address` = o helpdesk afetado em ambos. `queue_read_degraded` só é
+  emitido quando a falha passa do teto (`queue_read_degraded_sec`, padrão
+  300s); `queue_read_recovered` só é emitido se o degradado anterior foi de
+  fato emitido (uma falha curta, que nunca alertou, não gera "recuperação"
+  solta). Isso foi desenhado assim **de propósito** para o painel poder
+  ligar/desligar um alerta por evento (sem heurística por tempo nem polling
+  adicional): mostrar o alerta quando ver `queue_read_degraded` sem um
+  `queue_read_recovered` mais recente para o mesmo `queue_address`, e
+  esconder quando ver o `queue_read_recovered`.
+
+Não muda schema de tabela nem contrato de endpoint existente — é dado novo.
+**Ajuste manual necessário no outro repositório, se decidirem exibir esses
+eventos** — não é automático.
 
 ## Arquivos afetados
 

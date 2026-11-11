@@ -3253,8 +3253,20 @@ class Engine:
             ok_geral = ok_geral or ok
             if q:
                 if ok:
-                    self._queue_read_bad_since.pop(q, None)
-                    self._queue_read_degraded_alerted.discard(q)
+                    desde = self._queue_read_bad_since.pop(q, None)
+                    if q in self._queue_read_degraded_alerted:
+                        # So emite recuperacao se o alerta de degradacao tinha
+                        # sido emitido (evita ruido por falha curta, que nunca
+                        # chegou a alertar) — espelha `queue_read_degraded`
+                        # para o painel saber ligar/desligar o aviso sem
+                        # heuristica por tempo (ver
+                        # docs/plano-correcao-fila-esquecida.md).
+                        self._queue_read_degraded_alerted.discard(q)
+                        duracao = int(time.monotonic() - desde) if desde is not None else 0
+                        self._emit(
+                            "queue_read_recovered", None, q,
+                            f"leitura do TOA normalizada apos {duracao}s",
+                        )
                 else:
                     desde = self._queue_read_bad_since.setdefault(q, time.monotonic())
                     limite = float(self.cfg.get("queue_read_degraded_sec") or 300)

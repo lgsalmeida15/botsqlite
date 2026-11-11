@@ -710,7 +710,7 @@ O DDL e **um so** (`schema.sql`) e o dialeto tambem: o codigo continua escrito e
 | Alvo proibido | `self_target_blocked` (o alvo da entrega era o **proprio bot**: nada e enviado ao TOA) |
 | Analista offline (resgate) | `case_reclaimed` (caso devolvido a fila), `reclaim_invite_only` (chat: move recusado, so convida), `reclaim_no_queue` (caso sem fila) |
 | Analista entra na fila | `chat_adopted` (analista do time entrou no chat que esperava: caso e dele e o bot sai) |
-| Fila a prova de reinicio (ver `docs/plano-correcao-fila-esquecida.md`) | `analyst_available` (`snapshot_load` detectou que um analista ficou disponivel e acordou a fila do time dele, sem esperar o tick achar por acaso); `queue_read_degraded` (leitura do TOA falhando ha muito tempo para uma fila — antes disso era silencioso); `queue_wake_boot` (boot acordou toda a fila, para nao esperar o 1o `snapshot_load` depois de voltar) |
+| Fila a prova de reinicio (ver `docs/plano-correcao-fila-esquecida.md`) | `analyst_available` (`snapshot_load` detectou que um analista ficou disponivel e acordou a fila do time dele, sem esperar o tick achar por acaso); `queue_read_degraded`/`queue_read_recovered` (par simetrico: leitura do TOA falhando ha muito tempo para uma fila, e quando volta a normalizar — so emite o 2o se o 1o foi emitido, sem ruido de falha curta); `queue_wake_boot` (boot acordou toda a fila, para nao esperar o 1o `snapshot_load` depois de voltar) |
 
 ## 14. Status possiveis do chat
 
